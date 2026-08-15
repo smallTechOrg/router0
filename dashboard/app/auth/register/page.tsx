@@ -16,7 +16,7 @@ export default function RegisterPage() {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch('/auth/register', {
+      const res = await fetch('/go/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ invite_token: inviteToken, email, password }),

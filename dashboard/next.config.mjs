@@ -10,6 +10,8 @@ const nextConfig = {
       { source: '/api/costs', destination: 'http://localhost:8080/api/costs' },
       { source: '/admin/:path*', destination: 'http://localhost:8080/admin/:path*' },
       { source: '/v1/:path*', destination: 'http://localhost:8080/v1/:path*' },
+      // Go auth endpoints — prefixed /go/auth/* to avoid conflict with Next.js /auth/* pages
+      { source: '/go/auth/:path*', destination: 'http://localhost:8080/auth/:path*' },
     ];
   },
 };
