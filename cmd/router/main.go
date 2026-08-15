@@ -18,7 +18,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/zer0-router/zer0/internal/auth"
 	"github.com/zer0-router/zer0/internal/db"
+	"github.com/zer0-router/zer0/internal/handlers"
+	"github.com/zer0-router/zer0/internal/health"
+	"github.com/zer0-router/zer0/internal/routing"
 )
 
 func main() {
@@ -34,9 +38,9 @@ func main() {
 	port := envOrDefault("PORT", "8080")
 	databaseURL := mustEnv("DATABASE_URL")
 	redisURL := mustEnv("REDIS_URL")
+	jwtSecret := mustEnv("JWT_SECRET")
 
 	// ── Migrations path ──────────────────────────────────────────────────────
-	// Resolve migrations/ relative to the repo root (two levels above cmd/router/main.go).
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
 	migrationsPath := filepath.Join(repoRoot, "migrations")
@@ -69,6 +73,24 @@ func main() {
 	}
 	slog.Info("redis: connected")
 
+	// ── Routing pool ─────────────────────────────────────────────────────────
+	routingPool := routing.NewPool(redisClient)
+
+	// ── Health scheduler ─────────────────────────────────────────────────────
+	scheduler := health.NewScheduler(redisClient, pool, 4)
+	scheduler.Start(ctx)
+	defer scheduler.Stop()
+
+	// ── Handlers ─────────────────────────────────────────────────────────────
+	authHandler := handlers.NewAuthHandler(pool, jwtSecret)
+	keysHandler := handlers.NewKeysHandler(pool, routingPool)
+	poolHandler := handlers.NewPoolHandler(pool, routingPool)
+	adminHandler := handlers.NewAdminHandler(pool, routingPool)
+	inferenceHandler := handlers.NewInferenceHandler(pool, redisClient)
+
+	jwtMiddleware := auth.JWTMiddleware(jwtSecret)
+	zer0KeyMiddleware := auth.Zer0KeyMiddleware(pool)
+
 	// ── Router ───────────────────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -77,6 +99,37 @@ func main() {
 
 	r.Get("/healthz", healthzHandler(pool, redisClient))
 	r.Get("/metrics", promhttp.Handler().ServeHTTP)
+
+	// Auth routes
+	r.Post("/auth/register", authHandler.Register)
+	r.Post("/auth/login", authHandler.Login)
+	r.Post("/auth/logout", authHandler.Logout)
+	r.Post("/auth/refresh", authHandler.Refresh)
+	r.With(jwtMiddleware).Get("/auth/me", authHandler.Me)
+
+	// Inference (Zer0 key auth)
+	r.With(zer0KeyMiddleware).Post("/v1/chat/completions", inferenceHandler.ChatCompletions)
+
+	// API routes (JWT auth)
+	r.Group(func(r chi.Router) {
+		r.Use(jwtMiddleware)
+		r.Get("/api/keys", keysHandler.ListKeys)
+		r.Post("/api/keys", keysHandler.AddKey)
+		r.Delete("/api/keys/{id}", keysHandler.DeleteKey)
+		r.Post("/api/keys/{id}/test", keysHandler.TestKey)
+		r.Get("/api/pool", poolHandler.GetPool)
+		r.Get("/api/requests", poolHandler.GetRequests)
+		r.Get("/api/costs", poolHandler.GetCosts)
+	})
+
+	// Admin routes (JWT auth + admin role)
+	r.Group(func(r chi.Router) {
+		r.Use(jwtMiddleware)
+		r.Use(auth.AdminOnly)
+		r.Post("/admin/invites", adminHandler.CreateInvite)
+		r.Get("/admin/users", adminHandler.ListUsers)
+		r.Get("/admin/pool/{user_id}", adminHandler.GetPoolForUser)
+	})
 
 	// ── HTTP server ──────────────────────────────────────────────────────────
 	srv := &http.Server{
@@ -87,7 +140,6 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
 
@@ -119,23 +171,15 @@ func healthzHandler(pool *pgxpool.Pool, redisClient *redis.Client) http.HandlerF
 			DB     string `json:"db"`
 			Redis  string `json:"redis"`
 		}
-
-		resp := healthResponse{
-			Status: "ok",
-			DB:     "ok",
-			Redis:  "ok",
-		}
-
+		resp := healthResponse{Status: "ok", DB: "ok", Redis: "ok"}
 		if err := pool.Ping(r.Context()); err != nil {
 			resp.DB = "error"
 			resp.Status = "degraded"
 		}
-
 		if err := db.Ping(r.Context(), redisClient); err != nil {
 			resp.Redis = "error"
 			resp.Status = "degraded"
 		}
-
 		w.Header().Set("Content-Type", "application/json")
 		if resp.Status != "ok" {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -144,7 +188,6 @@ func healthzHandler(pool *pgxpool.Pool, redisClient *redis.Client) http.HandlerF
 	}
 }
 
-// envOrDefault returns the value of the env var or a fallback.
 func envOrDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -152,7 +195,6 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
-// mustEnv reads an env var and exits if it is empty.
 func mustEnv(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -162,24 +204,17 @@ func mustEnv(key string) string {
 	return v
 }
 
-// parseRedisURL parses redis://[:password@]host:port/db into components.
-// Supports the simple forms used in .env.example.
 func parseRedisURL(rawURL string) (addr, password string, dbIndex int) {
 	addr = "localhost:6379"
 	password = ""
 	dbIndex = 0
-
 	if rawURL == "" {
 		return
 	}
-
 	rest := rawURL
-	// Strip scheme
 	if len(rest) >= 8 && rest[:8] == "redis://" {
 		rest = rest[8:]
 	}
-
-	// Extract password (redis://:password@host:port/db)
 	if at := strLastIndex(rest, "@"); at >= 0 {
 		userInfo := rest[:at]
 		rest = rest[at+1:]
@@ -187,8 +222,6 @@ func parseRedisURL(rawURL string) (addr, password string, dbIndex int) {
 			password = userInfo[colon+1:]
 		}
 	}
-
-	// Extract db index after last '/'
 	if slash := strIndex(rest, "/"); slash >= 0 {
 		dbStr := rest[slash+1:]
 		rest = rest[:slash]
@@ -198,7 +231,6 @@ func parseRedisURL(rawURL string) (addr, password string, dbIndex int) {
 			}
 		}
 	}
-
 	if rest != "" {
 		addr = rest
 	}
