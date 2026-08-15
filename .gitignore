@@ -22,3 +22,4 @@ dashboard/out/
 
 # Colima / Docker
 .colima/
+dashboard/.env.local
