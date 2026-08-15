@@ -113,6 +113,7 @@ func main() {
 	r.With(jwtMiddleware).Get("/auth/me", authHandler.Me)
 
 	// Inference (Zer0 key auth)
+	r.Get("/v1/models", handlers.ListModels)
 	r.With(zer0KeyMiddleware).Post("/v1/chat/completions", inferenceHandler.ChatCompletions)
 
 	// API routes (JWT auth)

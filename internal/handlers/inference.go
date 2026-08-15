@@ -327,3 +327,21 @@ func countTokensApprox(s string) int {
 func newUUID() string {
 	return strings.ReplaceAll(uuid.New().String(), "-", "")
 }
+
+// ListModels handles GET /v1/models — returns the single Zer0 model identity.
+// Clients that require a model list (e.g. Hermes) will see "zer0-0.1"; the
+// router ignores the model field in requests and routes via the pool instead.
+func ListModels(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"object": "list",
+		"data": []map[string]any{
+			{
+				"id":       "zer0-0.1",
+				"object":   "model",
+				"created":  1700000000,
+				"owned_by": "zer0-router",
+			},
+		},
+	})
+}
