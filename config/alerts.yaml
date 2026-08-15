@@ -1,0 +1,26 @@
+groups:
+  - name: zer0_router
+    rules:
+      - alert: HighErrorRate
+        expr: rate(zer0_requests_total{status="error"}[5m]) / rate(zer0_requests_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Error rate above 10% for 2 minutes"
+
+      - alert: AllProvidersDown
+        expr: zer0_pool_active_size == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Active pool is empty — all providers unavailable for a user"
+
+      - alert: PoolSizeCritical
+        expr: zer0_pool_active_size < 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Active pool has fewer than 2 combos"
