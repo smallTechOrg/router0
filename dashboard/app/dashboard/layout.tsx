@@ -34,10 +34,10 @@ export default async function DashboardLayout({ children }: { children: React.Re
           ))}
           {(session as any)?.user?.role === 'admin' && (
             <Link
-              href="/admin/invites"
+              href="/dashboard/admin"
               className="flex items-center rounded-lg px-3 py-2 text-sm font-medium text-amber-400 hover:bg-neutral-800 transition-colors"
             >
-              Admin: Invites
+              Admin Panel
             </Link>
           )}
         </nav>

@@ -18,6 +18,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/zer0-router/zer0/internal/auth"
 	"github.com/zer0-router/zer0/internal/db"
 	"github.com/zer0-router/zer0/internal/handlers"
@@ -61,6 +63,9 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("migrations: up to date")
+
+	// ── Bootstrap admin user ─────────────────────────────────────────────────
+	bootstrapAdmin(ctx, pool)
 
 	// ── Redis ────────────────────────────────────────────────────────────────
 	redisAddr, redisPassword, redisDB := parseRedisURL(redisURL)
@@ -244,6 +249,37 @@ func strIndex(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+func bootstrapAdmin(ctx context.Context, pool *pgxpool.Pool) {
+	email := os.Getenv("ADMIN_EMAIL")
+	password := os.Getenv("ADMIN_PASSWORD")
+	if email == "" || password == "" {
+		slog.Warn("admin bootstrap: ADMIN_EMAIL or ADMIN_PASSWORD not set, skipping")
+		return
+	}
+	var count int
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE role = 'admin'`).Scan(&count)
+	if count > 0 {
+		slog.Info("admin bootstrap: admin user already exists")
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	if err != nil {
+		slog.Error("admin bootstrap: failed to hash password", "error", err)
+		return
+	}
+	_, err = pool.Exec(ctx,
+		`INSERT INTO users (email, password_hash, zer0_key_hash, zer0_key_prefix, role, status)
+		 VALUES ($1, $2, '', '', 'admin', 'active')
+		 ON CONFLICT (email) DO UPDATE SET role = 'admin', password_hash = $2`,
+		email, string(hash),
+	)
+	if err != nil {
+		slog.Error("admin bootstrap: failed to upsert admin", "error", err)
+		return
+	}
+	slog.Info("admin bootstrap: admin user ready", "email", email)
 }
 
 func strLastIndex(s, sub string) int {
