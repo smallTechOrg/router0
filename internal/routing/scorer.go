@@ -1,6 +1,9 @@
 package routing
 
-import "context"
+import (
+	"context"
+	"math/rand"
+)
 
 // Combo represents a (provider, model, key) combination.
 type Combo struct {
@@ -77,7 +80,16 @@ func (w *WeightedScoreFunc) Score(_ context.Context, _ string, combos []Combo, m
 		}
 		out = append(out, ScoredCombo{Combo: c, Score: score})
 	}
-	// Sort descending by score
+	// Add exploration jitter (±15%) so different combos rotate into the top slots
+	// across requests, giving unproven models a chance to race.
+	for i := range out {
+		jitter := 0.85 + rand.Float64()*0.30 // [0.85, 1.15]
+		out[i].Score *= jitter
+		if out[i].Score > 1 {
+			out[i].Score = 1
+		}
+	}
+	// Sort descending by jittered score
 	for i := 0; i < len(out); i++ {
 		for j := i + 1; j < len(out); j++ {
 			if out[j].Score > out[i].Score {

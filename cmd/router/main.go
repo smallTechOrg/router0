@@ -24,6 +24,7 @@ import (
 	"github.com/zer0-router/zer0/internal/db"
 	"github.com/zer0-router/zer0/internal/handlers"
 	"github.com/zer0-router/zer0/internal/health"
+	"github.com/zer0-router/zer0/internal/models"
 	"github.com/zer0-router/zer0/internal/routing"
 )
 
@@ -86,11 +87,35 @@ func main() {
 	scheduler.Start(ctx)
 	defer scheduler.Stop()
 
+	// ── Meta syncer (observed rate limits → provider_rate_limits) ────────────
+	metaSyncer := routing.NewMetaSyncer(pool)
+	metaSyncer.Start(ctx)
+	defer metaSyncer.Stop()
+	// Sync after probes complete (probes capture headers → observations → syncer consolidates)
+	scheduler.OnProbesDone(func() { metaSyncer.SyncNow(context.Background()) })
+
+	// ── Model registry + discovery ───────────────────────────────────────────
+	modelRegistry := models.NewRegistry(pool)
+	discoveryJob := models.NewDiscoveryJob(pool, redisClient, routingPool)
+	// Also sync after discovery (backfills pricing/context for newly found models)
+	discoveryJob.OnComplete(func() {
+		metaSyncer.SyncNow(context.Background())
+		// Probe all newly discovered models to verify they're accessible with our keys
+		go scheduler.ProbeUntestedModels(context.Background())
+	})
+	discoveryJob.Start(ctx)
+	defer discoveryJob.Stop()
+
+	// ── Pool promoter (auto-promotion/demotion) ───────────────────────────────
+	promoter := routing.NewPromoter(pool, redisClient)
+	promoter.Start(ctx)
+	defer promoter.Stop()
+
 	// ── Handlers ─────────────────────────────────────────────────────────────
 	authHandler := handlers.NewAuthHandler(pool, jwtSecret)
 	keysHandler := handlers.NewKeysHandler(pool, routingPool)
 	poolHandler := handlers.NewPoolHandler(pool, routingPool)
-	adminHandler := handlers.NewAdminHandler(pool, routingPool)
+	adminHandler := handlers.NewAdminHandler(pool, redisClient, routingPool, modelRegistry, discoveryJob)
 	inferenceHandler := handlers.NewInferenceHandler(pool, redisClient)
 
 	jwtMiddleware := auth.JWTMiddleware(jwtSecret)
@@ -126,6 +151,7 @@ func main() {
 		r.Get("/api/pool", poolHandler.GetPool)
 		r.Get("/api/requests", poolHandler.GetRequests)
 		r.Get("/api/costs", poolHandler.GetCosts)
+		r.Get("/api/attempts", poolHandler.GetAttempts)
 	})
 
 	// Admin routes (JWT auth + admin role)
@@ -134,7 +160,15 @@ func main() {
 		r.Use(auth.AdminOnly)
 		r.Post("/admin/invites", adminHandler.CreateInvite)
 		r.Get("/admin/users", adminHandler.ListUsers)
+		// Specific pool routes must come before the wildcard {user_id} route
+		r.Post("/admin/pool/reset", adminHandler.ResetPool)
 		r.Get("/admin/pool/{user_id}", adminHandler.GetPoolForUser)
+		// Provider key + model discovery
+		r.Post("/admin/provider-keys", adminHandler.SetProviderKey)
+		r.Get("/admin/provider-keys", adminHandler.ListProviderKeys)
+		r.Get("/admin/models", adminHandler.ListModels)
+		r.Post("/admin/discovery", adminHandler.TriggerDiscovery)
+		r.Post("/admin/perf-test", adminHandler.PerfTest)
 	})
 
 	// ── HTTP server ──────────────────────────────────────────────────────────

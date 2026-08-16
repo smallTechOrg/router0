@@ -11,6 +11,8 @@ export default function KeysPage() {
   const [adding, setAdding] = useState(false);
   const [form, setForm] = useState({ provider: 'groq', key: '', label: '', model_id: '' });
   const [error, setError] = useState('');
+  const [testResults, setTestResults] = useState<Record<string, { status: string; message?: string; latency_ms?: number }>>({});
+  const [testing, setTesting] = useState<Record<string, boolean>>({});
 
   async function loadKeys() {
     if (!session?.accessToken) return;
@@ -52,9 +54,17 @@ export default function KeysPage() {
   }
 
   async function handleTest(id: string) {
-    const res = await fetch(`/api/keys/${id}/test`, { method: 'POST', headers: { Authorization: `Bearer ${session.accessToken}` } });
-    const data = await res.json();
-    alert(`Test result: ${data.status}${data.latency_ms ? ` (${data.latency_ms}ms)` : ''}`);
+    setTesting(t => ({ ...t, [id]: true }));
+    setTestResults(r => { const n = { ...r }; delete n[id]; return n; });
+    try {
+      const res = await fetch(`/api/keys/${id}/test`, { method: 'POST', headers: { Authorization: `Bearer ${session.accessToken}` } });
+      const data = await res.json();
+      setTestResults(r => ({ ...r, [id]: { status: data.status, message: data.message, latency_ms: data.latency_ms } }));
+    } catch {
+      setTestResults(r => ({ ...r, [id]: { status: 'error', message: 'Network error' } }));
+    } finally {
+      setTesting(t => { const n = { ...t }; delete n[id]; return n; });
+    }
   }
 
   return (
@@ -143,9 +153,28 @@ export default function KeysPage() {
                     k.status === 'active' ? 'bg-green-900/40 text-green-400' : 'bg-red-900/40 text-red-400'
                   }`}>{k.status}</span>
                 </td>
-                <td className="px-6 py-3 flex gap-2">
-                  <button onClick={() => handleTest(k.id)} className="text-xs text-indigo-400 hover:text-indigo-300">Test</button>
-                  <button onClick={() => handleDelete(k.id)} className="text-xs text-red-400 hover:text-red-300">Delete</button>
+                <td className="px-6 py-3">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <button
+                      onClick={() => handleTest(k.id)}
+                      disabled={testing[k.id]}
+                      className="text-xs text-indigo-400 hover:text-indigo-300 disabled:opacity-50"
+                    >
+                      {testing[k.id] ? 'Testing…' : 'Test'}
+                    </button>
+                    <button onClick={() => handleDelete(k.id)} className="text-xs text-red-400 hover:text-red-300">Delete</button>
+                    {testResults[k.id] && (
+                      <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                        testResults[k.id].status === 'ok'
+                          ? 'bg-green-900/40 text-green-400'
+                          : 'bg-red-900/40 text-red-400'
+                      }`}>
+                        {testResults[k.id].status === 'ok'
+                          ? `ok${testResults[k.id].latency_ms ? ` · ${testResults[k.id].latency_ms}ms` : ''}`
+                          : testResults[k.id].message || 'error'}
+                      </span>
+                    )}
+                  </div>
                 </td>
               </tr>
             ))}

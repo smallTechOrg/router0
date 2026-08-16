@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/zer0-router/zer0/internal/keys"
 	"github.com/zer0-router/zer0/internal/providers"
@@ -17,10 +18,11 @@ const healthCacheTTL = 30 * time.Minute
 type Prober struct {
 	redis   *redis.Client
 	keyRepo *keys.Repository
+	pg      *pgxpool.Pool
 }
 
-func NewProber(r *redis.Client, keyRepo *keys.Repository) *Prober {
-	return &Prober{redis: r, keyRepo: keyRepo}
+func NewProber(r *redis.Client, keyRepo *keys.Repository, pg *pgxpool.Pool) *Prober {
+	return &Prober{redis: r, keyRepo: keyRepo, pg: pg}
 }
 
 // Probe runs a 1-token health check for the given combo.
@@ -64,14 +66,88 @@ func (p *Prober) Probe(ctx context.Context, providerName, model, keyID, userID s
 	)
 	p.redis.Expire(ctx, cacheKey, healthCacheTTL)
 
-	slog.Info("health_probe",
+	// Capture rate limit headers observed during the probe
+	if result.OK && result.RateLimit != nil {
+		rl := result.RateLimit
+		if rl.LimitRPM > 0 || rl.LimitTPM > 0 || rl.LimitTPD > 0 {
+			go func() {
+				nullInt := func(n int) interface{} {
+					if n == 0 {
+						return nil
+					}
+					return n
+				}
+				p.pg.Exec(context.Background(), `
+					INSERT INTO rate_limit_observations (provider, model_id, limit_rpm, limit_tpm, limit_tpd, source)
+					VALUES ($1,$2,$3,$4,$5,'probe')`,
+					providerName, model, nullInt(rl.LimitRPM), nullInt(rl.LimitTPM), nullInt(rl.LimitTPD))
+			}()
+		}
+	}
+
+	args := []any{
 		"provider", providerName,
 		"model", model,
 		"key_id", keyID,
 		"status", status,
 		"latency_ms", result.LatencyMs,
-	)
+	}
+	if !result.OK && result.Error != "" {
+		args = append(args, "error", result.Error)
+	}
+	slog.Info("health_probe", args...)
 	return nil
+}
+
+// ProbeModel tests a specific model with a given API key and updates probe_status in provider_models.
+func (p *Prober) ProbeModel(ctx context.Context, providerName, model, apiKey string) {
+	prov, err := providers.Get(providerName)
+	if err != nil {
+		return
+	}
+
+	type modelProber interface {
+		ProbeModel(ctx context.Context, apiKey, model string) (*providers.HealthResult, error)
+	}
+	var result *providers.HealthResult
+	if mp, ok := prov.(modelProber); ok {
+		result, err = mp.ProbeModel(ctx, apiKey, model)
+	} else {
+		// Fall back to provider health check (tests provider connectivity, not specific model)
+		result, err = prov.HealthCheck(ctx, apiKey)
+	}
+	if err != nil {
+		result = &providers.HealthResult{OK: false, Error: err.Error()}
+	}
+
+	probeStatus := "probe_ok"
+	if !result.OK {
+		probeStatus = "probe_error"
+	}
+
+	p.pg.Exec(ctx, `
+		UPDATE provider_models
+		SET probe_status = $1, last_probed_at = NOW()
+		WHERE provider = $2 AND model_id = $3`,
+		probeStatus, providerName, model)
+
+	if result.OK && result.RateLimit != nil {
+		rl := result.RateLimit
+		if rl.LimitRPM > 0 || rl.LimitTPM > 0 || rl.LimitTPD > 0 {
+			nullInt := func(n int) interface{} {
+				if n == 0 {
+					return nil
+				}
+				return n
+			}
+			p.pg.Exec(ctx, `
+				INSERT INTO rate_limit_observations (provider, model_id, limit_rpm, limit_tpm, limit_tpd, source)
+				VALUES ($1,$2,$3,$4,$5,'probe')`,
+				providerName, model, nullInt(rl.LimitRPM), nullInt(rl.LimitTPM), nullInt(rl.LimitTPD))
+		}
+	}
+
+	slog.Info("model_probe", "provider", providerName, "model", model, "status", probeStatus, "latency_ms", result.LatencyMs)
 }
 
 // GetCached returns the cached health result for a provider/model.

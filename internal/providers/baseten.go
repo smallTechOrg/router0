@@ -25,3 +25,8 @@ func (p *BasetenProvider) Stream(ctx context.Context, req *ChatRequest, apiKey s
 func (p *BasetenProvider) HealthCheck(ctx context.Context, apiKey string) (*HealthResult, error) {
 	return &HealthResult{OK: true, LatencyMs: 0}, nil
 }
+
+// Baseten doesn't have a public model catalog API — models are user-deployed.
+func (p *BasetenProvider) ListModels(ctx context.Context, apiKey string) ([]ModelInfo, error) {
+	return nil, nil
+}

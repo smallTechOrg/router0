@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -87,16 +88,26 @@ func (h *KeysHandler) AddKey(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "conflict", "key_exists", "A key with this provider and label already exists")
 			return
 		}
+		slog.Error("keys: failed to save key", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to save key")
 		return
 	}
 
-	// Add combos to pool for the provider's default models
+	// Add combos to appropriate tier pools based on model metadata
 	prov, _ := providers.Get(req.Provider)
 	if prov != nil {
-		ctx := context.Background()
+		bgCtx := context.Background()
 		for _, model := range prov.DefaultModels() {
-			_ = h.pool.AddCombo(ctx, userID, req.Provider, model, k.ID)
+			var paramB float64
+			var ctxWindow int
+			_ = h.pgPool.QueryRow(bgCtx,
+				`SELECT COALESCE(parameter_count_b,0), context_window FROM provider_models WHERE provider=$1 AND model_id=$2`,
+				req.Provider, model).Scan(&paramB, &ctxWindow)
+			if paramB <= 0 {
+				paramB = 50
+				ctxWindow = 128000
+			}
+			_ = h.pool.AddComboToAll(bgCtx, userID, req.Provider, model, k.ID, paramB, ctxWindow)
 		}
 	}
 
@@ -213,6 +224,38 @@ func (h *KeysHandler) TestKey(w http.ResponseWriter, r *http.Request) {
 		testResult = "error:" + result.Error
 	}
 	_ = h.keyRepo.UpdateTestResult(r.Context(), keyID, testResult)
+
+	// On auth error, zero ALL combos for this key across all discovered models
+	if !result.OK && result.Error == "auth_error" {
+		rows, _ := h.pgPool.Query(r.Context(),
+			`SELECT model_id FROM provider_models WHERE provider = $1`, k.Provider,
+		)
+		var allModels []string
+		if rows != nil {
+			for rows.Next() {
+				var m string
+				if rows.Scan(&m) == nil {
+					allModels = append(allModels, m)
+				}
+			}
+			rows.Close()
+		}
+		if prov2, _ := providers.Get(k.Provider); prov2 != nil && len(allModels) == 0 {
+			allModels = prov2.DefaultModels()
+		}
+		for _, model := range allModels {
+			for _, tier := range []routing.Tier{routing.TierFlashLite, routing.TierFlash, routing.TierPro} {
+				h.pool.UpdateScore(r.Context(), userID, k.Provider, model, keyID, tier, 0.0)
+			}
+		}
+	} else if result.OK {
+		prov2, _ := providers.Get(k.Provider)
+		if prov2 != nil {
+			for _, model := range prov2.DefaultModels() {
+				h.pool.UpdateScore(r.Context(), userID, k.Provider, model, keyID, routing.TierFlash, 0.5)
+			}
+		}
+	}
 
 	if result.OK {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "latency_ms": result.LatencyMs})

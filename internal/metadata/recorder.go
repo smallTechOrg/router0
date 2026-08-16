@@ -21,6 +21,7 @@ type Record struct {
 	Status          string
 	RetryCount      int
 	ErrorClass      string
+	ErrorMessage    string
 }
 
 type Recorder struct {
@@ -43,14 +44,46 @@ func (r *Recorder) RecordAsync(rec Record) {
 
 func (r *Recorder) record(ctx context.Context, rec Record) error {
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO request_metadata 
-		 (user_id, zer0_request_id, provider, model, provider_key_id, pool, input_tokens, output_tokens, latency_ms, estimated_cost_usd, cost_usd, status, retry_count, error_class, error_type)
-		 VALUES ($1, $2, $3, $4, NULLIF($5,'')::uuid, $6, $7, $8, $9, $10, $10, $11, $12, NULLIF($13,''), NULLIF($13,''))`,
+		`INSERT INTO request_metadata
+		 (user_id, zer0_request_id, provider, model, provider_key_id, pool, input_tokens, output_tokens, latency_ms, estimated_cost_usd, cost_usd, status, retry_count, error_class, error_type, error_message)
+		 VALUES ($1, $2, $3, $4, NULLIF($5,'')::uuid, $6, $7, $8, $9, $10, $10, $11, $12, NULLIF($13,''), NULLIF($13,''), NULLIF($14,''))`,
 		rec.UserID, rec.Zer0RequestID, rec.Provider, rec.Model, rec.ProviderKeyID,
 		rec.Pool, rec.InputTokens, rec.OutputTokens, rec.LatencyMs,
-		rec.EstimatedCostUSD, rec.Status, rec.RetryCount, rec.ErrorClass,
+		rec.EstimatedCostUSD, rec.Status, rec.RetryCount, rec.ErrorClass, rec.ErrorMessage,
 	)
 	return err
+}
+
+// Attempt represents a single provider attempt within a request.
+type Attempt struct {
+	Zer0RequestID string
+	UserID        string
+	Provider      string
+	Model         string
+	ProviderKeyID string
+	AttemptOrder  int
+	Status        string // "success" or "error"
+	ErrorClass    string
+	ErrorMessage  string
+	HTTPStatus    int
+	LatencyMs     int64
+}
+
+// RecordAttemptAsync writes a single attempt record asynchronously.
+func (r *Recorder) RecordAttemptAsync(a Attempt) {
+	go func() {
+		ctx := context.Background()
+		_, err := r.pool.Exec(ctx,
+			`INSERT INTO request_attempts
+			 (zer0_request_id, user_id, provider, model, provider_key_id, attempt_order, status, error_class, error_message, http_status, latency_ms)
+			 VALUES ($1, $2, $3, $4, NULLIF($5,'')::uuid, $6, $7, NULLIF($8,''), NULLIF($9,''), NULLIF($10,0), $11)`,
+			a.Zer0RequestID, a.UserID, a.Provider, a.Model, a.ProviderKeyID,
+			a.AttemptOrder, a.Status, a.ErrorClass, a.ErrorMessage, a.HTTPStatus, a.LatencyMs,
+		)
+		if err != nil {
+			slog.Debug("metadata: record attempt failed", "error", err)
+		}
+	}()
 }
 
 // EstimateCost estimates cost for the given provider/model/tokens.

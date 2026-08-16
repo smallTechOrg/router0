@@ -5,18 +5,19 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	activePoolKey = "pool:%s:active"
-	commonPoolKey = "pool:%s:common"
-)
+// Pool key format: pool:{userID}:{tier}
+func tierPoolKey(userID string, tier Tier) string {
+	return fmt.Sprintf("pool:%s:%s", userID, tier.String())
+}
 
 type Pool struct {
-	redis     *redis.Client
-	scorer    ScoreFunc
+	redis       *redis.Client
+	scorer      ScoreFunc
 	rateLimiter *RateLimiter
 }
 
@@ -28,135 +29,258 @@ func NewPool(r *redis.Client) *Pool {
 	}
 }
 
-// AddCombo adds a combo to the user's common pool with default score.
-func (p *Pool) AddCombo(ctx context.Context, userID, provider, model, keyID string) error {
-	key := fmt.Sprintf(commonPoolKey, userID)
+func (p *Pool) Redis() *redis.Client { return p.redis }
+
+// AddCombo adds a combo to the appropriate tier pool with default score.
+func (p *Pool) AddCombo(ctx context.Context, userID, provider, model, keyID string, tier Tier) error {
+	key := tierPoolKey(userID, tier)
 	member := fmt.Sprintf("%s:%s:%s", provider, model, keyID)
-	return p.redis.ZAdd(ctx, key, redis.Z{Score: 0.5, Member: member}).Err()
+	return p.redis.ZAddNX(ctx, key, redis.Z{Score: 0.5, Member: member}).Err()
 }
 
-// RemoveCombo removes a combo from both pools.
-func (p *Pool) RemoveCombo(ctx context.Context, userID, provider, model, keyID string) error {
+// AddComboToAll adds a combo to all tier pools it qualifies for.
+func (p *Pool) AddComboToAll(ctx context.Context, userID, provider, model, keyID string, paramB float64, ctxWindow int) error {
 	member := fmt.Sprintf("%s:%s:%s", provider, model, keyID)
-	p.redis.ZRem(ctx, fmt.Sprintf(activePoolKey, userID), member)
-	p.redis.ZRem(ctx, fmt.Sprintf(commonPoolKey, userID), member)
+	for _, tier := range []Tier{TierFlashLite, TierFlash, TierPro} {
+		f := tier.Filter()
+		if paramB >= f.MinParamB && float64(ctxWindow) >= float64(f.MinContext) {
+			key := tierPoolKey(userID, tier)
+			p.redis.ZAddNX(ctx, key, redis.Z{Score: 0.5, Member: member})
+		}
+	}
 	return nil
 }
 
-// LoadPool loads active and common pool combos for a user.
-func (p *Pool) LoadPool(ctx context.Context, userID string) (active, common []Combo, err error) {
-	active, err = p.loadFromKey(ctx, userID, fmt.Sprintf(activePoolKey, userID), "active")
-	if err != nil {
-		return
+// RemoveCombo removes a combo from all tier pools.
+func (p *Pool) RemoveCombo(ctx context.Context, userID, provider, model, keyID string) error {
+	member := fmt.Sprintf("%s:%s:%s", provider, model, keyID)
+	for _, tier := range []Tier{TierFlashLite, TierFlash, TierPro} {
+		p.redis.ZRem(ctx, tierPoolKey(userID, tier), member)
 	}
-	common, err = p.loadFromKey(ctx, userID, fmt.Sprintf(commonPoolKey, userID), "common")
-	return
+	return nil
 }
 
-func (p *Pool) loadFromKey(ctx context.Context, userID, redisKey, pool string) ([]Combo, error) {
+// RemoveModelFromPools removes ALL combos for a provider:model (any keyID) from a user's pools.
+func (p *Pool) RemoveModelFromPools(ctx context.Context, userID, provider, model string) {
+	prefix := fmt.Sprintf("%s:%s:", provider, model)
+	for _, tier := range []Tier{TierFlashLite, TierFlash, TierPro} {
+		key := tierPoolKey(userID, tier)
+		members, err := p.redis.ZRange(ctx, key, 0, -1).Result()
+		if err != nil {
+			continue
+		}
+		for _, m := range members {
+			if strings.HasPrefix(m, prefix) {
+				p.redis.ZRem(ctx, key, m)
+			}
+		}
+	}
+}
+
+// LoadPool loads combos for a specific tier.
+func (p *Pool) LoadPool(ctx context.Context, userID string, tier Tier) ([]Combo, error) {
+	return p.loadFromKey(ctx, tierPoolKey(userID, tier), tier.String())
+}
+
+func (p *Pool) loadFromKey(ctx context.Context, redisKey, pool string) ([]Combo, error) {
 	members, err := p.redis.ZRevRangeWithScores(ctx, redisKey, 0, -1).Result()
 	if err != nil {
 		return nil, err
 	}
 	combos := make([]Combo, 0, len(members))
 	for _, m := range members {
-		parts := strings.SplitN(m.Member.(string), ":", 3)
-		if len(parts) != 3 {
+		if m.Score == 0 {
+			continue
+		}
+		provider, model, keyID, ok := parseMember(m.Member.(string))
+		if !ok {
 			continue
 		}
 		combos = append(combos, Combo{
-			Provider:      parts[0],
-			Model:         parts[1],
-			ProviderKeyID: parts[2],
+			Provider:      provider,
+			Model:         model,
+			ProviderKeyID: keyID,
 			Pool:          pool,
 		})
 	}
 	return combos, nil
 }
 
-// SelectCombo picks a combo using the 80/20 active/common split.
-func (p *Pool) SelectCombo(ctx context.Context, userID string) ([]ScoredCombo, error) {
-	active, common, err := p.LoadPool(ctx, userID)
+const sessionComboTTL = 10 * time.Minute
+
+func sessionComboKey(userID, conversationID string) string {
+	return fmt.Sprintf("session:%s:%s:combo", userID, conversationID)
+}
+
+// SelectComboForSession pins a conversation to one combo for its lifetime.
+func (p *Pool) SelectComboForSession(ctx context.Context, userID, conversationID string, tier Tier) ([]ScoredCombo, error) {
+	if conversationID != "" {
+		key := sessionComboKey(userID, conversationID)
+		pinned, err := p.redis.Get(ctx, key).Result()
+		if err == nil && pinned != "" {
+			p.redis.Expire(ctx, key, sessionComboTTL)
+			parts := strings.SplitN(pinned, ":", 4) // provider:model:keyID:pool
+			if len(parts) == 4 {
+				combo := Combo{Provider: parts[0], Model: parts[1], ProviderKeyID: parts[2], Pool: parts[3]}
+				return []ScoredCombo{{Combo: combo, Score: 1.0}}, nil
+			}
+		}
+	}
+
+	scored, err := p.SelectCombo(ctx, userID, tier)
 	if err != nil {
 		return nil, err
 	}
 
-	// If active pool empty, fall back to common
-	var candidates []Combo
-	var poolLabel string
-	if len(active) == 0 && len(common) == 0 {
-		return nil, fmt.Errorf("no combos in pool for user %s", userID)
-	}
-	useActive := rand.Float64() < 0.80
-	if useActive && len(active) > 0 {
-		candidates = active
-		poolLabel = "active"
-	} else if len(common) > 0 {
-		candidates = common
-		poolLabel = "common"
-	} else {
-		candidates = active
-		poolLabel = "active"
-	}
-	_ = poolLabel
-
-	// Build metrics (basic — in Phase 2 we read from Redis metrics hash)
-	metrics := buildBasicMetrics(candidates)
-
-	// Filter exhausted
-	filtered := make([]Combo, 0, len(candidates))
-	for _, c := range candidates {
-		if !p.rateLimiter.IsExhausted(ctx, userID, c.Provider, c.Model) {
-			filtered = append(filtered, c)
-		}
-	}
-	if len(filtered) == 0 {
-		filtered = candidates // fall back to all if all exhausted
+	if conversationID != "" && len(scored) > 0 {
+		top := scored[0]
+		pinned := fmt.Sprintf("%s:%s:%s:%s", top.Provider, top.Model, top.ProviderKeyID, top.Pool)
+		key := sessionComboKey(userID, conversationID)
+		p.redis.Set(ctx, key, pinned, sessionComboTTL)
 	}
 
-	scored := p.scorer.Score(ctx, userID, filtered, metrics)
 	return scored, nil
 }
 
-// UpdateScore updates the Redis sorted-set score for a combo.
-func (p *Pool) UpdateScore(ctx context.Context, userID, provider, model, keyID, pool string, score float64) error {
-	var redisKey string
-	if pool == "active" {
-		redisKey = fmt.Sprintf(activePoolKey, userID)
-	} else {
-		redisKey = fmt.Sprintf(commonPoolKey, userID)
+// SelectCombo picks combos from the tier pool.
+func (p *Pool) SelectCombo(ctx context.Context, userID string, tier Tier) ([]ScoredCombo, error) {
+	key := tierPoolKey(userID, tier)
+	members, err := p.redis.ZRevRangeWithScores(ctx, key, 0, -1).Result()
+	if err != nil {
+		return nil, err
 	}
-	member := fmt.Sprintf("%s:%s:%s", provider, model, keyID)
-	return p.redis.ZAdd(ctx, redisKey, redis.Z{Score: score, Member: member}).Err()
-}
+	if len(members) == 0 {
+		return nil, fmt.Errorf("no combos in %s pool for user %s", tier.String(), userID)
+	}
 
-// buildBasicMetrics builds minimal metrics for scoring (Phase 1 basic implementation).
-func buildBasicMetrics(combos []Combo) map[string]ComboMetrics {
-	m := make(map[string]ComboMetrics, len(combos))
-	for _, c := range combos {
-		m[comboKey(c)] = ComboMetrics{
-			ErrorRate:    0,
-			P95LatencyMs: 500,
-			CostPerToken: costPerToken(c.Provider, c.Model),
-			QuotaRatio:   1.0,
+	// Build combos with their Redis scores (health signal)
+	type candidate struct {
+		combo Combo
+		health float64 // Redis score: 0 = dead, 0.5 = untested, higher = healthy
+	}
+	var alive []candidate
+	var dead []candidate
+	for _, m := range members {
+		provider, model, keyID, ok := parseMember(m.Member.(string))
+		if !ok {
+			continue
+		}
+		c := candidate{
+			combo: Combo{Provider: provider, Model: model, ProviderKeyID: keyID, Pool: tier.String()},
+			health: m.Score,
+		}
+		if m.Score == 0 {
+			dead = append(dead, c)
+			continue
+		}
+		alive = append(alive, c)
+	}
+	if len(alive) == 0 {
+		// All dead — return them anyway so the caller can attempt and get a proper error
+		for _, d := range dead {
+			alive = append(alive, d)
 		}
 	}
-	return m
+
+	// Read per-combo usage counts for this tier (round-robin tracking)
+	rrKey := fmt.Sprintf("rr:%s:%s", userID, tier.String())
+	usageCounts, _ := p.redis.HGetAll(ctx, rrKey).Result()
+
+	// Fair share: total requests / number of alive combos
+	totalUsage := int64(0)
+	for _, v := range usageCounts {
+		n, _ := fmt.Sscanf(v, "%d", new(int64))
+		if n > 0 {
+			var val int64
+			fmt.Sscanf(v, "%d", &val)
+			totalUsage += val
+		}
+	}
+	fairShare := float64(totalUsage+1) / float64(len(alive))
+
+	// Score each combo: lower usage ratio = higher priority
+	// Also factor in exhaustion status and health
+	type scoredCandidate struct {
+		combo    Combo
+		priority float64
+		exhausted bool
+	}
+	scored := make([]scoredCandidate, 0, len(alive))
+	for _, c := range alive {
+		memberStr := fmt.Sprintf("%s:%s:%s", c.combo.Provider, c.combo.Model, c.combo.ProviderKeyID)
+		var usage int64
+		if v, ok := usageCounts[memberStr]; ok {
+			fmt.Sscanf(v, "%d", &usage)
+		}
+
+		exhausted := p.rateLimiter.IsExhausted(ctx, userID, c.combo.Provider, c.combo.Model)
+
+		// Priority: inverse of usage ratio, boosted by health
+		usageRatio := float64(usage+1) / (fairShare + 1)
+		priority := (1.0 / (usageRatio + 0.1)) * c.health
+
+		// Small jitter (±5%) to break ties
+		jitter := 0.95 + rand.Float64()*0.10
+		priority *= jitter
+
+		scored = append(scored, scoredCandidate{combo: c.combo, priority: priority, exhausted: exhausted})
+	}
+
+	// Sort: non-exhausted first, then by priority descending
+	for i := 0; i < len(scored); i++ {
+		for j := i + 1; j < len(scored); j++ {
+			swap := false
+			if scored[i].exhausted && !scored[j].exhausted {
+				swap = true
+			} else if scored[i].exhausted == scored[j].exhausted && scored[j].priority > scored[i].priority {
+				swap = true
+			}
+			if swap {
+				scored[i], scored[j] = scored[j], scored[i]
+			}
+		}
+	}
+
+	result := make([]ScoredCombo, 0, len(scored))
+	for _, s := range scored {
+		result = append(result, ScoredCombo{Combo: s.combo, Score: s.priority})
+	}
+	return result, nil
 }
 
-func costPerToken(provider, model string) float64 {
-	costs := map[string]float64{
-		"google:gemini-1.5-flash":        0.075 / 1e6,
-		"google:gemini-1.5-pro":          3.50 / 1e6,
-		"groq:llama-3.1-70b-versatile":   0.59 / 1e6,
-		"groq:mixtral-8x7b-32768":        0.24 / 1e6,
-		"nvidia:meta/llama-3.1-70b-instruct": 0.35 / 1e6,
-		"nvidia:meta/llama-3.1-8b-instruct":  0.10 / 1e6,
-		"together:meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo": 0.88 / 1e6,
-		"together:mistralai/Mixtral-8x7B-Instruct-v0.1":          0.60 / 1e6,
+// UpdateScore updates the Redis sorted-set score for a combo in a specific tier pool.
+func (p *Pool) UpdateScore(ctx context.Context, userID, provider, model, keyID string, tier Tier, score float64) error {
+	member := fmt.Sprintf("%s:%s:%s", provider, model, keyID)
+	return p.redis.ZAdd(ctx, tierPoolKey(userID, tier), redis.Z{Score: score, Member: member}).Err()
+}
+
+// IncrementUsage increments the round-robin usage counter for a combo in a tier.
+// The counters expire after 1 hour so usage naturally rebalances.
+func (p *Pool) IncrementUsage(ctx context.Context, userID string, tier Tier, provider, model, keyID string) {
+	rrKey := fmt.Sprintf("rr:%s:%s", userID, tier.String())
+	member := fmt.Sprintf("%s:%s:%s", provider, model, keyID)
+	p.redis.HIncrBy(ctx, rrKey, member, 1)
+	p.redis.Expire(ctx, rrKey, time.Hour)
+}
+
+// parseMember splits a Redis sorted-set member "provider:model:keyID" where
+// model may contain colons (e.g. "openrouter:nvidia/foo:free:uuid").
+// KeyID is always the last colon-delimited segment; provider is the first.
+func parseMember(member string) (provider, model, keyID string, ok bool) {
+	lastColon := strings.LastIndex(member, ":")
+	if lastColon <= 0 {
+		return "", "", "", false
 	}
-	if v, ok := costs[provider+":"+model]; ok {
-		return v
+	keyID = member[lastColon+1:]
+	rest := member[:lastColon]
+	firstColon := strings.Index(rest, ":")
+	if firstColon <= 0 {
+		return "", "", "", false
 	}
-	return 0.50 / 1e6
+	provider = rest[:firstColon]
+	model = rest[firstColon+1:]
+	if model == "" || keyID == "" {
+		return "", "", "", false
+	}
+	return provider, model, keyID, true
 }

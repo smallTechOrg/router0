@@ -36,7 +36,7 @@ func (r *Repository) Create(ctx context.Context, userID, provider, label, keyHin
 	err := r.pool.QueryRow(ctx,
 		`INSERT INTO provider_keys (user_id, provider, label, key_hint, ciphertext, nonce, model_id, status, models)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', '{}')
-		 RETURNING id, user_id, provider, label, key_hint, ciphertext, nonce, model_id, status, created_at, updated_at`,
+		 RETURNING id, user_id, provider, label, key_hint, ciphertext, nonce, COALESCE(model_id,''), status, created_at, updated_at`,
 		userID, provider, label, keyHint, ciphertext, nonce, nullStr(modelID),
 	).Scan(&k.ID, &k.UserID, &k.Provider, &k.Label, &k.KeyHint, &k.Ciphertext, &k.Nonce, &k.ModelID, &k.Status, &k.CreatedAt, &k.UpdatedAt)
 	return k, err

@@ -38,7 +38,7 @@ func (s *Selector) Pool() *Pool {
 
 // Select picks the best combo and returns it with the decrypted API key.
 func (s *Selector) Select(ctx context.Context, userID string) (*SelectedCombo, []ScoredCombo, error) {
-	scored, err := s.pool.SelectCombo(ctx, userID)
+	scored, err := s.pool.SelectCombo(ctx, userID, TierFlash)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -67,7 +67,7 @@ func (s *Selector) Select(ctx context.Context, userID string) (*SelectedCombo, [
 
 // SelectN picks up to n combos (for hedging) excluding already-tried keyIDs.
 func (s *Selector) SelectN(ctx context.Context, userID string, n int, exclude map[string]bool) ([]*SelectedCombo, error) {
-	scored, err := s.pool.SelectCombo(ctx, userID)
+	scored, err := s.pool.SelectCombo(ctx, userID, TierFlash)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +97,7 @@ func (s *Selector) SelectN(ctx context.Context, userID string, n int, exclude ma
 
 // Execute attempts the inference with adaptive retry (sequential → parallel hedge).
 func (s *Selector) Execute(ctx context.Context, userID string, req *providers.ChatRequest) (*providers.ChatResponse, *SelectedCombo, int, error) {
-	scored, err := s.pool.SelectCombo(ctx, userID)
+	scored, err := s.pool.SelectCombo(ctx, userID, TierFlash)
 	if err != nil {
 		return nil, nil, 0, err
 	}
