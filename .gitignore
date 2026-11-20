@@ -1,0 +1,25 @@
+# Environment secrets — never committed
+.env
+
+# Go build artifacts
+bin/
+*.test
+*.out
+
+# Dashboard
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Colima / Docker
+.colima/
+dashboard/.env.local

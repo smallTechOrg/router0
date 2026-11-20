@@ -1,0 +1,17 @@
+ALTER TABLE users DROP COLUMN IF EXISTS status;
+ALTER TABLE users DROP COLUMN IF EXISTS invited_by;
+ALTER TABLE invites DROP COLUMN IF EXISTS accepted_at;
+ALTER TABLE invites DROP COLUMN IF EXISTS invited_by;
+ALTER TABLE provider_keys DROP COLUMN IF EXISTS key_hint;
+ALTER TABLE provider_keys DROP COLUMN IF EXISTS status;
+ALTER TABLE provider_keys DROP COLUMN IF EXISTS last_test_result;
+ALTER TABLE provider_keys DROP COLUMN IF EXISTS model_id;
+ALTER TABLE request_metadata DROP COLUMN IF EXISTS zer0_request_id;
+ALTER TABLE request_metadata DROP COLUMN IF EXISTS provider_key_id;
+ALTER TABLE request_metadata DROP COLUMN IF EXISTS pool;
+ALTER TABLE request_metadata DROP COLUMN IF EXISTS retry_count;
+ALTER TABLE request_metadata DROP COLUMN IF EXISTS error_class;
+ALTER TABLE request_metadata DROP COLUMN IF EXISTS estimated_cost_usd;
+ALTER TABLE pool_scores DROP COLUMN IF EXISTS provider_key_id;
+ALTER TABLE pool_scores DROP COLUMN IF EXISTS last_health_check_at;
+ALTER TABLE pool_scores DROP COLUMN IF EXISTS error_rate_1h;

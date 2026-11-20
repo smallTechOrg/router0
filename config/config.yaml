@@ -1,0 +1,26 @@
+server:
+  port: 8080
+  read_timeout_seconds: 30
+  write_timeout_seconds: 120
+  shutdown_timeout_seconds: 15
+
+routing:
+  active_pool_fraction: 0.80
+  score_weights:
+    latency: 0.30
+    error_rate: 0.40
+    cost: 0.20
+    quota_remaining: 0.10
+  retry_sequential_max: 2
+  hedge_parallelism: 2
+
+health:
+  idle_probe_interval_seconds: 300
+  probe_model: "llama-3.1-8b-instant"
+  goroutine_pool_size: 10
+
+pool:
+  promote_min_score: 0.75
+  demote_max_error_rate: 0.15
+  rescore_interval_seconds: 300
+  active_pool_max_size: 5
