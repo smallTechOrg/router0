@@ -1,186 +1,193 @@
 'use client';
-import { useEffect, useState } from 'react';
-import { useSession } from 'next-auth/react';
-
-const PROVIDERS = ['groq', 'google', 'openrouter', 'nvidia', 'together', 'baseten'];
+import { useMemo, useState } from 'react';
+import { useAuth, useLoader } from '@/lib/hooks';
+import {
+  addKey, deleteKey, errorMessage, getPriority, listKeys, listProviders, putPriority, testKey,
+  type ProviderKey,
+} from '@/lib/api';
+import KeyStateBadge from '@/components/KeyStateBadge';
+import { btnDanger, btnGhost, btnPrimary, Card, EmptyState, ErrorBanner, fmtTime, inputCls, Loading, Notice, PageHeader } from '@/components/ui';
 
 export default function KeysPage() {
-  const { data: session } = useSession() as any;
-  const [keys, setKeys] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [adding, setAdding] = useState(false);
-  const [form, setForm] = useState({ provider: 'groq', key: '', label: '', model_id: '' });
+  const { token, canWrite } = useAuth();
+  const keys = useLoader((t) => listKeys(t), token, [], 10000);
+  const prio = useLoader((t) => getPriority(t), token, [], 10000);
+  const providers = useLoader((t) => listProviders(t), token);
+
+  const [provider, setProvider] = useState('');
+  const [secret, setSecret] = useState('');
+  const [label, setLabel] = useState('');
+  const [modelId, setModelId] = useState('');
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [testResults, setTestResults] = useState<Record<string, { status: string; message?: string; latency_ms?: number }>>({});
-  const [testing, setTesting] = useState<Record<string, boolean>>({});
+  const [notice, setNotice] = useState('');
+  const [testing, setTesting] = useState<string | null>(null);
 
-  async function loadKeys() {
-    if (!session?.accessToken) return;
-    try {
-      const res = await fetch('/api/keys', { headers: { Authorization: `Bearer ${session.accessToken}` } });
-      const data = await res.json();
-      setKeys(data.keys || []);
-    } catch {
-      setKeys([]);
-    } finally {
-      setLoading(false);
-    }
+  const providerLabel = useMemo(() => {
+    const m: Record<string, string> = {};
+    providers.data?.providers.forEach((p) => { m[p.id] = p.label; });
+    return (id: string) => m[id] || id;
+  }, [providers.data]);
+
+  const byId = useMemo(() => {
+    const m = new Map<string, ProviderKey>();
+    keys.data?.keys.forEach((k) => m.set(k.id, k));
+    return m;
+  }, [keys.data]);
+
+  // Groups in priority order; keys in position order. Disabled keys are not shown.
+  const groups = (prio.data?.providers ?? []).map((g) => ({
+    provider: g.provider,
+    keys: [...g.keys].sort((a, b) => a.position - b.position)
+      .map((k) => byId.get(k.id)).filter((k): k is ProviderKey => !!k),
+  }));
+
+  const effectiveProvider = provider || providers.data?.providers[0]?.id || '';
+
+  async function reloadAll() {
+    await Promise.all([keys.reload(true), prio.reload(true)]);
   }
 
-  useEffect(() => { loadKeys(); }, [session]);
-
-  async function handleAdd(e: React.FormEvent) {
+  async function onAdd(e: React.FormEvent) {
     e.preventDefault();
+    if (!token) return;
     setError('');
-    setAdding(true);
+    setBusy(true);
     try {
-      const res = await fetch('/api/keys', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.accessToken}` },
-        body: JSON.stringify(form),
+      await addKey(token, {
+        provider: effectiveProvider, key: secret, label,
+        ...(effectiveProvider === 'baseten' && modelId ? { model_id: modelId } : {}),
       });
-      const data = await res.json();
-      if (!res.ok) { setError(data?.error?.message || 'Failed to add key'); return; }
-      setForm({ provider: 'groq', key: '', label: '', model_id: '' });
-      loadKeys();
-    } catch { setError('Network error'); }
-    finally { setAdding(false); }
-  }
-
-  async function handleDelete(id: string) {
-    if (!confirm('Delete this key?')) return;
-    await fetch(`/api/keys/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${session.accessToken}` } });
-    loadKeys();
-  }
-
-  async function handleTest(id: string) {
-    setTesting(t => ({ ...t, [id]: true }));
-    setTestResults(r => { const n = { ...r }; delete n[id]; return n; });
-    try {
-      const res = await fetch(`/api/keys/${id}/test`, { method: 'POST', headers: { Authorization: `Bearer ${session.accessToken}` } });
-      const data = await res.json();
-      setTestResults(r => ({ ...r, [id]: { status: data.status, message: data.message, latency_ms: data.latency_ms } }));
-    } catch {
-      setTestResults(r => ({ ...r, [id]: { status: 'error', message: 'Network error' } }));
+      setSecret(''); setLabel(''); setModelId('');
+      setNotice(`Key "${label}" added. Model discovery runs in the background.`);
+      await reloadAll();
+    } catch (err) {
+      setError(errorMessage(err));
     } finally {
-      setTesting(t => { const n = { ...t }; delete n[id]; return n; });
+      setBusy(false);
     }
   }
+
+  async function move(provider: string, idx: number, dir: -1 | 1) {
+    if (!token || !prio.data) return;
+    const g = groups.find((x) => x.provider === provider);
+    if (!g) return;
+    const ids = g.keys.map((k) => k.id);
+    const j = idx + dir;
+    if (j < 0 || j >= ids.length) return;
+    [ids[idx], ids[j]] = [ids[j], ids[idx]];
+    setError('');
+    try {
+      const res = await putPriority(token, {
+        providers: prio.data.providers.map((p) => p.provider),
+        key_order: { [provider]: ids },
+      });
+      prio.setData(res);
+    } catch (err) {
+      setError(errorMessage(err));
+      reloadAll();
+    }
+  }
+
+  async function onTest(k: ProviderKey) {
+    if (!token) return;
+    setTesting(k.id); setError('');
+    try {
+      const r = await testKey(token, k.id);
+      if (r.status === 'ok') setNotice(`"${k.label}" OK: ${r.model_count ?? 0} models, ${r.latency_ms ?? 0} ms.`);
+      else setError(`Test of "${k.label}" failed (${r.class ?? 'error'}): ${r.message ?? 'unknown error'}`);
+      await reloadAll();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setTesting(null);
+    }
+  }
+
+  async function onRemove(k: ProviderKey) {
+    if (!token) return;
+    if (!window.confirm(`Remove key "${k.label}"? It will be disabled and no longer used for routing.`)) return;
+    setError('');
+    try {
+      await deleteKey(token, k.id);
+      setNotice(`Key "${k.label}" removed.`);
+      await reloadAll();
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
+  const loading = (keys.loading || prio.loading) && !keys.data;
 
   return (
-    <div>
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-white">Provider Keys</h1>
-        <p className="mt-1 text-sm text-neutral-400">Manage your encrypted provider API keys.</p>
-      </div>
+    <div className="space-y-6">
+      <PageHeader title="Provider keys" subtitle="Bring your own keys. Within a provider, keys are tried top to bottom; use the arrows to change the order. Status refreshes every 10 s." />
+      <ErrorBanner message={keys.error || prio.error || providers.error} onRetry={reloadAll} />
+      <ErrorBanner message={error} />
+      <Notice message={notice} />
 
-      {/* Add key form */}
-      <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-6 mb-6">
-        <h2 className="text-sm font-semibold text-neutral-200 mb-4">Add a new key</h2>
-        <form className="space-y-4" onSubmit={handleAdd}>
-          {error && <div className="text-sm text-red-400">{error}</div>}
-          <div className="grid grid-cols-2 gap-4">
+      {canWrite && (
+        <Card title="Add provider key">
+          <form onSubmit={onAdd} className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-4 lg:items-end">
             <div>
-              <label className="block text-xs font-medium text-neutral-400 mb-1">Provider</label>
-              <select
-                value={form.provider} onChange={e => setForm(f => ({ ...f, provider: e.target.value }))}
-                className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2 text-sm text-neutral-100 focus:border-indigo-500 focus:outline-none"
-              >
-                {PROVIDERS.map(p => <option key={p} value={p}>{p}</option>)}
+              <label htmlFor="k-provider" className="mb-1.5 block text-sm font-medium text-neutral-300">Provider</label>
+              <select id="k-provider" className={inputCls} value={effectiveProvider} onChange={(e) => setProvider(e.target.value)}>
+                {(providers.data?.providers ?? []).map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
               </select>
             </div>
             <div>
-              <label className="block text-xs font-medium text-neutral-400 mb-1">Label (optional)</label>
-              <input
-                type="text" value={form.label} onChange={e => setForm(f => ({ ...f, label: e.target.value }))}
-                placeholder={form.provider + ' key'}
-                className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2 text-sm text-neutral-100 focus:border-indigo-500 focus:outline-none"
-              />
+              <label htmlFor="k-label" className="mb-1.5 block text-sm font-medium text-neutral-300">Label</label>
+              <input id="k-label" className={inputCls} value={label} onChange={(e) => setLabel(e.target.value)} placeholder="groq-a" required />
             </div>
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-neutral-400 mb-1">API Key</label>
-            <input
-              type="password" value={form.key} onChange={e => setForm(f => ({ ...f, key: e.target.value }))} required
-              className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2 text-sm text-neutral-100 focus:border-indigo-500 focus:outline-none"
-            />
-          </div>
-          {form.provider === 'baseten' && (
             <div>
-              <label className="block text-xs font-medium text-neutral-400 mb-1">Model ID (baseten)</label>
-              <input
-                type="text" value={form.model_id} onChange={e => setForm(f => ({ ...f, model_id: e.target.value }))} required
-                className="w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 py-2 text-sm text-neutral-100 focus:border-indigo-500 focus:outline-none"
-              />
+              <label htmlFor="k-secret" className="mb-1.5 block text-sm font-medium text-neutral-300">API key</label>
+              <input id="k-secret" type="password" autoComplete="off" className={inputCls} value={secret} onChange={(e) => setSecret(e.target.value)} required />
             </div>
-          )}
-          <button
-            type="submit" disabled={adding}
-            className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500 disabled:opacity-50 transition-colors"
-          >
-            {adding ? 'Adding…' : 'Add key'}
-          </button>
-        </form>
-      </div>
+            {effectiveProvider === 'baseten' && (
+              <div>
+                <label htmlFor="k-model" className="mb-1.5 block text-sm font-medium text-neutral-300">Model ID</label>
+                <input id="k-model" className={inputCls} value={modelId} onChange={(e) => setModelId(e.target.value)} />
+              </div>
+            )}
+            <div>
+              <button type="submit" className={`${btnPrimary} w-full`} disabled={busy || !effectiveProvider}>{busy ? 'Adding…' : 'Add key'}</button>
+            </div>
+          </form>
+        </Card>
+      )}
 
-      {/* Keys list */}
-      <div className="rounded-xl border border-neutral-800 bg-neutral-900 overflow-hidden">
-        <div className="px-6 py-4 border-b border-neutral-800">
-          <h2 className="text-sm font-semibold text-neutral-200">Your keys</h2>
-        </div>
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-neutral-800">
-              <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Provider</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Label</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Key hint</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Status</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {loading ? (
-              <tr><td colSpan={5} className="px-6 py-8 text-center text-neutral-500">Loading…</td></tr>
-            ) : keys.length === 0 ? (
-              <tr><td colSpan={5} className="px-6 py-8 text-center text-neutral-500">No keys yet.</td></tr>
-            ) : keys.map((k: any) => (
-              <tr key={k.id} className="border-b border-neutral-800/50">
-                <td className="px-6 py-3 text-neutral-200 capitalize">{k.provider}</td>
-                <td className="px-6 py-3 text-neutral-400">{k.label}</td>
-                <td className="px-6 py-3 font-mono text-xs text-neutral-500">{k.key_hint}</td>
-                <td className="px-6 py-3">
-                  <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                    k.status === 'active' ? 'bg-green-900/40 text-green-400' : 'bg-red-900/40 text-red-400'
-                  }`}>{k.status}</span>
-                </td>
-                <td className="px-6 py-3">
-                  <div className="flex items-center gap-3 flex-wrap">
-                    <button
-                      onClick={() => handleTest(k.id)}
-                      disabled={testing[k.id]}
-                      className="text-xs text-indigo-400 hover:text-indigo-300 disabled:opacity-50"
-                    >
-                      {testing[k.id] ? 'Testing…' : 'Test'}
-                    </button>
-                    <button onClick={() => handleDelete(k.id)} className="text-xs text-red-400 hover:text-red-300">Delete</button>
-                    {testResults[k.id] && (
-                      <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                        testResults[k.id].status === 'ok'
-                          ? 'bg-green-900/40 text-green-400'
-                          : 'bg-red-900/40 text-red-400'
-                      }`}>
-                        {testResults[k.id].status === 'ok'
-                          ? `ok${testResults[k.id].latency_ms ? ` · ${testResults[k.id].latency_ms}ms` : ''}`
-                          : testResults[k.id].message || 'error'}
-                      </span>
-                    )}
+      {loading ? (
+        <Card><Loading /></Card>
+      ) : groups.length === 0 ? (
+        <Card><EmptyState title="No provider keys yet" hint={canWrite ? 'Add a Groq or OpenRouter key above.' : 'Ask an org owner or admin to add one.'} /></Card>
+      ) : (
+        groups.map((g, gi) => (
+          <Card key={g.provider} title={`${providerLabel(g.provider)}${gi === 0 ? ' (highest priority)' : ''}`}>
+            <ul className="divide-y divide-neutral-800">
+              {g.keys.map((k, i) => (
+                <li key={k.id} className="flex flex-wrap items-center gap-3 px-5 py-3">
+                  <span className="w-5 text-xs text-neutral-500" aria-label={`Position ${i + 1}`}>{i + 1}</span>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-neutral-100">{k.label}</p>
+                    <p className="truncate font-mono text-xs text-neutral-500">
+                      {k.key_hint} · last test: {k.last_test_result ? `${k.last_test_result}, ${fmtTime(k.last_tested_at)}` : 'never'}
+                    </p>
                   </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+                  <KeyStateBadge keyInfo={k} />
+                  {canWrite && (
+                    <div className="flex items-center gap-1.5">
+                      <button className={btnGhost} onClick={() => move(g.provider, i, -1)} disabled={i === 0} aria-label={`Move ${k.label} up`}>▲</button>
+                      <button className={btnGhost} onClick={() => move(g.provider, i, 1)} disabled={i === g.keys.length - 1} aria-label={`Move ${k.label} down`}>▼</button>
+                      <button className={btnGhost} onClick={() => onTest(k)} disabled={testing === k.id}>{testing === k.id ? 'Testing…' : 'Test'}</button>
+                      <button className={btnDanger} onClick={() => onRemove(k)}>Remove</button>
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </Card>
+        ))
+      )}
     </div>
   );
 }

@@ -4,58 +4,52 @@ import { authOptions } from '@/lib/auth';
 import Link from 'next/link';
 
 const navItems = [
-  { label: 'Pool Status', href: '/dashboard' },
+  { label: 'Overview', href: '/dashboard' },
+  { label: 'Tokens', href: '/dashboard/tokens' },
   { label: 'Provider Keys', href: '/dashboard/keys' },
+  { label: 'Routing', href: '/dashboard/routing' },
   { label: 'Requests', href: '/dashboard/requests' },
   { label: 'Costs', href: '/dashboard/costs' },
 ];
+
+const linkCls =
+  'flex items-center whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-colors hover:bg-neutral-800 focus:outline-none focus:ring-2 focus:ring-indigo-400';
 
 export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
   const session = await getServerSession(authOptions);
   if (!session) redirect('/auth/login');
 
   return (
-    <div className="flex h-full min-h-screen">
-      <aside className="w-60 shrink-0 border-r border-neutral-800 bg-neutral-900 flex flex-col">
-        <div className="flex items-center gap-2 px-6 py-5 border-b border-neutral-800">
-          <span className="text-lg font-bold tracking-tight text-white">
-            Zer0<span className="text-indigo-400"> Router</span>
-          </span>
+    <div className="flex min-h-screen flex-col md:flex-row">
+      <aside className="shrink-0 border-b border-neutral-800 bg-neutral-900 md:flex md:w-60 md:flex-col md:border-b-0 md:border-r">
+        <div className="flex items-center justify-between gap-2 px-6 py-4 md:py-5 md:border-b md:border-neutral-800">
+          <Link href="/dashboard" className="text-lg font-bold tracking-tight text-white">
+            router<span className="text-indigo-400">0</span>
+          </Link>
+          <div className="text-right md:hidden">
+            <p className="max-w-[10rem] truncate text-xs text-neutral-500">{session.user?.email}</p>
+            <a href="/api/auth/signout" className="text-xs text-neutral-500 hover:text-neutral-300">Sign out</a>
+          </div>
         </div>
-        <nav className="flex-1 px-3 py-4 space-y-0.5">
+        <nav aria-label="Main" className="flex gap-1 overflow-x-auto px-3 pb-3 md:flex-1 md:flex-col md:space-y-0.5 md:overflow-visible md:py-4">
           {navItems.map((item) => (
-            <Link
-              key={item.href}
-              href={item.href}
-              className="flex items-center rounded-lg px-3 py-2 text-sm font-medium text-neutral-300 hover:bg-neutral-800 hover:text-white transition-colors"
-            >
+            <Link key={item.href} href={item.href} className={`${linkCls} text-neutral-300 hover:text-white`}>
               {item.label}
             </Link>
           ))}
           {(session as any)?.user?.role === 'admin' && (
-            <>
-              <Link
-                href="/dashboard/admin"
-                className="flex items-center rounded-lg px-3 py-2 text-sm font-medium text-amber-400 hover:bg-neutral-800 transition-colors"
-              >
-                Admin Panel
-              </Link>
-              <Link
-                href="/dashboard/admin/models"
-                className="flex items-center rounded-lg px-3 py-2 text-sm font-medium text-amber-400/70 hover:bg-neutral-800 transition-colors"
-              >
-                Model Registry
-              </Link>
-            </>
+            <Link href="/dashboard/admin" className={`${linkCls} text-amber-400`}>
+              Admin
+            </Link>
           )}
         </nav>
-        <div className="px-6 py-4 border-t border-neutral-800">
-          <p className="text-xs text-neutral-500 truncate">{session.user?.email}</p>
-          <a href="/api/auth/signout" className="mt-1 text-xs text-neutral-600 hover:text-neutral-400">Sign out</a>
+        <div className="hidden border-t border-neutral-800 px-6 py-4 md:block">
+          <p className="truncate text-xs text-neutral-500">{session.user?.email}</p>
+          <a href="/api/auth/signout" className="mt-1 inline-block text-xs text-neutral-500 hover:text-neutral-300">Sign out</a>
         </div>
       </aside>
-      <main className="flex-1 overflow-auto bg-neutral-950">
-        <div className="mx-auto max-w-7xl px-6 py-8">{children}</div>
+      <main className="min-w-0 flex-1 bg-neutral-950">
+        <div className="mx-auto max-w-7xl px-4 py-6 md:px-6 md:py-8">{children}</div>
       </main>
     </div>
   );
