@@ -1,29 +1,40 @@
 groups:
-  - name: zer0_router
+  - name: router0
     rules:
-      - alert: HighProviderErrorRate
-        expr: rate(zer0_provider_errors_total[5m]) > 0.1
-        for: 2m
+      - alert: HighRequestErrorRatio
+        expr: |
+          sum(rate(router0_requests_total{status="error"}[5m]))
+            / clamp_min(sum(rate(router0_requests_total[5m])), 1e-9) > 0.15
+        for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "High provider error rate for {{ $labels.provider }}/{{ $labels.model }}"
-          description: "Error rate {{ $value }} errors/sec over 5m"
+          summary: "More than 15% of inference requests are failing"
+          description: "Error ratio is {{ $value | humanizePercentage }} over 5m"
 
-      - alert: AllProvidersDown
-        expr: sum(zer0_requests_total{status="success"}) == 0
-        for: 5m
+      - alert: ProviderKeysOutOfCredits
+        expr: increase(router0_key_state_marks_total{reason="credits_exhausted"}[15m]) > 0
+        for: 0m
         labels:
-          severity: critical
+          severity: warning
         annotations:
-          summary: "No successful requests in 5 minutes"
-          description: "Zer0 Router is not successfully routing any requests"
+          summary: "Provider keys are running out of credits ({{ $labels.provider }})"
+          description: "{{ $value }} credits_exhausted marks in the last 15m"
+
+      - alert: RequestLogDropping
+        expr: increase(router0_metadata_dropped_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Request-log records are being dropped"
+          description: "The async metadata buffer is full; check PostgreSQL write latency"
 
       - alert: HighP95Latency
-        expr: histogram_quantile(0.95, rate(zer0_request_duration_seconds_bucket[5m])) > 5
+        expr: histogram_quantile(0.95, sum by (le, provider) (rate(router0_request_duration_seconds_bucket{stream="false"}[5m]))) > 10
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "High p95 latency for {{ $labels.provider }}/{{ $labels.model }}"
+          summary: "High p95 latency for {{ $labels.provider }}"
           description: "p95 latency is {{ $value }}s"
