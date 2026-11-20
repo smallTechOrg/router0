@@ -1,165 +1,259 @@
-# Roadmap: Zer0 Router
+# Roadmap: router0
 
 ## Goal and Scope
 
-Build a self-hosted, OpenAI-compatible inference gateway that routes across multiple user-supplied provider keys, maximises availability, and shows pool health in a web dashboard.
+Turn the existing Zer0 Router (Go 1.22 + Next.js 14 + Postgres + Redis) into **router0**: an org-scoped, OpenAI-compatible gateway with BYOK keys, many revocable service tokens, canonical-model resolution, fixed provider priority with key order and header override, failover on any error, and three distinct actionable errors (404 / 402 / 429). The stack is extended, not rewritten, except that Redis is removed and everything runs bare-local against the developer's Postgres 14 (binding user directive; see architecture.md › Stack).
 
-**In scope (Phase 1):** Single-binary Go gateway + Next.js dashboard + PostgreSQL + Redis. All six capabilities below delivered end-to-end.
+**Already exists (Scaffold done, commit db85a19):** the Go binary with chi routes, JWT + invite auth, AES-GCM provider keys, six OpenAI-compatible adapters, a pool/scorer router that ignores the requested model, `request_metadata` + `request_attempts`, and a dashboard with login/keys/requests/costs/admin pages. `internal/integration/gateway_test.go` does not compile (`NewAdminHandler` arity) and is replaced in Phase 1.
 
-**Out of scope across all phases:**
-- Storing prompt or response content
-- Email delivery (invites are shown on-screen)
-- Billing or markup
-- OAuth / SSO login
-- Fine-tuning or model hosting
-- Conversation history storage
-- Mobile application
+**Out of scope (all phases):** storing prompt/response content; smart/semantic/learned routing; billing or markup; email delivery (invites stay on-screen); OAuth/SSO; multi-org membership per user; image/audio inputs; fine-tuning/hosting; conversation storage.
+
+### Common environment for every gate
+
+All gates run from the repo root, bare-local: the developer's Homebrew `postgresql@14` on `127.0.0.1:5432`, test database `router0_test`, `GO111MODULE=on`, **no real provider keys** (mock providers via `httptest`), and no other services. The block below is referred to as `GATE_ENV`:
+
+```bash
+pg_isready -h 127.0.0.1 -p 5432 && \
+(createdb router0_test 2>/dev/null || true) && \
+export GO111MODULE=on \
+  DATABASE_URL="postgres://$(whoami)@127.0.0.1:5432/router0_test?sslmode=disable" \
+  AES_KEY='000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f' \
+  JWT_SECRET='router0-gate-jwt-secret-0123456789abcdef'
+```
+
+Assumed: `router0_test` (and the dev database `router0`, created once with `createdb router0`) are owned by the current OS user with no password. The integration tests run migrations themselves (`db.RunMigrations`) and create unique orgs/users per test, so `router0_test` is never wiped between runs. `(createdb … || true)` makes the step idempotent; the parentheses keep a failing `pg_isready` from being swallowed by `|| true`.
 
 ---
 
-## Phases of Development
+## Phase 1: Org-scoped gateway with canonical models and failover (quick win)
+
+**Goal:** A user registers (org created), adds Groq and OpenRouter keys (mock or real), sets provider priority and key order, creates/revokes service tokens in the dashboard, and calls `/v1/chat/completions` (streaming and not) with a canonical model name. They see failover across keys and providers, get `404 model_not_found` / `402 insufficient_credits` / `429 rate_limited` + `Retry-After` when everything is exhausted, and see each request's provider, key, latency, tokens, status, and failover trail in the request log. Everything user-visible is named router0.
+
+Capabilities: auth-onboarding, service-tokens, provider-key-management, model-catalog (discovery for Groq + OpenRouter), routing-engine, error-classification, provider-adapters (Groq + OpenRouter), dashboard (Phase 1 pages), observability.
+
+### Slices (owned paths are disjoint)
+
+| Slice | Owns (exclusive write access) | Depends on |
+|-------|-------------------------------|------------|
+| **1A Schema** | `migrations/000014_create_orgs.{up,down}.sql`, `migrations/000015_create_service_tokens.{up,down}.sql`, `migrations/000016_org_provider_routing.{up,down}.sql`, `migrations/000017_org_model_catalog.{up,down}.sql`, `migrations/000018_request_log_org.{up,down}.sql`, `migrations/000019_provider_key_state.{up,down}.sql` | — (runs first; small) |
+| **1B Orgs, auth & tokens** | `internal/auth/`, `internal/orgs/`, `internal/tokens/`, `internal/handlers/auth.go`, `internal/handlers/tokens.go`, `internal/handlers/admin.go` | 1A |
+| **1C Catalog** | `internal/catalog/`, `internal/handlers/catalog.go` | 1A; existing `providers.Provider.ListModels` |
+| **1D Keys & priority** | `internal/keys/`, `internal/handlers/keys.go`, `internal/handlers/priority.go` | 1A; contracts `catalog.Discoverer`, `keystate.Store` (injected) |
+| **1E Adapters, classification, key state & cache** | `internal/providers/`, `internal/keystate/` (Postgres `provider_key_state` + in-memory cache), `internal/cache/` | 1A (000019) for keystate tests |
+| **1F Routing & inference** | `internal/routing/` (incl. deleting the legacy Redis-based files), `internal/handlers/inference.go`, `internal/handlers/helpers.go`, `internal/metadata/`, `internal/metrics/`, `config/alerts.yaml` | contracts from 1B, 1C, 1D, 1E (architecture.md › Phase 1 Internal Contracts) |
+| **1G Request log API** | `internal/handlers/pool.go` | 1A |
+| **1H Dashboard** | `dashboard/` | api.md (may build against stubbed responses) |
+| **1I Wiring, mocks, Redis removal & gate** | `internal/server/`, `cmd/router/main.go`, `cmd/mockprovider/`, `internal/testutil/`, `internal/integration/`, `internal/db/redis.go` (delete), `internal/health/` (delete), `internal/models/`, `go.mod`, `go.sum`, `docker-compose.yml`, `Makefile`, `.env.example`, `README.md` | all others (integrates last) |
+
+Order: 1A first → 1B, 1C, 1D, 1E, 1G, 1H in parallel → 1F (can start in parallel against the contracts and integrates once 1B–1E land) → 1I.
+
+Not owned by any Phase 1 slice and not to be edited: `internal/db/postgres.go`, `internal/db/db_test.go`, `migrations/000001`–`000013`, `spec/`, `NOTES.md`.
+
+Redis removal in Phase 1 is spread across owners: 1B removes the redis client from `handlers/admin.go`; 1F removes it from `handlers/inference.go` and deletes the legacy `internal/routing/{pool,scorer,selector,promoter,tier,meta_syncer,ratelimit,ratelimit_observer,remediate}.go`; 1I deletes `internal/db/redis.go` and `internal/health/`, strips `routing.Pool`/redis from `internal/models/discovery.go`, drops `REDIS_URL` from `main.go`/`.env.example`, removes the Redis service from `docker-compose.yml` (now documented in `README.md` as a deployment example only), and runs `go mod tidy` so `github.com/redis/go-redis/v9` leaves `go.mod`.
+
+### Key files per slice
+
+- **1A:** six migration pairs exactly as in data.md, including backfills (one org per existing user, legacy tokens, `provider_keys.org_id/position`, priority rows) and `provider_key_state`. PG 14-compatible SQL only.
+- **1B:** `internal/auth/middleware.go` (`ServiceTokenMiddleware`, `JWTMiddleware` + `org_id`, `RequireOrgRole`, OpenAI-shaped 401 for `/v1`), `internal/auth/jwt.go` (`OrgID` claim), `internal/auth/keygen.go` (`GenerateServiceToken`, unbiased base58), `internal/tokens/repository.go`, `internal/tokens/verifier.go` (sha256 + legacy bcrypt + 30 s in-process cache via `internal/cache`, evicted on revoke), `internal/orgs/repository.go`, `internal/handlers/tokens.go`, `internal/handlers/auth.go` (transactional register creating org, no key), `internal/handlers/admin.go` (invites with `org_id`, `/admin/orgs`, remove pool endpoints and the `routing.Pool` constructor dependency). Unit tests: keygen format/distribution, verifier cache-hit path, legacy bcrypt path.
+- **1C:** `internal/catalog/canonical.go` + `canonical_test.go` (fixture table from model-catalog.md), `internal/catalog/overrides.go`, `internal/catalog/repository.go` (upsert/mark-unavailable/list), `internal/catalog/discovery.go` (`RefreshProvider`, in-process per-(org,provider) mutex, key fallback on auth), `internal/catalog/resolver.go`, `internal/catalog/scheduler.go` (6-hourly refresh loop, started by 1I), `internal/handlers/catalog.go` (`GET /v1/models`, `GET /api/catalog`, `POST /api/catalog/refresh`).
+- **1D:** `internal/keys/repository.go` (org-scoped CRUD, `position`, `ActiveByOrgProvider`, `MarkAuthError`), `internal/keys/priority.go` (`PriorityStore`, transactional replace), `internal/handlers/keys.go` (`/api/keys*`, `/api/providers`, `state` from keystate, discovery trigger; drop `AddComboToAll`), `internal/handlers/priority.go` (`/api/routing/priority`).
+- **1E:** `internal/providers/provider.go` (extended types: `ErrorClass` set, `ProviderError{Code,RetryAfter}`, `ChatChunk{Usage,Err}`, `*float64` temperature, tool-call `Index`), `internal/providers/classify.go` + `classify_test.go` (generic rules, Retry-After parsing), `internal/providers/openai_compat.go` (classifier use, shared transport, no 15 s client timeout, `include_usage`, 1 MiB scanner, SSE error events), `internal/providers/groq.go` / `openrouter.go` (Classifier overrides, base-URL `ListModels`, drop `:free` filter, router0 attribution headers), `internal/providers/registry.go` (per-file `init`, derived `ValidProviders`), `internal/keystate/store.go` + `store_test.go` (Postgres `provider_key_state` `Check`/`CheckMany`/`Mark`/`Sweep` with a 2 s write-through in-memory cache; tests use `DATABASE_URL` when set, else skip), `internal/cache/ttl.go` + `ttl_test.go` (generic TTL+LRU, injectable clock).
+- **1F:** `internal/routing/plan.go`, `internal/routing/executor.go`, `internal/routing/outcome.go` + table tests (fake AttemptFuncs, fake keystate), `internal/handlers/inference.go` (rewritten: parse → resolve → plan → execute → respond; stream commit-on-first-chunk; `X-Router0-*` headers; removes the `ListModels` func), `internal/handlers/helpers.go` (`writeOpenAIError`), `internal/metadata/recorder.go` (org/token/label/trail fields, buffered async writer, no raw bodies), `internal/metrics/prometheus.go` (`router0_*`), `config/alerts.yaml`.
+- **1G:** `internal/handlers/pool.go` → `GET /api/requests` (filters, cursor, `trail`, `token_name`), `GET /api/requests/{id}`, `GET /api/costs` org-scoped; delete `GetPool`/`GetAttempts` and the `routing.Pool` constructor dependency. (1D likewise drops `routing.Pool` from `NewKeysHandler`.)
+- **1H:** `dashboard/app/dashboard/layout.tsx` (nav, brand), `page.tsx` (overview), `tokens/page.tsx`, `keys/page.tsx`, `routing/page.tsx`, `requests/page.tsx`, `admin/page.tsx` (invite org select), `app/auth/register/page.tsx` (org name; redirect to tokens), `components/TokenCreatedModal.tsx`, `components/FailoverTrail.tsx`, `components/KeyStateBadge.tsx`, `lib/api.ts` (typed wrappers for every Phase 1 endpoint), `package.json` name `router0-dashboard`; remove "Zer0" strings.
+- **1I:** `internal/server/router.go` (`server.New(Deps) http.Handler`: the single route table), `cmd/router/main.go` (uses `server.New`; no `REDIS_URL`; no legacy scheduler/promoter/meta-syncer; starts catalog scheduler and hourly `keystate.Sweep`; `/healthz` reports db only; `service: router0` log field; admin bootstrap creates org), `internal/testutil/mockprovider/mockprovider.go` (scripted OpenAI-compatible server; behaviour selected by bearer key: `mock-ok*`, `mock-429-<secs>*`, `mock-402*`, `mock-401*`, `mock-500*`, `mock-midstream*`; configurable `/models` list; per-key call counters; error bodies contain `SENTINEL-BODY`), `cmd/mockprovider/main.go` (serves Groq-flavoured mock on `:9901` and OpenRouter-flavoured on `:9902`), `internal/integration/phase1_test.go`, `internal/integration/smoke_test.go` (`//go:build integration && smoke`), delete `internal/integration/gateway_test.go`, `Makefile` targets `gate-phase1`, `smoke`, `mock`, `db` (`createdb router0; createdb router0_test`, idempotent), and `dev`/`test` without `source .env` requirements for Redis, `.env.example` (`DATABASE_URL=postgres://<you>@127.0.0.1:5432/router0?sslmode=disable`, router0 vars, `TEST_OPENROUTER_KEY`, no Redis vars), `README.md` (bare-local quick start; docker-compose described as a deployment example only).
+
+### Integration tests required in `internal/integration/phase1_test.go` (all mock-only)
+
+`TestPhase1_RegisterCreatesOrg`, `TestPhase1_TokenLifecycle` (create → use → revoke → 401), `TestPhase1_LegacyTokenAccepted`, `TestPhase1_CatalogDiscovery`, `TestPhase1_PriorityOrder`, `TestPhase1_KeyOrderFailover`, `TestPhase1_ProviderFailover`, `TestPhase1_HeaderOverride`, `TestPhase1_Streaming`, `TestPhase1_StreamFailoverBeforeFirstByte`, `TestPhase1_StreamInterrupted`, `TestPhase1_ModelNotFound`, `TestPhase1_InsufficientCredits`, `TestPhase1_RateLimitedRetryAfter`, `TestPhase1_MixedPrecedence`, `TestPhase1_CooldownSkips`, `TestPhase1_CooldownPersistsAcrossRestart` (a second `server.New` instance on the same DB skips the key marked by the first, proving Postgres is the source of truth), `TestPhase1_RevokeInvalidatesCacheImmediately`, `TestPhase1_AuthErrorDisablesKey`, `TestPhase1_RequestLogTrail`, `TestPhase1_NoContentStored`, `TestPhase1_OrgIsolation`, `TestPhase1_MetricsRenamed`. Each one implements the matching success criteria in the capability files.
+
+### Gate (exact command)
+
+```bash
+pg_isready -h 127.0.0.1 -p 5432 && \
+(createdb router0_test 2>/dev/null || true) && \
+export GO111MODULE=on \
+  DATABASE_URL="postgres://$(whoami)@127.0.0.1:5432/router0_test?sslmode=disable" \
+  AES_KEY='000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f' \
+  JWT_SECRET='router0-gate-jwt-secret-0123456789abcdef' && \
+go build ./... && \
+go vet ./... && \
+go vet -tags 'integration smoke' ./internal/integration/... && \
+go test ./internal/... -count=1 && \
+go test -tags integration ./internal/integration/... -run 'TestPhase1' -count=1 -v && \
+! grep -q 'go-redis' go.mod && \
+! grep -rIqi 'zer0' dashboard/app dashboard/components && \
+(cd dashboard && pnpm install --frozen-lockfile && pnpm run build)
+```
+
+`make gate-phase1` runs the same command. It needs no provider keys, no Docker, and no Redis; only the local Postgres 14 must be running (`brew services start postgresql@14`). The gate passes only if every `TestPhase1_*` runs (none skipped) and passes.
+
+### Optional real-key smoke (not part of the gate)
+
+```bash
+(createdb router0_test 2>/dev/null || true) && \
+GO111MODULE=on \
+DATABASE_URL="postgres://$(whoami)@127.0.0.1:5432/router0_test?sslmode=disable" \
+AES_KEY='000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f' \
+JWT_SECRET='router0-gate-jwt-secret-0123456789abcdef' \
+TEST_GROQ_KEY="$TEST_GROQ_KEY" TEST_OPENROUTER_KEY="$TEST_OPENROUTER_KEY" \
+go test -tags 'integration smoke' ./internal/integration/... -run 'TestSmoke' -count=1 -v
+```
+
+`TestSmokeGroq` (skips unless `TEST_GROQ_KEY`): discovery finds `llama-3.3-70b`, and a non-stream + stream completion succeed. `TestSmokeOpenRouter` (skips unless `TEST_OPENROUTER_KEY`): the same with `llama-3.3-70b:free` or `llama-3.3-70b`. `TestSmokeRealFailover` (skips unless both are set): an invalid Groq key `gsk_invalid_router0_smoke` at position 0, the real Groq key next, then OpenRouter. The request succeeds and the trail shows `auth` then `success`. `make smoke` runs the same.
+
+### How the user tests it
+
+Without real keys (browser + curl):
+1. `brew services start postgresql@14` (if not running); `make db` (creates `router0` and `router0_test`); `cp .env.example .env` and fill `DATABASE_URL=postgres://$(whoami)@127.0.0.1:5432/router0?sslmode=disable`, `AES_KEY`, `JWT_SECRET`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`.
+2. Terminal 1: `make mock` (Groq mock on `:9901`, OpenRouter mock on `:9902`).
+3. Terminal 2: `source .env && GROQ_BASE_URL=http://127.0.0.1:9901 OPENROUTER_BASE_URL=http://127.0.0.1:9902 make dev`.
+4. Terminal 3: `cd dashboard && pnpm dev`; open `http://localhost:3000`, log in as admin, create an invite (Admin), open the invite link in a private window, and register as `owner@example.com` (org created).
+5. Provider Keys: add Groq key `mock-429-15-a` (label `groq-a`), Groq key `mock-ok-b` (label `groq-b`), OpenRouter key `mock-ok-or` (label `or-main`).
+6. Tokens: create `demo-svc` and copy the `r0-sk-…` token from the modal into `T`. `curl -s localhost:8080/v1/models -H "Authorization: Bearer $T"` lists `llama-3.3-70b` with providers groq and openrouter.
+7. `curl -s localhost:8080/v1/chat/completions -H "Authorization: Bearer $T" -H 'Content-Type: application/json' -d '{"model":"llama-3.3-70b","messages":[{"role":"user","content":"hi"}]}' -D -` → 200, `X-Router0-Provider: groq`, `X-Router0-Key: groq-b`, `X-Router0-Attempts: 2`.
+8. Same with `"stream":true` → SSE chunks then `data: [DONE]`.
+9. Requests page: the request shows trail `groq/groq-a ✕ rate_limit 429 → groq/groq-b ✓`; Provider Keys shows `groq-a` "rate limited · Ns".
+10. Routing page: move OpenRouter above Groq and Save; repeat step 7 → `X-Router0-Provider: openrouter`. Add `-H 'X-Router0-Providers: groq'` → served by Groq again.
+11. Errors: `"model":"no-such-model"` → 404 `model_not_found`. Remove `groq-b` and `or-main`, add Groq `mock-402-x` → 429 while `groq-a` cools down (precedence); after 15 s → 402 `insufficient_credits`. Keys `mock-429-40-*` only → 429 with `Retry-After` ≈ 40.
+12. Tokens: revoke `demo-svc`; step 7 → 401 `invalid_api_key`.
+
+With real keys: same flow without steps 2–3's base-URL overrides, using real Groq/OpenRouter keys, and `model: "llama-3.3-70b"`.
 
 ---
 
-### Scaffold
+## Phase 2: Anthropic, Gemini, Mesh API, tool calling, catalog page, aliases, on-demand discovery
 
-**Goal:** A runnable skeleton — the Go binary starts, connects to PostgreSQL and Redis, runs migrations, serves `GET /healthz`, and the Next.js dashboard builds. Everything wired; no business logic yet.
+**Goal:** Org adds Anthropic, Gemini, and Mesh API keys. `claude-sonnet-5-5` (or any discovered Claude model) is served via Anthropic's native Messages API, and via OpenRouter/Mesh API on failover. OpenAI-format tool calling works identically across Groq, OpenRouter, Anthropic, Gemini, and Mesh API, streaming included. The Catalog page shows canonical model → providers. Org aliases work. A model that a provider started offering after the last refresh is found on demand at request time.
 
-**Independent slices:**
+Capabilities: provider-adapters (Anthropic, Gemini, Mesh API), error-classification (their rules), model-catalog (aliases, on-demand), dashboard (catalog page).
 
-| Slice | Owns | Dependencies |
-|-------|------|-------------|
-| A: Go skeleton | `cmd/router/main.go`, `internal/db/postgres.go`, `internal/db/redis.go`, `migrations/`, `docker-compose.yml`, `Makefile`, `.env.example` | None |
-| B: Next.js shell | `dashboard/` (layout, login page stub, tailwind, next.config.ts) | None |
+### Slices
 
-**Gate:**
+| Slice | Owns | Depends on |
+|-------|------|------------|
+| **2A Schema** | `migrations/000020_org_model_aliases.{up,down}.sql` | Phase 1 |
+| **2B Anthropic adapter** | `internal/providers/anthropic.go`, `internal/providers/anthropic_translate.go`, `internal/providers/anthropic_stream.go`, `internal/providers/anthropic_test.go`, `internal/providers/anthropic_translate_test.go`, `internal/providers/anthropic_stream_test.go`, `internal/providers/testdata/anthropic/` | Phase 1 provider types |
+| **2C Gemini conformance** | `internal/providers/google.go`, `internal/providers/google_test.go`, `internal/providers/testdata/gemini/` | Phase 1 |
+| **2D Mesh API adapter** | `internal/providers/meshapi.go`, `internal/providers/meshapi_test.go` | Phase 1 |
+| **2E Aliases & on-demand discovery** | `internal/catalog/` (adds `aliases.go`, `ondemand.go`; edits `resolver.go`, `overrides.go`), `internal/handlers/catalog.go`, `internal/handlers/aliases.go` | 2A |
+| **2F Dashboard catalog** | `dashboard/` | 2E API (api.md) |
+| **2G Wiring, mocks & gate** | `internal/server/`, `cmd/router/main.go`, `cmd/mockprovider/`, `internal/testutil/`, `internal/integration/phase2_test.go`, `internal/integration/smoke_phase2_test.go`, `Makefile`, `.env.example`, `README.md` | all |
+
+Order: 2A → 2B, 2C, 2D, 2E, 2F in parallel → 2G.
+
+### Key files
+
+- **2B:** translation tables and streaming event mapping exactly as in provider-adapters.md; `Classify` per error-classification.md; `ListModels` with `after_id` pagination; golden fixtures in `testdata/anthropic/*.json|*.sse`.
+- **2C:** tool-calling conformance tests (mock fixtures of Google's OpenAI-compat responses incl. array-wrapped errors, missing tool-call ids), native `GET /v1beta/models` listing with chat/embedding kind, Gemini `Classify`.
+- **2D:** `MeshAPIProvider` on `openai_compat.go`, base URL `MESHAPI_BASE_URL`, self-registration.
+- **2E:** `aliases.go` (CRUD + shadowing check), `ondemand.go` (miss debounce key, parallel refresh with 10 s cap), resolver alias step, overrides for Claude/Gemini ids; `GET/POST/DELETE /api/aliases`; `/v1/models` includes aliases.
+- **2F:** `dashboard/app/dashboard/catalog/page.tsx`, `components/ProviderChip.tsx`, `lib/api.ts` (catalog, refresh, aliases), keys page provider labels for Anthropic / Mesh API.
+- **2G:** `mockprovider` gains Anthropic wire format (`/v1/messages`, SSE events, `x-api-key`) and a Gemini-flavoured OpenAI-compat mock, scripted tool-calling conversations, and a mutable `/models` list (for on-demand tests); `cmd/mockprovider` adds `:9903` (anthropic), `:9904` (gemini), `:9905` (meshapi).
+
+### Integration tests required in `internal/integration/phase2_test.go`
+
+`TestPhase2_AnthropicChat`, `TestPhase2_AnthropicStream`, `TestPhase2_AnthropicToolCalling`, `TestPhase2_AnthropicStreamToolCalls`, `TestPhase2_AnthropicCreditsIs402`, `TestPhase2_GeminiToolCalling`, `TestPhase2_MeshAPIChat`, `TestPhase2_CrossProviderToolParity`, `TestPhase2_ClaudeFailoverToOpenRouter` (Anthropic 529 → OpenRouter `anthropic/claude-sonnet-5.5` serves canonical `claude-sonnet-5-5`), `TestPhase2_Aliases`, `TestPhase2_AliasCannotShadow`, `TestPhase2_OnDemandDiscovery`, `TestPhase2_OnDemandDebounce`.
+
+### Gate (exact command)
+
+```bash
+pg_isready -h 127.0.0.1 -p 5432 && \
+(createdb router0_test 2>/dev/null || true) && \
+export GO111MODULE=on \
+  DATABASE_URL="postgres://$(whoami)@127.0.0.1:5432/router0_test?sslmode=disable" \
+  AES_KEY='000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f' \
+  JWT_SECRET='router0-gate-jwt-secret-0123456789abcdef' && \
+go build ./... && \
+go vet ./... && \
+go vet -tags 'integration smoke' ./internal/integration/... && \
+go test ./internal/... -count=1 && \
+go test -tags integration ./internal/integration/... -run 'TestPhase1|TestPhase2' -count=1 -v && \
+! grep -q 'go-redis' go.mod && \
+! grep -rIqi 'zer0' dashboard/app dashboard/components && \
+(cd dashboard && pnpm install --frozen-lockfile && pnpm run build)
 ```
-docker compose up -d && \
-  source .env && \
-  go build ./... && \
-  go test ./internal/db/... -count=1 -v && \
-  cd dashboard && pnpm install && pnpm run build
-```
 
-**How the user tests it:**
-1. Run the gate command.
-2. `curl http://localhost:8080/healthz` returns `{"status":"ok"}`.
-3. `open http://localhost:3000` shows the login page stub (no form submission works yet — clearly labelled "Coming soon in Phase 1").
+Optional smoke: the Phase 1 smoke command with `-run 'TestSmoke'` plus `TEST_ANTHROPIC_KEY`, `TEST_GEMINI_KEY`, `TEST_MESHAPI_KEY`. `TestSmokeAnthropicTools`, `TestSmokeGeminiTools`, and `TestSmokeMeshAPI` each skip when their key is unset.
+
+### How the user tests it
+
+1. `make mock` (now also Anthropic `:9903`, Gemini `:9904`, Mesh API `:9905`), then `make dev` with `ANTHROPIC_BASE_URL=http://127.0.0.1:9903/v1 GOOGLE_BASE_URL=http://127.0.0.1:9904 MESHAPI_BASE_URL=http://127.0.0.1:9905/v1` (or real keys and no overrides).
+2. Add Anthropic `mock-ok-anth`, Gemini `mock-ok-gem`, Mesh API `mock-ok-mesh` keys. Open **Catalog**: `claude-sonnet-5-5` lists anthropic, openrouter, and meshapi chips.
+3. Using the OpenAI Python SDK against `http://localhost:8080/v1` with the service token, run a weather-tool conversation (`tools=[get_weather]`, then send the tool result back) with `model="claude-sonnet-5-5"`. You get `tool_calls`, then a final answer. Repeat with `stream=True`; `tool_calls[0].function.arguments` deltas concatenate to valid JSON. Repeat with `X-Router0-Providers: google` and a Gemini model.
+4. Catalog page: add alias `smart → claude-sonnet-5-5`; `model="smart"` works and the response `model` is `claude-sonnet-5-5`.
+5. On-demand: `curl -X POST localhost:9902/_models -d '["acme/new-model-x"]'` (mock admin endpoint), then call `model="new-model-x"` → 200 on first try; Catalog shows it with source `on_demand`.
 
 ---
 
-### Phase 1: Complete Primary Journey
+## Phase 3: Embeddings, balance polling, monthly budgets, priority UI polish, legacy cleanup
 
-**Goal:** A user receives an invite, registers, adds provider keys, points their OpenAI client at the router, receives streamed responses, and views pool health and request feed in the dashboard. All six capabilities are live and real on the tested path.
+**Goal:** `/v1/embeddings` works with the same routing and errors. OpenRouter keys with zero balance are skipped before they fail. Per-key monthly USD budgets stop a key at its limit (402 when nothing else can serve). The priority and key UI gets drag-and-drop, budgets, balances, and "reset state". The legacy pool tables are dropped (their code was already deleted in Phase 1).
 
-**Slices (all are independent or dependencies marked):**
+Capabilities: embeddings, credit-tracking, provider-key-management (P3 parts), dashboard (P3 parts).
 
-| Slice | Owns | Dependencies |
-|-------|------|-------------|
-| 1: Auth & Onboarding | `internal/auth/`, `internal/handlers/auth.go`, `migrations/000001`, `migrations/000002` | Scaffold |
-| 2: Provider Key Management | `internal/keys/`, `internal/handlers/keys.go`, `migrations/000003` | Slice 1 (user FK) |
-| 3: Provider Adapters | `internal/providers/` (all 6 adapters + interface + registry) | Scaffold |
-| 4: Routing Engine | `internal/routing/`, `internal/health/` (basic probe), `migrations/000005` | Slice 3 (Provider interface); Slice 2 (key retrieval) |
-| 5: Inference Handler + Metadata | `internal/handlers/inference.go`, `internal/metadata/recorder.go`, `migrations/000004` | Slices 1, 2, 3, 4 |
-| 6: Dashboard UI | `dashboard/app/dashboard/`, `dashboard/app/auth/`, `dashboard/app/admin/`, `dashboard/components/`, `dashboard/lib/` | Slices 1–5 for live data |
-| 7: Observability | `internal/metrics/prometheus.go`, structured slog wired into inference handler and routing engine, `config/alerts.yaml`, `internal/handlers/admin.go` (basic: pool inspect + invite create) | Slices 1–5 for data |
+### Slices
 
-**Dependencies between slices:**
-- Slice 2 depends on Slice 1 (user table must exist).
-- Slice 4 depends on Slice 3 (Provider interface) and Slice 2 (key decryption path).
-- Slice 5 depends on Slices 1–4 (all must be wired for end-to-end request flow).
-- Slice 6 depends on Slices 1–5 for live data (can be built against stub API responses in parallel, then wired at the end).
-- Slice 7 is largely independent (cross-cutting); wiring into the inference handler happens alongside or after Slice 5.
+| Slice | Owns | Depends on |
+|-------|------|------------|
+| **3A Schema** | `migrations/000021_key_budgets_balances.{up,down}.sql`, `migrations/000022_drop_legacy_pool.{up,down}.sql` | Phase 2 |
+| **3B Embeddings** | `internal/handlers/embeddings.go`, `internal/handlers/embeddings_test.go`, `internal/providers/embed_*.go`, `internal/catalog/embedding_discovery.go` | 3A; `metadata.Record.Endpoint` from 3D |
+| **3C Balance polling** | `internal/balance/`, `internal/providers/openrouter_balance.go`, `internal/providers/openrouter_balance_test.go` | 3A; `keystate` credits set/clear from 3D |
+| **3D Budgets, spend & key state** | `internal/keystate/`, `internal/metadata/` | 3A |
+| **3E Keys & priority polish** | `internal/keys/`, `internal/handlers/keys.go`, `internal/handlers/priority.go`, `dashboard/` | 3A, 3D |
+| **3F Wiring & gate** | `internal/server/`, `cmd/router/main.go`, `cmd/mockprovider/`, `internal/testutil/`, `internal/integration/phase3_test.go`, `Makefile`, `.env.example`, `README.md` | all |
 
-**Key files per slice:**
+Contracts added by 3D for 3B/3C/3E (signatures fixed at slice start): `metadata.Record.Endpoint string`; `keystate.Store.SetCredits(ctx, keyID, reason string, ttl time.Duration) error`; `keystate.Store.ClearCredits(ctx, keyID, onlyReason string) error`; `keystate.Store.Reset(ctx, keyID) error`; `keystate.Store.AddSpend(ctx, keyID string, microUSD int64) error` (upsert into `provider_key_spend`); `keystate.Store.MonthSpend(ctx, keyID string) (microUSD int64, err error)` (5 s in-memory cache).
 
-Slice 1: `internal/auth/middleware.go`, `internal/auth/jwt.go`, `internal/auth/keygen.go`, `internal/handlers/auth.go`, `migrations/000001_create_users.*.sql`, `migrations/000002_create_invites.*.sql`
+### Key files
 
-Slice 2: `internal/keys/crypto.go`, `internal/keys/repository.go`, `internal/handlers/keys.go`, `migrations/000003_create_provider_keys.*.sql`
+- **3B:** `embeddings.go` (handler reusing `routing.BuildPlan`/`Executor.Run`), `embed_openai_compat.go` (Gemini, Mesh API, OpenRouter, NVIDIA, Together implement `Embedder`), `embedding_discovery.go`.
+- **3C:** `balance/poller.go` (10-min loop over active OpenRouter keys, test hook `PollNow`), `openrouter_balance.go` (`/key`, `/credits` client).
+- **3D:** `keystate/budget.go`, `keystate/spend.go` (Postgres `provider_key_spend`), `keystate/store.go` (budget in `Check`/`CheckMany`), `metadata/recorder.go` (endpoint, spend upsert), `metadata/reconcile.go` (hourly reconcile from `request_metadata`).
+- **3E:** `PATCH /api/keys/{id}`, `POST /api/keys/{id}/reset-state`, balances/spend in `GET /api/keys`; `dashboard/app/dashboard/routing/page.tsx` drag-and-drop (native HTML5 DnD, arrows kept), keys page budget editor, spend bar, balance, and reset button.
+- **3F:** `server.New` gains `/v1/embeddings` and the balance poller, mock embeddings + OpenRouter `/key` endpoints in `mockprovider`.
 
-Slice 3: `internal/providers/provider.go`, `internal/providers/registry.go`, `internal/providers/google.go`, `internal/providers/groq.go`, `internal/providers/openrouter.go`, `internal/providers/nvidia.go`, `internal/providers/together.go`, `internal/providers/baseten.go`
+### Integration tests required in `internal/integration/phase3_test.go`
 
-Slice 4: `internal/routing/pool.go`, `internal/routing/scorer.go`, `internal/routing/selector.go`, `internal/routing/ratelimit.go`, `internal/health/probe.go`, `internal/health/scheduler.go`, `migrations/000005_create_pool_scores.*.sql`
+`TestPhase3_Embeddings`, `TestPhase3_EmbeddingsFailover`, `TestPhase3_EmbeddingsWrongKind`, `TestPhase3_EmbeddingsBase64`, `TestPhase3_BalancePollMarksExhausted`, `TestPhase3_BalancePollClears`, `TestPhase3_MonthlyBudget`, `TestPhase3_BudgetCleared`, `TestPhase3_SpendReconcile`, `TestPhase3_ResetKeyState`.
 
-Slice 5: `internal/handlers/inference.go`, `internal/metadata/recorder.go`, `migrations/000004_create_request_metadata.*.sql`
+### Gate (exact command)
 
-Slice 6: `dashboard/app/`, `dashboard/components/`, `dashboard/lib/api.ts`, `dashboard/lib/auth.ts`
-
-Slice 7: `internal/metrics/prometheus.go`, `internal/handlers/admin.go`, `config/alerts.yaml`
-
-**Gate:**
+```bash
+pg_isready -h 127.0.0.1 -p 5432 && \
+(createdb router0_test 2>/dev/null || true) && \
+export GO111MODULE=on \
+  DATABASE_URL="postgres://$(whoami)@127.0.0.1:5432/router0_test?sslmode=disable" \
+  AES_KEY='000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f' \
+  JWT_SECRET='router0-gate-jwt-secret-0123456789abcdef' && \
+go build ./... && \
+go vet ./... && \
+go vet -tags 'integration smoke' ./internal/integration/... && \
+go test ./internal/... -count=1 && \
+go test -tags integration ./internal/integration/... -run 'TestPhase1|TestPhase2|TestPhase3' -count=1 -v && \
+! grep -q 'go-redis' go.mod && \
+! grep -rIqi 'zer0' dashboard/app dashboard/components && \
+(cd dashboard && pnpm install --frozen-lockfile && pnpm run build)
 ```
-source .env && \
-  go test ./internal/... -tags integration -run TestGatewayEndToEnd -count=1 -v && \
-  cd dashboard && pnpm run build
-```
 
-The `TestGatewayEndToEnd` integration test:
-1. Starts the Go service against a test PostgreSQL database (from `.env`).
-2. Creates an admin user directly in the DB.
-3. Calls `POST /admin/invites` to create an invite.
-4. Calls `POST /auth/register` with the invite token, email, and password — asserts `zer0_key` is returned.
-5. Calls `POST /api/keys` with a real Groq API key (from `.env` `TEST_GROQ_KEY`) — asserts HTTP 201.
-6. Calls `POST /v1/chat/completions` with the Zer0 key and prompt "count to 3" with `stream: true` — asserts HTTP 200, at least 3 SSE chunks received, `X-Zer0-Provider: groq` header present, `X-Zer0-Latency-Ms` > 0.
-7. Calls `GET /api/requests` — asserts the request appears in the feed with `input_tokens > 0` and `status: success`.
-8. Calls `GET /metrics` — asserts `zer0_requests_total` counter is > 0.
+Optional smoke: `TestSmokeOpenRouterBalance` (needs `TEST_OPENROUTER_KEY`): the poll returns a numeric balance.
 
-**How the user tests it:**
-1. Copy `.env.example` to `.env`; fill in `DATABASE_URL`, `REDIS_URL`, `AES_KEY` (64 hex chars), `JWT_SECRET`, `TEST_GROQ_KEY` (a real Groq API key).
-2. Run `docker compose up -d` to start PostgreSQL and Redis.
-3. Run the gate command. All assertions pass.
-4. Manual verification:
-   - Open `http://localhost:3000`. Click "Register" (requires invite token from the test output).
-   - Log in as the registered user.
-   - Navigate to `/dashboard/keys` — see the Groq key listed with a green status badge.
-   - Navigate to `/dashboard` — see the Groq combo in the active pool table with a score and latency.
-   - Navigate to `/dashboard/requests` — see the test request in the feed with model, latency, tokens, and `success` badge.
-   - Navigate to `/dashboard/costs` — see a non-zero estimated cost for Groq.
-   - "Spend chart coming soon" stub is visible on the costs page.
-   - "Analytics" section on the pool page shows a stub card labelled "Coming soon."
-5. Using the `openai` Python client: `client = OpenAI(api_key="zer0:sk-...", base_url="http://localhost:8080/v1"); response = client.chat.completions.create(model="llama-3.1-70b-versatile", messages=[...])` — assert a non-empty response is returned.
+### How the user tests it
+
+1. With the mocks running: `curl localhost:8080/v1/embeddings -H "Authorization: Bearer $T" -H 'Content-Type: application/json' -d '{"model":"text-embedding-004","input":"hello"}'` → a vector. The Requests page shows `endpoint: embeddings`.
+2. Provider Keys: set `groq-b` budget to `$0.001`. Send requests until it shows "budget reached". The next request skips it (trail `skipped: budget_exhausted`). With no other key → 402.
+3. Set mock OpenRouter balance to 0 (`curl -X POST localhost:9902/_balance -d 0`). Within 10 min, or after clicking "Poll balances", `or-main` shows "out of credits" and is skipped.
+4. Routing page: drag OpenRouter above Groq and Save; the next request's trail starts with OpenRouter. "Reset state" on a rate-limited key clears its badge immediately (its `provider_key_state` rows are deleted).
 
 ---
 
-### Phase 2: Advanced Operations and Pool Intelligence
+## Self-Review
 
-**Goal:** Fully automated pool health management, time-series cost analytics, a complete admin API, and a contextual-bandit routing hook that outperforms static weights given sufficient telemetry.
-
-**Capabilities delivered (≥3):**
-
-| Capability | Description |
-|-----------|-------------|
-| 7: Advanced Health Probe Scheduler | Hybrid probing: idle-key probes on configurable interval (5–15 min), live traffic rate-limit header parsing already wired in Phase 1, billing API polling where available (OpenRouter, Google). Goroutine pool with backpressure. |
-| 8: Pool Auto-Management | Automated promotion/demotion with configurable thresholds (env var overrides for `PROMOTE_MIN_SCORE`, `DEMOTE_MAX_ERROR_RATE`, etc.). Re-scoring every 5 minutes wired to pool_scores table. |
-| 9: Cost Analytics | Time-series spend chart (daily granularity, 30-day window) on `/dashboard/costs`. PostgreSQL aggregation query by day. Budget alert threshold configurable per user. |
-| 10: Admin API (full) | Complete admin surface: disable any key, force pool overrides, view any user's pool state, list all users. Plus: operator runbook for AES_KEY rotation. |
-| 11: Bandit Routing (optional, feature-flagged) | Thompson Sampling `BanditScoreFunc` implementing the `ScoreFunc` interface from Phase 1. Active when `ROUTING_STRATEGY=bandit`. Cold-start fallback to weighted formula. Alpha/beta stored in Redis. |
-
-**Independent slices:**
-
-| Slice | Owns | Dependencies |
-|-------|------|-------------|
-| A: Health Probe Scheduler | `internal/health/` (full implementation) | Phase 1 complete |
-| B: Pool Auto-Management | `internal/routing/pool.go` (promotion/demotion goroutine) | Phase 1 complete |
-| C: Cost Analytics | `dashboard/app/dashboard/costs/page.tsx` (chart), PostgreSQL daily aggregation view | Phase 1 complete |
-| D: Admin API complete | `internal/handlers/admin.go` (all admin endpoints) | Phase 1 complete |
-| E: Bandit Routing | `internal/routing/bandit.go`, `BanditScoreFunc` | Phase 1 `ScoreFunc` interface |
-
-**Gate:**
-```
-source .env && \
-  go test ./internal/... -tags integration -count=1 -v && \
-  go test ./internal/routing/... -run TestBanditScoreFunc -count=1 -v && \
-  cd dashboard && pnpm run build && pnpm run test
-```
-
-The integration suite must include:
-- A test that runs 200 requests through the bandit scorer with simulated telemetry and asserts the top-scored combo at round 200 matches the combo with the highest simulated success rate (the bandit must converge).
-- A test that idle-key probes fire within the configured interval and update the Redis health cache.
-- A test that pool promotion fires after injecting 20 low-error-rate, low-latency metadata rows for a common-pool combo.
-
-**How the user tests it:**
-- Set `ROUTING_STRATEGY=bandit` in `.env` and restart the service.
-- Send 50 requests. Observe via `/metrics` that `zer0_pool_score` values drift over time (bandit is learning).
-- On `/dashboard/costs`, the spend chart shows bars for each of the last 30 days (or fewer if the service is newer).
-- Admin: `curl -H "Authorization: Bearer <admin_jwt>" http://localhost:8080/admin/pool/<user_id>` returns full pool state.
+- [x] Every phase has an exact, runnable gate command that needs no real provider keys (mock providers via `httptest`), no Docker, and no Redis: only the local Postgres 14 at `127.0.0.1:5432` with `router0_test` created idempotently, plus `GO111MODULE=on`. Real-key smoke runs are separate and optional.
+- [x] No Redis anywhere: key state is in `provider_key_state` (Postgres) + in-memory cache, tokens use an in-process TTL cache, catalog locks and debounce are in-process; go-redis removal is checked by the gates. Docker appears only as the deployment-example note for `docker-compose.yml`.
+- [x] Migrations 000001–000022 use only PG ≤ 14 features (data.md › PostgreSQL Compatibility); none flagged.
+- [x] Phase 1 slices own disjoint paths: 1A migrations 14–19 · 1B `auth/ orgs/ tokens/ handlers/{auth,tokens,admin}.go` · 1C `catalog/ handlers/catalog.go` · 1D `keys/ handlers/{keys,priority}.go` · 1E `providers/ keystate/ cache/` · 1F `routing/ handlers/{inference,helpers}.go metadata/ metrics/ config/alerts.yaml` · 1G `handlers/pool.go` · 1H `dashboard/` · 1I `server/ cmd/router cmd/mockprovider testutil/ integration/ db/redis.go health/ models/ go.mod go.sum docker-compose.yml Makefile .env.example README.md`. No path appears twice.
+- [x] Phase 2 slices are disjoint: provider files are split per adapter (2B `anthropic*`, 2C `google*`, 2D `meshapi*`); catalog/aliases in 2E; dashboard in 2F; wiring in 2G.
+- [x] Phase 3 slices are disjoint: 3B new files only (`handlers/embeddings*.go`, `providers/embed_*.go`, `catalog/embedding_discovery.go`); 3C `balance/`, `providers/openrouter_balance*.go`; 3D `keystate/ metadata/`; 3E `keys/ handlers/{keys,priority}.go dashboard/`; 3F wiring only (legacy code already gone in Phase 1).
+- [x] agent.md is complete: each AI pattern is evaluated with a decision, and the conclusion is deterministic routing with no LLM inside router0.
+- [x] No placeholders remain; every assumption is marked `Assumed:` inline.

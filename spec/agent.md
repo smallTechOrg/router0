@@ -1,77 +1,67 @@
-# AI-Native Design: Zer0 Router
+# AI-Native Design: router0
 
-## Evaluation Summary
+## Framing
 
-The routing engine is the primary intelligence surface in Zer0 Router. This file evaluates every applicable AI/agent pattern from the catalogue against the routing problem and records the design decision.
+router0 is infrastructure that LLM-powered backend services (many of them agents) call. The AI-native questions are therefore:
 
-## Pattern Evaluation
+1. Should any decision inside router0 be made by a model (an LLM, embeddings, or a learned policy)?
+2. What does router0 have to do so that AI callers — agents, tool-using workers, SDKs — work well through it?
 
-### 1. Retrieval-Augmented Generation (RAG)
+Short answer: **no model reasoning happens inside router0. Routing, name resolution, and error classification are deterministic.** The AI-native work goes into being a faithful substrate for AI callers: exact OpenAI wire compatibility, correct tool-calling translation, streaming, and machine-actionable errors.
 
-**Opportunity considered:** Retrieve provider status pages or community-reported incidents to inform routing decisions.
+## Decisions Inside router0
 
-**Decision: Not applicable.** Provider health is tracked directly from live response metadata (latency, error rate, rate-limit headers) — real-time first-party signals that are strictly more accurate and lower-latency than retrieved external documents. Adding a retrieval step would increase latency on the critical path with no accuracy gain. Rationale: routing signals are numerical metrics, not natural-language knowledge.
+### 1. Model selection / "smart routing" — Rejected
 
-### 2. LLM-as-Judge / Quality Evaluation
+**Considered:** pick the provider or even the model per request from prompt content (semantic routing), learned quality, or cost/latency scoring (the old weighted scorer and planned Thompson-sampling bandit).
 
-**Opportunity considered:** Use a fast LLM to evaluate response quality and feed that signal back into pool scoring.
+**Decision:** Fixed priority only. The user-approved brief requires one global provider order per org, key order within each provider, and a per-request header override. Operators need to predict which key is billed and why. A learned or semantic policy would make the billing key unpredictable, add latency on the hot path, and could substitute a model the caller did not ask for. The old `ScoreFunc`/bandit hook from the Zer0 spec is retired; the legacy scorer and pool code are taken off the request path in Phase 1 and deleted in Phase 3.
 
-**Decision: Not applicable in Phase 1; deferred to Phase 2+.** Quality evaluation requires calling a second LLM per request, doubling cost and adding latency. In Phase 1, error rate and provider HTTP status codes are sufficient correctness proxies. A quality feedback loop is a valid Phase 3 feature if users request it.
+### 2. Model-name normalisation with an LLM or embeddings — Rejected
 
-### 3. Chain-of-Thought / Structured Reasoning
+**Considered:** when a caller sends a name router0 does not know (`llama3.3-70B`, `sonnet latest`), ask an LLM or nearest-neighbour embeddings to guess the closest catalog entry.
 
-**Opportunity considered:** Use CoT to select among routing options.
+**Decision:** Deterministic rules plus explicit aliases. A fuzzy match that is wrong sends traffic to a different model without anyone noticing. That is a correctness and cost hazard, and it cannot be reproduced when debugging. The deterministic path is:
+- `catalog.Canonicalize`: lowercase, strip vendor prefix, strip known suffixes and date stamps, family-specific rules, and a static override table (capabilities/model-catalog.md);
+- org aliases defined by humans (Phase 2);
+- on-demand discovery: on a miss, re-list the org's providers and match with the same rules (Phase 2).
+If none of these match, the caller gets `404 model_not_found` with the requested name, which they can fix right away.
 
-**Decision: Not applicable.** Routing is a deterministic weighted scoring formula over numeric metrics. There is no ambiguity requiring reasoning — the formula produces a total ordering of combos in microseconds. CoT would add hundreds of milliseconds of latency and cost per request with no benefit over the formula.
+### 3. Error classification with an LLM — Rejected
 
-### 4. Agent with Tools
+**Considered:** read free-text provider error bodies with a model to decide whether a failure means "rate limited", "out of credits", or "transient".
 
-**Opportunity considered:** An agent that adaptively decides whether to retry, hedge, or fail based on rich context.
+**Decision:** Rule tables per provider, keyed on HTTP status, structured error `code`/`type` fields, and a short list of documented message substrings (capabilities/error-classification.md). Provider errors are structured enough. A model call on the failure path would add latency exactly when the system is degraded, and could misclassify, which changes what the caller is told (402 vs 429). Rules are unit-tested against recorded fixtures.
 
-**Decision: Not applicable.** The retry/hedge policy is a finite state machine (try top combo → on failure, try next → on second failure, hedge two simultaneously). The states and transitions are fully specified and deterministic. An LLM agent cannot make this decision faster or more reliably than the FSM, and adding one would make failure modes harder to reason about.
+### 4. LLM-as-judge / response quality feedback — Rejected
 
-### 5. Contextual Bandit / Reinforcement Learning (Phase 2 hook)
+router0 never reads or stores response content (binding rule), so it cannot judge quality. Callers who need evaluation do it in their own service.
 
-**Opportunity considered:** Replace the static scoring weights with a learned policy that optimises routing for each user's traffic pattern.
+### 5. Agentic retry policy — Rejected
 
-**Decision: Deferred to Phase 2, with a concrete hook point designed in Phase 1.**
+The failover policy is a finite loop over an ordered candidate list with explicit skip states and a fixed error precedence (429 > 402 > 404 > 400 > 503). An agent cannot make this faster or more reliable, and it would make failures non-reproducible.
 
-The static scoring formula in Phase 1 uses fixed weights (0.35 / 0.30 / 0.20 / 0.15) chosen by domain knowledge. These weights are optimal for average traffic but may not be optimal for individual users. A contextual bandit can learn per-user optimal weights from historical request metadata stored in PostgreSQL.
+### 6. Prompt-injection or content filtering — Not applicable
 
-**Phase 2 plan:**
+router0 does not interpret message content; nothing in routing depends on it. Content filtering, if wanted, belongs to the caller or the provider.
 
-- **Algorithm:** Thompson Sampling over the discrete action space of `(provider, model)` combos per user. Each combo maintains a Beta distribution `Beta(α, β)` where α = success count and β = failure count in a rolling time window.
-- **Context features:** time of day, estimated request token count (from input length), model preference in the original request (if provided).
-- **Hook point (Phase 1 scaffolded):** `internal/routing/scorer.go` exposes a `ScoreFunc` interface:
+### 7. Natural-language analytics in the dashboard — Deferred, not planned
 
-  ```go
-  type ScoreFunc interface {
-      Score(ctx context.Context, userID string, combos []Combo, metrics map[string]ComboMetrics) []ScoredCombo
-  }
-  ```
+Asking "why did billing-worker fail last night?" in natural language is a nice-to-have. The request log's filters plus the per-request failover trail answer it directly. Not in Phases 1–3.
 
-  Phase 1 implements `WeightedScoreFunc` (the static formula). Phase 2 implements `BanditScoreFunc` that queries the Thompson Sampling state from Redis and samples from the Beta distributions.
+## What router0 Does for AI Callers
 
-- **State storage:** Alpha/beta counts stored in Redis hash `bandit:{user_id}:{provider}:{model}` — fast read at request time, updated async after each request outcome.
-- **Cold start:** Fall back to `WeightedScoreFunc` until a combo has ≥ 20 observations.
-- **Switchover:** Feature-flagged via `ROUTING_STRATEGY` env var (`weighted` | `bandit`); defaults to `weighted` in Phase 1 and Phase 2.
+These are requirements, written as success criteria in the capability files:
 
-### 6. Embedding-Based Semantic Routing
-
-**Opportunity considered:** Route requests to different models based on semantic similarity of the prompt to each model's known strengths (e.g. code → Llama, creative → Gemini).
-
-**Decision: Not applicable in Phase 1.** This requires embedding the prompt (adding latency + cost) and a curated semantic profile per model (which does not exist in a structured, reliable form). The user's application already selects a model in the request; overriding it silently would violate the principle of least surprise. Deferred as a potential Phase 3 "smart model selection" feature if users request it.
-
-### 7. Prompt Injection / Safety Filtering
-
-**Opportunity considered:** Inspect prompts for injection attempts targeting the routing logic.
-
-**Decision: Not applicable.** The router is stateless with respect to prompt content — it reads the message array to count tokens (for cost estimation) but does not interpret it. There is no routing decision that can be influenced by prompt content. No filtering is needed on this path.
+| Need of an AI caller | router0 behaviour | Where specified |
+|----------------------|-------------------|-----------------|
+| Drop-in SDK compatibility | OpenAI request/response/SSE shapes, OpenAI error shape (`error.type/code/param`) so SDK exception classes map correctly (404 → `NotFoundError`, 429 → `RateLimitError`) | api.md |
+| Correct tool/function calling across providers | Pass-through for OpenAI-compatible providers (Phase 1); full translation to Anthropic `tool_use`/`tool_result` blocks, `tool_choice` mapping, streamed `input_json_delta` → `tool_calls[].function.arguments` deltas (Phase 2); Gemini conformance tests (Phase 2) | provider-adapters.md |
+| Self-directed backoff | `429` with exact `Retry-After` from the soonest key reset; distinct `402` that tells the agent "retrying will not help" | error-classification.md |
+| Stable model identity | Canonical names stable across providers; `model` in responses echoes the canonical name | model-catalog.md |
+| Reliable streams | Failover before first byte; a clear in-band `stream_interrupted` error after it, never a silent truncation | routing-engine.md |
+| Discoverability | `GET /v1/models` lists exactly what the org can call | api.md |
 
 ## Conclusion
 
-**No AI capability is needed or used in Phase 1 routing.** The routing engine is a deterministic weighted scoring formula (`internal/routing/scorer.go`) applied to numeric telemetry. This is not a simplification — it is the correct design: the problem is an optimisation over real-time numeric signals, not a reasoning or generation problem. Introducing an LLM would add latency, cost, and failure modes with no upside.
-
-The single Phase 2 AI hook — a contextual bandit (Thompson Sampling) replacing the static weight formula — is scaffolded in Phase 1 via the `ScoreFunc` interface so it can be swapped in without touching the request handler or retry logic.
-
-No `spec/agent.md` placeholder remains: this file is the complete AI-native design.
+router0 contains **no LLM, embedding, or learned-policy component** in any phase. Every routing decision is deterministic: canonical name → org catalog → fixed provider priority (or header override) → key order → skip keys in cooldown → fail over on any error → fixed error precedence. This matches the user's explicit choice of fixed priority, keeps billing predictable, keeps the hot path sub-millisecond apart from I/O, and makes every outcome reproducible from the request log trail. The AI-native investment is in fidelity for AI callers: wire compatibility, tool-calling translation, streaming behaviour, and actionable error codes.

@@ -1,151 +1,78 @@
 # Capability: Dashboard
 
+Phase 1: rename to router0, tokens page, org-scoped keys with order and state, routing priority page, request log with failover trail, overview. Phase 2: catalog page and aliases. Phase 3: drag-and-drop priority, key budgets and balances, reset key state.
+
 ## What It Does
 
-Provides a Next.js web application where authenticated users manage provider keys, monitor pool health, review recent request metadata, and view estimated provider spend. Admins additionally access an invite management screen.
+The Next.js 14 app where org members manage router0: service tokens, provider keys, provider priority and key order, model catalog, and the request log.
 
 ## Inputs
 
-| Input | Type | Source | Required |
-|-------|------|---------|----------|
-| JWT access token | HTTP cookie / Authorization header | Browser (NextAuth session) | Yes |
-| User actions (add key, delete key, test key) | Form submissions | Browser | Contextual |
-| Pool state, request feed, cost data | JSON | Router service internal API | Yes (fetched server-side) |
+| Input | Source |
+|-------|--------|
+| NextAuth session holding the Go-issued JWT (`org_id` claim) | `dashboard/lib/auth.ts` |
+| Go API (`/api/*`, `/auth/*`, `/admin/*`) via rewrites to `:8080` | `dashboard/lib/api.ts` |
 
 ## Outputs
 
-| Output | Type | Destination |
-|--------|------|-------------|
-| Rendered HTML pages (SSR) | HTTP response | Browser |
-| Mutating API calls | JSON HTTP requests | Router service API routes |
+Pages, plus API calls for writes. No data is stored in the browser except NextAuth cookies.
 
 ## External Calls
 
 | System | Operation | On Failure |
 |--------|-----------|------------|
-| Router Go service API | `GET /api/pool`, `GET /api/requests`, `GET /api/costs`, key CRUD | Show error banner; do not crash page |
-| Router Go service API | `POST /api/keys`, `DELETE /api/keys/:id`, `POST /api/keys/:id/test` | Display inline error message |
+| Go gateway | typed fetch wrappers in `lib/api.ts` | Inline red error banner with `error.message`; 401 → redirect to `/auth/login` |
 
 ## Business Rules
 
-### Navigation Structure
+### Navigation (sidebar, brand "router0")
 
+`Overview` (`/dashboard`) · `Tokens` · `Provider Keys` · `Routing` · `Requests` · `Catalog` (P2) · `Costs` · `Admin` (platform admins only: invites, users/orgs, legacy models).
+
+### Overview (`/dashboard`) — Phase 1
+
+Replaces the pool-status page. Cards: live tokens, active keys by provider, requests and error rate in the last 24 h (from `/api/requests`), and a copyable quick-start snippet:
 ```
-/                     → redirect to /dashboard if authenticated, else /auth/login
-/auth/login           → email + password login form
-/auth/register        → registration form (requires invite token in URL query param)
-/dashboard            → pool status overview (default landing after login)
-/dashboard/keys       → provider key management
-/dashboard/requests   → request feed (last 50 requests)
-/dashboard/costs      → estimated cost tracker (Phase 1: table only, no charts)
-/admin/invites        → admin only: create and list invites
+curl $ROUTER0_URL/v1/chat/completions -H "Authorization: Bearer r0-sk-…" \
+  -H "Content-Type: application/json" -d '{"model":"llama-3.3-70b","messages":[{"role":"user","content":"hi"}]}'
 ```
+A new user with no tokens sees a "Create your first service token" call-to-action linking to Tokens.
 
-### Authentication
+### Tokens (`/dashboard/tokens`) — Phase 1
 
-NextAuth.js handles session management. Credentials provider uses the Router service's `POST /auth/login` endpoint to verify email/password and returns a JWT embedded in the NextAuth session. All `/dashboard/*` and `/admin/*` routes are server-side protected — unauthenticated requests redirect to `/auth/login`.
+Table: name, prefix (`r0-sk-XXXXXXXXXXXX…`), created by, created, last used, status (`live` / `revoked` / `legacy`). The "Create token" form takes a name. On success a modal shows the full token once, with a copy button and the text "This token will not be shown again." Each live row has a "Revoke" button with a confirm dialog. Write controls are hidden for `member` role.
 
-### Pool Status Page (`/dashboard`)
+### Provider Keys (`/dashboard/keys`) — Phase 1
 
-Displays two sections — **Active Pool** and **Common Pool** — each as a sortable table:
+Grouped by provider in priority order. Per key: label, hint, status badge (`active` green / `error` red / state badges: `rate limited · 12s` amber, `out of credits` red, `cooling down` grey), last test result, and buttons ▲ ▼ (key order; each click sends `PUT /api/routing/priority` with the new `key_order`), Test, and Remove. The add-key form has a provider select (from the registered providers; labels "Groq", "OpenRouter", "Gemini", "Anthropic", "Mesh API (Fiesta Labs)", …), the key, and a label. The page polls `GET /api/keys` every 10 s so state badges expire visibly.
 
-| Column | Source |
-|--------|--------|
-| Provider | `pool_scores.provider` |
-| Model | `pool_scores.model` |
-| Score | `pool_scores.score` (2 decimal places) |
-| p95 Latency | `pool_scores.p95_latency_ms` ms |
-| Error Rate | `pool_scores.error_rate_1h` % (1 hour window) |
-| Quota (min / hr / day) | Redis rate-limit remaining counters |
-| Last Health Check | `pool_scores.last_health_check_at` relative time |
-| Status | Green / Yellow / Red indicator |
+### Routing (`/dashboard/routing`) — Phase 1
 
-Status indicator logic:
-- Green: score ≥ 0.70 AND error_rate_1h < 0.05
-- Yellow: score ≥ 0.40 AND score < 0.70
-- Red: score < 0.40 OR error_rate_1h ≥ 0.15
+An ordered list of providers that have keys, with ▲ ▼ buttons and Save (`PUT /api/routing/priority`). A help box explains the order and the `X-Router0-Providers` header override, with an example. P3: drag-and-drop replaces the arrows (arrows kept for keyboard accessibility).
 
-Refresh: auto-polls every 30 seconds via `setInterval` + `router.refresh()`.
+### Requests (`/dashboard/requests`) — Phase 1
 
-### Provider Key Management Page (`/dashboard/keys`)
+Table (newest first, 50 per page, "Load older" uses `before`): time, token, canonical model, provider, key label, status (badge with HTTP code and `error_code`), latency, tokens in/out, attempts. Clicking a row expands the failover trail as a horizontal chain: `groq/groq-a ✕ rate_limit 429 (95 ms) → groq/groq-b ✓ (717 ms)`. Skipped candidates show `⤼ skipped: rate_limited 9s`. Filters: status, model, token. An auto-refresh toggle (10 s).
 
-Lists all provider keys with: provider icon, label, key hint, status badge, last-tested timestamp, and actions (Test, Delete).
+### Catalog (`/dashboard/catalog`) — Phase 2
 
-**Add key form:** provider dropdown, optional label, raw API key field (masked input). Submit calls `POST /api/keys`. On success, refreshes the list. The raw key input is cleared immediately after submission.
+Search box; a table of canonical models → provider chips (`groq · llama-3.3-70b-versatile`), with unavailable ones struck through, plus kind and last seen. A "Refresh now" button (`POST /api/catalog/refresh`) shows the per-provider refresh status and time. Aliases section: list, add (alias → canonical, with autocomplete from the catalog), delete.
 
-**Test button:** calls `POST /api/keys/:id/test`, shows a spinner, then inline result: `OK (234 ms)` or `Error: invalid_api_key`.
+### Costs (`/dashboard/costs`) — existing, org-scoped; P3 adds per-key month-to-date spend vs budget bars.
 
-**Delete button:** confirmation modal ("This will remove this key from all pools. Existing request logs are retained."), then calls `DELETE /api/keys/:id`.
+### Admin (`/dashboard/admin`) — existing; invite form gains an optional "Join existing org" select.
 
-**Quota display:** for each key, a mini-row shows minute / hour / day quota remaining with a colour-coded bar (green > 50%, yellow 20–50%, red < 20%) and the reset countdown. Reset countdown is derived from the Redis TTL returned by the pool API.
+### Styling and errors
 
-### Request Feed Page (`/dashboard/requests`)
-
-Table of the last 50 request metadata records (most recent first):
-
-| Column | Source |
-|--------|--------|
-| Time | `request_metadata.created_at` relative |
-| Model | `request_metadata.model` |
-| Provider | `request_metadata.provider` |
-| Input tokens | `request_metadata.input_tokens` |
-| Output tokens | `request_metadata.output_tokens` |
-| Latency | `request_metadata.latency_ms` ms |
-| Cost (est.) | `request_metadata.estimated_cost_usd` formatted as $0.000000 |
-| Status | success / error / hedged badge |
-
-No pagination in Phase 1 (hard limit: last 50). Prompt content is never displayed. Auto-refreshes every 15 seconds.
-
-### Cost Tracker Page (`/dashboard/costs`)
-
-A table grouped by provider showing:
-
-| Column | Value |
-|--------|-------|
-| Provider | |
-| Requests this month | COUNT of `request_metadata` rows for current calendar month |
-| Input tokens | SUM |
-| Output tokens | SUM |
-| Estimated cost | SUM of `estimated_cost_usd` |
-
-Month resets at UTC midnight on the 1st. "This month" means current UTC calendar month.
-
-Phase 1: table only. Charts (time-series spend over time) are a Phase 2 stub — the page shows a labelled placeholder: "Spend chart coming soon."
-
-### Admin Invites Page (`/admin/invites`)
-
-Visible only to users with `role = 'admin'` (enforced server-side). Lists all invites with email, status (pending/accepted/expired), created date, and expiry. A form at the top creates a new invite: email field + "Send Invite" button. In Phase 1, the invite token is displayed on-screen after creation (email delivery is out of scope).
-
-### UI Stubs (Phase 1 — labelled non-functional)
-
-The following surfaces exist in the UI but display a "Coming soon" label and no interactive controls:
-
-- Spend chart on `/dashboard/costs`
-- p95 latency / success rate time-series charts (1h / 24h / 7d) — referenced in the pool page under a "Analytics" heading with a stub card
-- Force promote / demote controls in pool table (buttons present but disabled with tooltip "Available in a future release")
-
-These stubs are never mistaken for bugs because they carry explicit "Coming soon" labels.
-
-### Styling
-
-Tailwind CSS. No component library — keep it minimal. Dark mode support via `prefers-color-scheme`.
-
-### Error Handling
-
-- API errors display a dismissable error banner at the top of the relevant section.
-- Network failures during auto-refresh do not interrupt the user; they show a small "Last updated: N seconds ago" indicator.
-- Form validation is client-side (HTML5 required attributes) and server-side (API returns 422 with field errors displayed inline).
+Tailwind, the existing dark neutral palette and `StatusBadge` component. All writes show a success toast or an inline error. No page crashes on a failed fetch.
 
 ## Success Criteria
 
-- [ ] Visiting `/auth/login` while unauthenticated renders the login form without server error.
-- [ ] Submitting valid credentials redirects to `/dashboard` and shows the pool status table.
-- [ ] Visiting `/dashboard` with a user who has one active Groq key shows at least one pool row with a non-zero score.
-- [ ] Adding a new provider key via the form, then refreshing the page, shows the new key in the list with a redacted key hint.
-- [ ] Clicking "Test" on a valid key displays `OK (<N> ms)` inline within 10 seconds.
-- [ ] Clicking "Delete" and confirming removes the key from the list and subsequent requests do not use it.
-- [ ] The request feed at `/dashboard/requests` shows the most recent request after sending a chat completion via the API, with correct model, provider, latency, and token counts.
-- [ ] The cost tracker at `/dashboard/costs` shows a non-zero estimated cost after at least one successful request.
-- [ ] Visiting `/admin/invites` as a non-admin user is redirected to `/dashboard` (HTTP 302).
-- [ ] The "Spend chart coming soon" stub is visible on the costs page and does not produce a JavaScript console error.
-- [ ] `npm run build` in the `dashboard/` directory completes without errors.
+- [ ] `pnpm run build` succeeds with zero type errors.
+- [ ] No visible "Zer0" / "zer0" string remains in `dashboard/app` or `dashboard/components` (`grep -ri zer0 dashboard/app dashboard/components` is empty).
+- [ ] Manual: create a token → modal shows the full `r0-sk-…` once; reload → only the prefix shows; revoke → status `revoked`.
+- [ ] Manual: two Groq keys; ▼ on the first swaps them; reload keeps the order; the next request's trail starts with the new first key.
+- [ ] Manual: Routing page reorder + Save → the next request tries the new first provider.
+- [ ] Manual: after a failover request, Requests shows attempts = 2 and the expanded trail names both keys with outcome and class.
+- [ ] Manual: a `member` user sees no Create / Revoke / Add / Remove / Save controls.
+- [ ] (P2) Catalog page lists `llama-3.3-70b` with both providers; adding alias `fast` shows it in the list and in `/v1/models`.

@@ -31,3 +31,15 @@ No placeholders. Assumed flags:
 1. GO111MODULE=off set globally by asdf — added GO111MODULE=on to .env.example, .env, and Makefile
 2. Local postgres on port 5432 — changed docker-compose to port 5433
 3. localhost resolves to ::1 (IPv6) — changed DATABASE_URL to 127.0.0.1
+
+---
+
+## Run: 2026-11-20T13:56 — feature/router0-gateway-20261120-1356-v0.1 (base: main)
+
+Pivot: Zer0 Router → router0, a model-name-routed, multi-tenant (org) BYOK gateway.
+
+### Friction log
+1. **Harness `support/` tree missing** — symptom: the skill's `support/agents/*.md` role files and `support/patterns/*` aren't present beside the synced skill copy; there's no `project-builder` agent type either. What I did: ran the roles from the SKILL.md description; spec-writer delegated to a general-purpose agent. Lesson: the synced skill install must ship `support/`, or SKILL.md should inline minimal role checklists.
+2. **Infra assumption wrong late** — symptom: the spec was written for docker-compose PG16 + Redis, but the machine has no Docker or Redis, and the user wants bare-local with no Redis. What I did: sent the spec back for a no-Redis revision; reuse Homebrew PG14 on 5432 (`router0`, `router0_test` DBs created). Lesson: the intake technical round should ask "how do you run infra locally (Docker / bare / remote)?" and probe for `docker`/`redis-server`/`pg_isready` BEFORE spec-writing.
+3. **Real keys deferred** — the user will add provider keys later, so gates are mock-provider-only; the real-key smoke stays open until the keys exist.
+4. **Thin baseline tests** — the existing code has tests only in internal/db; the integration test doesn't compile (`NewAdminHandler` arity). Phase 1 replaces it.

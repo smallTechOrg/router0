@@ -1,164 +1,93 @@
 # Capability: Routing Engine
 
+Phase 1. Replaces the per-user "best combo" pool/scorer path. Today `Selector.Select(ctx, userID)` and `Pool.SelectComboForSession` ignore the requested model; that is removed.
+
 ## What It Does
 
-Selects the best model-provider-key combination for each inference request by scoring active and common pools using a weighted formula over latency, error rate, cost, and rate-limit quota. Handles retry on failure (sequential then parallel hedge) and updates pool scores in Redis after each request.
+For each request: turn the requested model into an ordered list of candidates (provider + provider model id + key) using the org's catalog, the fixed provider priority (or the per-request header override), and key order. Then try candidates one after another, skipping keys in cooldown, failing over on any error, until one succeeds or the list is exhausted. On exhaustion, return the single most actionable error.
 
 ## Inputs
 
-| Input | Type | Source | Required |
-|-------|------|---------|----------|
-| User ID | UUID | Auth middleware | Yes |
-| Internal `ChatRequest` | Go struct | Request handler | Yes |
-| Pool state | Redis sorted sets | Redis (`pool:{user_id}:active`, `pool:{user_id}:common`) | Yes |
-| Rate-limit counters | Redis counters | Redis (`rl:{user_id}:{provider}:{model}:{window}`) | Yes |
-| Rolling metrics | Redis hashes | Redis (`metrics:{user_id}:{provider}:{model}`) | Yes |
+| Input | Source |
+|-------|--------|
+| `auth.Principal` (org, token) | Service-token middleware |
+| Parsed request (model, stream, body) | `handlers/inference.go` |
+| `X-Router0-Providers` header | Request |
+| Catalog entries | `catalog.Resolver` |
+| Provider order | `orgs.PriorityStore` |
+| Active keys per provider, by position | `keys.Repository.ActiveByOrgProvider` |
+| Key states | `keystate.Store.Check` |
 
 ## Outputs
 
-| Output | Type | Destination |
-|--------|------|-------------|
-| Selected `Combo` (provider + model + key ID) | Go struct | Request handler → Provider Adapter |
-| Updated pool scores | Redis sorted set | Redis |
-| Updated rate-limit counters | Redis counter | Redis |
-| Request outcome metadata | Go struct | Metadata Recorder → PostgreSQL |
+| Output | Destination |
+|--------|-------------|
+| Response (JSON or SSE) | Client |
+| `routing.Result{Winner, Attempts}` | Metadata recorder (request + attempt rows) |
+| `keystate.Mark` calls; key `status='error'` on auth; catalog row unavailable on `model_unavailable` | PostgreSQL (`provider_key_state`, `provider_keys`, `org_model_catalog`) |
 
 ## External Calls
 
 | System | Operation | On Failure |
 |--------|-----------|------------|
-| Redis | ZRANGEBYSCORE pool sets; GET/INCR rl counters; HGET metrics | Return 503 to client; log "pool unavailable" |
-| Provider Adapter | `Stream()` or `Complete()` call | Retry / hedge logic (see below) |
+| PostgreSQL | catalog, priority, keys (3 indexed queries) | 503 `upstream_error/router_unavailable` |
+| PostgreSQL via keystate | `CheckMany` once per request (2 s in-memory cache), `Mark` on failure | Check error: fail open (treat keys as not blocked), log `warn`. Mark error: log `warn`, continue |
+| Provider adapters | `Complete` / `Stream` | Classify → mark → next candidate |
 
 ## Business Rules
 
-### Pool Structure
+### Plan construction (`routing.BuildPlan`)
 
-Each user has two pools stored in Redis:
+1. `entries := catalog.Resolve(org, model)`. Empty → plan is empty → `404 model_not_found`.
+2. Provider order:
+   - Header present: parse the comma list, lowercase, trim, map `gemini` → `google`, de-duplicate keeping the first occurrence. An unknown provider id → `400 invalid_provider_override` before any upstream call. The order is exactly the header list; providers not in it are excluded.
+   - No header: `org_provider_priority` order, then any remaining providers alphabetically.
+3. For each provider in order that has an entry: for each active key (`status='active'`) in `position` order → `Candidate{provider, entry.ProviderModelID, key.ID, key.Label}`.
+4. Keys whose keystate is `transient_cooldown` are moved to the end of the plan, keeping their relative order. They are not skipped, so a single-key org is not locked out by one blip.
+5. Empty plan after the header filter → `404 model_not_found` with message `"… not offered by providers in X-Router0-Providers (groq)"`.
 
-- **Active pool** (`pool:{user_id}:active`): top-scoring model-provider combos. Serves 80% of requests (determined by `rand.Float64() < 0.80`).
-- **Common pool** (`pool:{user_id}:common`): all registered combos. Serves 20% of requests (telemetry gathering).
+### Execution (`routing.Executor.Run`)
 
-A combo is the tuple `(provider, model, provider_key_id)`. When a user has multiple keys for the same provider, each key-model pair is a distinct combo.
+- Strictly sequential, in plan order. No parallel hedging. Assumed: hedging is removed because it double-bills keys and contradicts fixed priority.
+- For each candidate:
+  1. State from the request's single `keystate.CheckMany` result (computed before the loop). `rate_limited` or `credits_exhausted` (or P3 `budget_exhausted`) → record `outcome=skipped`, `skip_reason`, `retry_after` → next. Skipped candidates do not count toward `ROUTER0_MAX_ATTEMPTS`.
+  2. Decrypt the key (failure → `outcome=error, class=transient, provider_error_code=key_decrypt_failed` → next).
+  3. Call the attempt func with a per-attempt context: non-stream timeout `ROUTER0_ATTEMPT_TIMEOUT_SECONDS` (120); stream timeout `ROUTER0_STREAM_FIRST_BYTE_TIMEOUT_SECONDS` (20) until the first chunk, then no router-side cap. Assumed: the current 15 s non-stream timeout is too short for long completions, so it becomes 120 s.
+  4. Success → stop. Error → `*providers.ProviderError` (via the adapter's classifier) → record → `keystate.Mark` → side effects (auth → key `status='error'`; `model_unavailable` → catalog row unavailable) → next.
+- Stops after `ROUTER0_MAX_ATTEMPTS` (8) attempted candidates. Unattempted candidates are not part of the error decision.
+- The client disconnecting (request ctx cancelled) stops the loop immediately. The cancelled attempt is recorded as `error`/`client_cancelled` and the key is **not** marked.
+- Fail over on **any** error class, including `bad_request` and `auth`, per the brief.
 
-### Scoring Formula
+### Streaming
 
-Each combo is scored 0.0–1.0 (higher is better). Combos with exhausted daily quota are scored `-1` and excluded from selection entirely.
+- The stream attempt func calls `Stream`, then waits for the first item from the channel: a content/role/tool chunk means success (commit). An error event or a channel closed before any chunk means failure, classified, and failover continues.
+- On commit, the handler writes `200`, the `X-Router0-*` headers, and the first chunk, then pipes the rest. Every chunk is re-serialised as an OpenAI `chat.completion.chunk` with `model` = canonical name. Raw provider SSE lines are no longer passed through, because Anthropic and Gemini chunks must be translated and the model name rewritten.
+- Mid-stream upstream failure → write `data: {"error":{"type":"upstream_error","code":"stream_interrupted",…}}`, then `data: [DONE]`. Record `status=error, error_code=stream_interrupted`. Mark the key per the classified error.
+- router0 always sends `stream_options: {"include_usage": true}` upstream for providers that support it (OpenAI-compatible). It forwards the usage chunk to the client only if the client asked for it.
 
-```
-score(combo) =
-    0.35 * (1 - error_rate_5m)           // reliability weight
-  + 0.30 * latency_score(combo)          // speed weight (inverted)
-  + 0.20 * (1 - cost_score(combo))       // cost weight (inverted)
-  + 0.15 * quota_remaining_fraction(combo)  // quota pressure weight
-```
+### Exhaustion → final error
 
-Where:
-- `error_rate_5m` = (errors in last 5 min) / (requests in last 5 min), range [0, 1]. Defaults to 0.0 for a new combo with no traffic.
-- `latency_score(combo)` = `p95_latency_ms(combo)` / `max_p95_ms_in_pool`, range [0, 1]. If only one combo, score = 0.5.
-- `cost_score(combo)` = `cost_per_token(combo)` / `max_cost_in_pool`, range [0, 1].
-- `quota_remaining_fraction(combo)` = min(minute_remaining/minute_limit, hour_remaining/hour_limit, day_remaining/day_limit), range [0, 1]. If provider does not publish limits, defaults to 1.0.
+`routing.FinalError(result)`. Precedence is defined in error-classification.md: **429 > 402 > 404 > 400 > 503**.
 
-Weights are static in Phase 1. Phase 2 replaces them with a contextual-bandit learner (see `spec/agent.md`).
+### Response headers
 
-### Rate-Limit Tracking
+`X-Router0-Request-Id`, `X-Router0-Canonical-Model`, `X-Router0-Attempts` always. `X-Router0-Provider`, `X-Router0-Model`, `X-Router0-Key`, `X-Router0-Latency-Ms` on success. `Retry-After` on 429.
 
-Redis keys:
+### Legacy code
 
-| Key Pattern | Type | Value | TTL |
-|-------------|------|-------|-----|
-| `rl:{user_id}:{provider}:{model}:minute` | String (int counter) | Requests used | Expires at the top of next minute |
-| `rl:{user_id}:{provider}:{model}:hour` | String (int counter) | Requests used | Expires at the top of next hour |
-| `rl:{user_id}:{provider}:{model}:day` | String (int counter) | Requests used | Expires at UTC midnight |
+`routing/pool.go`, `scorer.go`, `selector.go`, `promoter.go`, `tier.go`, `meta_syncer.go`, `ratelimit.go`, `ratelimit_observer.go` are no longer called from the request path, and their goroutines are not started from `main.go` in Phase 1. `remediate.go`'s `HandleAuthError` behaviour (key → `error`) moves into the executor's side effects. Deleted in Phase 3.
 
-Counters are incremented with `INCR` after each request is dispatched. Provider-returned rate-limit headers update `quota_remaining_fraction` directly via `SET rl:{user_id}:{provider}:{model}:remaining:{window}` (separate key per window, overwritten on each response).
+## Success Criteria (all runnable against mock providers)
 
-**Critical rule:** any combo where `day_remaining == 0` (daily quota exhausted) must NEVER be selected. The scorer assigns `-1` and the selector skips it entirely.
-
-### Error Classification and Pool Impact
-
-| ProviderError Class | Rate-limit counter action | Pool score impact |
-|---------------------|--------------------------|-------------------|
-| `ErrClassRateLimit` | Mark window exhausted in Redis | Score set to -1 for exhausted window; removed from active pool |
-| `ErrClassProviderThrottle` | Mark provider throttled (5 min cooldown Redis key) | All combos for provider excluded for 5 min |
-| `ErrClassAuth` | None | Key status set to `error` via DB write; removed from pool |
-| `ErrClassTimeout` | Increment request counter | p95 latency increased |
-| `ErrClassUpstream` | Increment error counter | error_rate increased |
-
-### Request Routing Flow
-
-1. Authenticate the Zer0 API key → resolve `user_id`.
-2. Roll dice: `active = rand.Float64() < 0.80`.
-3. Load the chosen pool from Redis (sorted set, descending score order).
-4. Filter out any combos with exhausted daily quota or provider-throttle cooldown.
-5. If the filtered pool is empty, fall back to the other pool. If both empty, return 503.
-6. Select the top-scored combo from the filtered pool.
-7. Decrypt the provider key in-memory; call `Provider.Stream()` (or `Complete()`) with the request.
-8. On success: stream response to client; record metadata; update metrics.
-9. On failure: execute retry/hedge logic (see below).
-
-### Retry and Hedge Logic
-
-**Sequential retry (attempt 2):**
-- On any failure except `ErrClassAuth` (which disqualifies the key), pick the next-ranked eligible combo from the same pool.
-- Execute the same request.
-
-**Parallel hedge (attempt 3+):**
-- If the sequential retry also fails, enter hedge mode.
-- Fire 2 remaining eligible combos simultaneously using `context.WithCancel`.
-- Return the first successful response to the client; cancel the other in-flight request immediately.
-- If both fail, return structured 503.
-
-**Total failure response:**
-
-```json
-{
-  "error": {
-    "message": "All available providers failed to fulfill this request.",
-    "type": "zer0_gateway_error",
-    "code": "all_providers_failed",
-    "details": [
-      {"provider": "groq", "model": "llama-3.1-70b-versatile", "error": "rate_limit"},
-      {"provider": "google", "model": "gemini-1.5-flash", "error": "upstream_error"}
-    ]
-  },
-  "retry_after": 30
-}
-```
-
-HTTP status: 503. `retry_after` is the minimum TTL-to-expiry across exhausted rate-limit windows (seconds), or 30 if unknown.
-
-### Pool Promotion and Demotion
-
-Re-scored every 5 minutes via a background goroutine for each user that has had traffic in the past 24 hours.
-
-**Promotion to active pool** (common → active): score ≥ 0.70 AND error_rate_1h < 0.05 AND p95_latency_ms < 800 AND day_quota_remaining_fraction > 0.20.
-
-**Demotion from active pool** (active → common): score < 0.40 OR error_rate_1h > 0.15 OR p95_latency_ms > 2000 OR day_quota_remaining_fraction < 0.05.
-
-Active pool size is soft-capped at 5 combos. If more than 5 combos meet promotion criteria, the top 5 by score are in active; others remain in common.
-
-### Metrics Stored in Redis
-
-`metrics:{user_id}:{provider}:{model}` hash fields:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `requests_5m` | int | Request count in rolling 5-minute window |
-| `errors_5m` | int | Error count in rolling 5-minute window |
-| `requests_1h` | int | Request count in rolling 1-hour window |
-| `errors_1h` | int | Error count in rolling 1-hour window |
-| `p95_latency_ms` | int | Running p95 latency estimate (reservoir sampling, 100-sample reservoir) |
-| `last_request_at` | unix timestamp | For pool re-scoring scheduling |
-
-Rolling windows are approximated with two counter buckets per window (current + previous) rotated on TTL. This avoids expensive sorted set operations at request time.
-
-## Success Criteria
-
-- [ ] With two active pool combos (e.g. Groq + Google), 100 sequential requests produce roughly 80 ± 10 routing to the active pool and 20 ± 10 to the common pool.
-- [ ] A combo with a manually set daily quota counter at the limit is never selected; verified by sending 10 requests and asserting none use the exhausted combo in `X-Zer0-Provider` / `X-Zer0-Model` headers.
-- [ ] Mocking the top-ranked combo to return `ErrClassUpstream`: the router uses the second-ranked combo (sequential retry); `X-Zer0-Provider` in the response matches the second combo.
-- [ ] Mocking the top two combos to fail: the router enters hedge mode and returns a successful response from one of the remaining combos within 2× single-request timeout.
-- [ ] Mocking all combos to fail: the router returns HTTP 503 with `{"error":{"code":"all_providers_failed"}}` and a `retry_after` field > 0.
-- [ ] After 10 simulated errors on a combo, the re-scoring goroutine demotes it from the active pool within one 5-minute cycle.
-- [ ] Redis `rl:{user_id}:{provider}:{model}:minute` counter increments by 1 for each completed request.
+- [ ] Priority `groq, openrouter`; mock Groq returns 200 → served by Groq, trail length 1.
+- [ ] Mock Groq key A returns 500 → served by Groq key B; trail `[A:error/transient, B:success]`.
+- [ ] Both Groq keys return 429 → served by OpenRouter; trail has 3 entries.
+- [ ] `X-Router0-Providers: openrouter` → mock Groq receives zero requests (call counter) and the response comes from OpenRouter.
+- [ ] `X-Router0-Providers: nosuch` → 400 `invalid_provider_override`, and no provider is called.
+- [ ] Requesting `llama-3.3-70b` never calls a provider whose catalog lacks it (the request goes only to providers that list it).
+- [ ] Streaming: Groq key A fails before the first byte (503), key B streams 3 chunks → the client receives 3 content chunks + `[DONE]`, and the trail shows the failover.
+- [ ] Streaming: a mock that sends 2 chunks then closes with an error → the client receives the 2 chunks, a `stream_interrupted` error event, and `[DONE]`; the log row has `error_code=stream_interrupted`.
+- [ ] After a 429 with `Retry-After: 30` on Groq key A, a second request within 30 s skips key A without calling it (mock call counter unchanged), and the trail shows `skipped/rate_limited`.
+- [ ] A single-key org whose key just got a transient 502 still has the next request attempted on that key (moved to the end, not skipped).
+- [ ] Client disconnect during an attempt does not mark the key (no keystate entry).
+- [ ] With 10 keys all failing transiently, only 8 upstream calls are made.
