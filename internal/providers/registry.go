@@ -2,6 +2,8 @@ package providers
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 )
 
@@ -10,16 +12,33 @@ var (
 	registry = map[string]Provider{}
 )
 
+// aliases map accepted alternative provider ids to the canonical one.
+var aliases = map[string]string{
+	"gemini": "google",
+}
+
+// Register adds a provider under its Name(). Each adapter calls this from its
+// own file's init().
 func Register(p Provider) {
 	mu.Lock()
 	defer mu.Unlock()
 	registry[p.Name()] = p
 }
 
+// CanonicalName resolves aliases (e.g. "gemini" -> "google") and lowercases.
+func CanonicalName(name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if a, ok := aliases[n]; ok {
+		return a
+	}
+	return n
+}
+
+// Get returns a provider by id or alias.
 func Get(name string) (Provider, error) {
 	mu.RLock()
 	defer mu.RUnlock()
-	p, ok := registry[name]
+	p, ok := registry[CanonicalName(name)]
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", name)
 	}
@@ -36,15 +55,14 @@ func All() map[string]Provider {
 	return out
 }
 
+// ValidProviders returns the sorted registered provider ids.
 func ValidProviders() []string {
-	return []string{"google", "groq", "openrouter", "nvidia", "together", "baseten"}
-}
-
-func init() {
-	Register(&GroqProvider{})
-	Register(&GoogleProvider{})
-	Register(&OpenRouterProvider{})
-	Register(&NvidiaProvider{})
-	Register(&TogetherProvider{})
-	Register(&BasetenProvider{})
+	mu.RLock()
+	defer mu.RUnlock()
+	out := make([]string, 0, len(registry))
+	for k := range registry {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

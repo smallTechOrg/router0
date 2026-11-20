@@ -11,15 +11,20 @@ type Claims struct {
 	UserID string `json:"user_id"`
 	Email  string `json:"email"`
 	Role   string `json:"role"`
+	// OrgID is the user's org at login time. Optional: JWTMiddleware falls back
+	// to org_members when it is absent (tokens issued before orgs existed).
+	OrgID string `json:"org_id,omitempty"`
 	jwt.RegisteredClaims
 }
 
-func IssueAccessToken(secret, userID, email, role string) (string, error) {
+func IssueAccessToken(secret, userID, email, role, orgID string) (string, error) {
 	claims := Claims{
 		UserID: userID,
 		Email:  email,
 		Role:   role,
+		OrgID:  orgID,
 		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   userID,
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},

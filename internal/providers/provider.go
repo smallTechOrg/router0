@@ -3,6 +3,8 @@ package providers
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"time"
 )
 
 // ToolFunction describes a callable function in a tool definition.
@@ -26,6 +28,7 @@ type ToolCallFunction struct {
 
 // ToolCall represents a single tool invocation in an assistant message.
 type ToolCall struct {
+	Index    *int             `json:"index,omitempty"` // streaming deltas: position of the tool call
 	ID       string           `json:"id"`
 	Type     string           `json:"type"`
 	Function ToolCallFunction `json:"function"`
@@ -47,11 +50,16 @@ type ChatRequest struct {
 	Model       string        `json:"model"`
 	Messages    []ChatMessage `json:"messages"`
 	MaxTokens   int           `json:"max_tokens,omitempty"`
-	Temperature float64       `json:"temperature,omitempty"`
+	Temperature *float64      `json:"temperature,omitempty"` // pointer so that 0 is forwarded
+	TopP        *float64      `json:"top_p,omitempty"`
+	Seed        *int          `json:"seed,omitempty"`
+	User        string        `json:"user,omitempty"`
 	Stream      bool          `json:"stream,omitempty"`
 	Stop        []string      `json:"stop,omitempty"`
 	Tools       []Tool        `json:"tools,omitempty"`
 	ToolChoice  any           `json:"tool_choice,omitempty"`
+	// ResponseFormat is forwarded as-is (e.g. {"type":"json_object"}).
+	ResponseFormat any `json:"response_format,omitempty"`
 }
 
 // Usage contains token counts.
@@ -63,13 +71,13 @@ type Usage struct {
 
 // RateLimitHeaders holds rate limit information parsed from provider response headers.
 type RateLimitHeaders struct {
-	LimitRPM   int
+	LimitRPM     int
 	RemainingRPM int
-	LimitTPM   int
+	LimitTPM     int
 	RemainingTPM int
-	LimitTPD   int
+	LimitTPD     int
 	RemainingTPD int
-	ResetAt    string
+	ResetAt      string
 }
 
 // ChatResponse is a non-streaming response.
@@ -92,6 +100,11 @@ type ChatChunk struct {
 	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
 	FinishReason string     `json:"finish_reason,omitempty"`
 	Done         bool       `json:"done"`
+	// Usage is set on the final usage-only chunk (stream_options.include_usage).
+	Usage *Usage `json:"usage,omitempty"`
+	// Err is set when the stream failed after it started (SSE error event,
+	// premature EOF, read error). No further chunks follow an Err chunk.
+	Err *ProviderError `json:"-"`
 	// Raw SSE line for passthrough
 	Raw string `json:"raw,omitempty"`
 }
@@ -108,22 +121,36 @@ type HealthResult struct {
 type ErrorClass string
 
 const (
-	ErrorClassRateLimit   ErrorClass = "rate_limit"
-	ErrorClassAuthError   ErrorClass = "auth_error"
-	ErrorClassUpstream    ErrorClass = "upstream_error"
-	ErrorClassTimeout     ErrorClass = "timeout"
-	ErrorClassUnavailable ErrorClass = "unavailable"
+	ErrorClassRateLimit          ErrorClass = "rate_limit"
+	ErrorClassInsufficientCredit ErrorClass = "insufficient_credits"
+	ErrorClassAuth               ErrorClass = "auth"
+	ErrorClassModelUnavailable   ErrorClass = "model_unavailable"
+	ErrorClassBadRequest         ErrorClass = "bad_request"
+	ErrorClassTransient          ErrorClass = "transient"
 )
 
-// ProviderError wraps a provider-specific error.
+// ProviderError is a classified provider failure.
+//
+// Message is the provider's own error message: it is kept in memory only (it may
+// be returned to the caller for a bad_request) and must never be persisted or
+// logged. Code is the provider's structured error code/type (<= 200 chars) and
+// is the only part that may be persisted. Error() deliberately omits Message.
 type ProviderError struct {
-	Class   ErrorClass
-	Message string
-	HTTP    int
+	Class      ErrorClass
+	HTTP       int
+	Code       string
+	RetryAfter time.Duration
+	Message    string
 }
 
 func (e *ProviderError) Error() string {
-	return fmt.Sprintf("provider error [%s]: %s (http %d)", e.Class, e.Message, e.HTTP)
+	return fmt.Sprintf("provider error [%s] code=%q (http %d)", e.Class, e.Code, e.HTTP)
+}
+
+// Classifier is optionally implemented by adapters with provider-specific rules.
+// body is at most 64 KiB of the response.
+type Classifier interface {
+	Classify(status int, h http.Header, body []byte) *ProviderError
 }
 
 // ModelInfo describes a model discovered from a provider's API.
@@ -134,7 +161,7 @@ type ModelInfo struct {
 	MaxOutputTokens   int
 	InputCostPerMTok  float64 // USD per million input tokens
 	OutputCostPerMTok float64 // USD per million output tokens
-	SupportsStreaming  bool
+	SupportsStreaming bool
 	ParameterCountB   float64 // total parameters in billions (0 = unknown)
 	Architecture      string  // e.g. "dense", "MoE", "SSM"
 	Extra             map[string]any

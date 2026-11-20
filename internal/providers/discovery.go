@@ -3,33 +3,65 @@ package providers
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// doListModelsOpenAI fetches the /models endpoint from an OpenAI-compatible API.
-func doListModelsOpenAI(ctx context.Context, baseURL, apiKey string, headers map[string]string) ([]map[string]any, error) {
-	client := &http.Client{Timeout: 20 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, "GET", baseURL+"/models", nil)
+const listModelsTimeout = 30 * time.Second
+
+// doGetJSON performs an authenticated GET (bounded by listModelsTimeout) and
+// returns the 2xx body. Non-2xx and transport failures are *ProviderError.
+func doGetJSON(ctx context.Context, url string, headers map[string]string, cls Classifier) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, listModelsTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := client.Do(req)
+	resp, err := doRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, failureFromResponse(resp, cls)
+	}
 	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+	if err != nil {
+		pe, _ := TransportError(ctx, err)
+		if pe == nil {
+			return nil, err
+		}
+		return nil, pe
+	}
+	return b, nil
+}
+
+func bearer(apiKey string, extra map[string]string) map[string]string {
+	h := map[string]string{"Authorization": "Bearer " + apiKey}
+	for k, v := range extra {
+		h[k] = v
+	}
+	return h
+}
+
+// doListModelsOpenAI fetches the /models endpoint from an OpenAI-compatible API.
+func doListModelsOpenAI(ctx context.Context, baseURL, apiKey string, headers map[string]string, cls Classifier) ([]map[string]any, error) {
+	b, err := doGetJSON(ctx, strings.TrimRight(baseURL, "/")+"/models", bearer(apiKey, headers), cls)
+	if err != nil {
+		return nil, err
+	}
 	var result struct {
 		Data []map[string]any `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+	if err := json.Unmarshal(b, &result); err != nil {
+		return nil, &ProviderError{Class: ErrorClassTransient, Code: "invalid_response", Message: "unparseable model list"}
 	}
 	return result.Data, nil
 }
@@ -58,8 +90,8 @@ func jsonStr(m map[string]any, key string) string {
 }
 
 // doListModelsOpenAIAsModelInfo is a convenience wrapper that returns []ModelInfo from an OpenAI-compat /models list.
-func doListModelsOpenAIAsModelInfo(ctx context.Context, baseURL, apiKey string, headers map[string]string) ([]ModelInfo, error) {
-	raw, err := doListModelsOpenAI(ctx, baseURL, apiKey, headers)
+func doListModelsOpenAIAsModelInfo(ctx context.Context, baseURL, apiKey string, headers map[string]string, cls Classifier) ([]ModelInfo, error) {
+	raw, err := doListModelsOpenAI(ctx, baseURL, apiKey, headers, cls)
 	if err != nil {
 		return nil, err
 	}
@@ -70,12 +102,12 @@ func doListModelsOpenAIAsModelInfo(ctx context.Context, baseURL, apiKey string, 
 			continue
 		}
 		models = append(models, ModelInfo{
-			ID:               id,
-			DisplayName:      id,
-			ContextWindow:    jsonInt(m, "context_length"),
-			MaxOutputTokens:  jsonInt(m, "max_output_tokens"),
+			ID:                id,
+			DisplayName:       id,
+			ContextWindow:     jsonInt(m, "context_length"),
+			MaxOutputTokens:   jsonInt(m, "max_output_tokens"),
 			SupportsStreaming: true,
-			Extra:            map[string]any{},
+			Extra:             map[string]any{},
 		})
 	}
 	return models, nil
