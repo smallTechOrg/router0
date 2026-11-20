@@ -2,30 +2,52 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/zer0-router/zer0/internal/auth"
+	"github.com/zer0-router/zer0/internal/orgs"
 )
 
 type AuthHandler struct {
 	pool      *pgxpool.Pool
+	orgs      *orgs.Repository
 	jwtSecret string
 }
 
 func NewAuthHandler(pool *pgxpool.Pool, jwtSecret string) *AuthHandler {
-	return &AuthHandler{pool: pool, jwtSecret: jwtSecret}
+	return &AuthHandler{pool: pool, orgs: orgs.NewRepository(pool), jwtSecret: jwtSecret}
 }
 
 type registerReq struct {
 	InviteToken string `json:"invite_token"`
 	Email       string `json:"email"`
 	Password    string `json:"password"`
+	OrgName     string `json:"org_name"`
 }
+
+type orgJSON struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Role string `json:"role"`
+}
+
+// regError aborts registration with an HTTP error (the transaction is rolled back).
+type regError struct {
+	status         int
+	typ, code, msg string
+}
+
+func (e *regError) Error() string { return e.code }
 
 func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	var req registerReq
@@ -34,6 +56,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Email = strings.TrimSpace(strings.ToLower(req.Email))
+	req.OrgName = strings.TrimSpace(req.OrgName)
 	if req.Email == "" || req.Password == "" || req.InviteToken == "" {
 		writeError(w, http.StatusBadRequest, "validation_error", "missing_fields", "invite_token, email, and password are required")
 		return
@@ -42,80 +65,105 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error", "password_too_short", "Password must be at least 12 characters")
 		return
 	}
+	if utf8.RuneCountInString(req.OrgName) > 80 {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", "org_name_too_long", "org_name must be at most 80 characters")
+		return
+	}
 
-	ctx := r.Context()
-	// Validate invite
-	var inviteID, inviteEmail string
-	var acceptedAt *time.Time
-	var expiresAt time.Time
-	err := h.pool.QueryRow(ctx,
-		`SELECT id, email, accepted_at, expires_at FROM invites WHERE token = $1`,
-		req.InviteToken,
-	).Scan(&inviteID, &inviteEmail, &acceptedAt, &expiresAt)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "validation_error", "invalid_invite", "Invalid invite token")
-		return
-	}
-	if acceptedAt != nil {
-		writeError(w, http.StatusConflict, "conflict", "invite_used", "Invite already used")
-		return
-	}
-	if time.Now().After(expiresAt) {
-		writeError(w, http.StatusGone, "gone", "invite_expired", "Invite has expired")
-		return
-	}
-	_ = inviteEmail
-
-	// Hash password
 	pwHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "hash_failed", "Failed to hash password")
 		return
 	}
 
-	// Generate Zer0 key
-	fullKey, prefix, err := auth.GenerateZer0Key()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "keygen_failed", "Failed to generate key")
-		return
-	}
-	keyHash, err := bcrypt.GenerateFromPassword([]byte(fullKey), 12)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "hash_failed", "Failed to hash key")
-		return
-	}
-
-	// Create user
+	ctx := r.Context()
 	var userID, role, status string
 	var createdAt time.Time
-	err = h.pool.QueryRow(ctx,
-		`INSERT INTO users (email, password_hash, zer0_key_hash, zer0_key_prefix, role, status)
-		 VALUES ($1, $2, $3, $4, 'user', 'active')
-		 RETURNING id, role, status, created_at`,
-		req.Email, string(pwHash), string(keyHash), prefix,
-	).Scan(&userID, &role, &status, &createdAt)
+	var org orgJSON
+
+	// User, org, membership and invite consumption are one transaction.
+	err = pgx.BeginFunc(ctx, h.pool, func(tx pgx.Tx) error {
+		var inviteID string
+		var inviteOrgID, inviteOrgRole *string
+		var acceptedAt, usedAt *time.Time
+		var expiresAt time.Time
+		err := tx.QueryRow(ctx,
+			`SELECT id::text, org_id::text, org_role, accepted_at, used_at, expires_at
+			   FROM invites WHERE token = $1 FOR UPDATE`,
+			req.InviteToken,
+		).Scan(&inviteID, &inviteOrgID, &inviteOrgRole, &acceptedAt, &usedAt, &expiresAt)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return &regError{http.StatusBadRequest, "validation_error", "invalid_invite", "Invalid invite token"}
+			}
+			return err
+		}
+		if acceptedAt != nil || usedAt != nil {
+			return &regError{http.StatusConflict, "conflict", "invite_used", "Invite already used"}
+		}
+		if time.Now().After(expiresAt) {
+			return &regError{http.StatusGone, "gone", "invite_expired", "Invite has expired"}
+		}
+
+		err = tx.QueryRow(ctx,
+			`INSERT INTO users (email, password_hash, role, status)
+			 VALUES ($1, $2, 'user', 'active')
+			 RETURNING id::text, role, status, created_at`,
+			req.Email, string(pwHash),
+		).Scan(&userID, &role, &status, &createdAt)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return &regError{http.StatusConflict, "conflict", "email_exists", "Email already registered"}
+			}
+			return err
+		}
+
+		if inviteOrgID == nil {
+			name := req.OrgName
+			if name == "" {
+				name = req.Email
+			}
+			orgID, err := orgs.CreateWithOwner(ctx, tx, name, userID)
+			if err != nil {
+				return err
+			}
+			org = orgJSON{ID: orgID, Name: name, Role: orgs.RoleOwner}
+		} else {
+			memberRole := orgs.RoleMember
+			if inviteOrgRole != nil && *inviteOrgRole != "" {
+				memberRole = *inviteOrgRole
+			}
+			if err := orgs.AddMember(ctx, tx, *inviteOrgID, userID, memberRole); err != nil {
+				return err
+			}
+			org = orgJSON{ID: *inviteOrgID, Role: memberRole}
+			if err := tx.QueryRow(ctx, `SELECT name FROM orgs WHERE id = $1`, *inviteOrgID).Scan(&org.Name); err != nil {
+				return err
+			}
+		}
+
+		_, err = tx.Exec(ctx, `UPDATE invites SET accepted_at = NOW(), used_at = NOW(), used_by = $2 WHERE id = $1`, inviteID, userID)
+		return err
+	})
 	if err != nil {
-		if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
-			writeError(w, http.StatusConflict, "conflict", "email_exists", "Email already registered")
+		var re *regError
+		if errors.As(err, &re) {
+			writeError(w, re.status, re.typ, re.code, re.msg)
 			return
 		}
+		slog.Error("register failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to create user")
 		return
 	}
 
-	// Mark invite as used
-	h.pool.Exec(ctx, `UPDATE invites SET accepted_at = NOW() WHERE id = $1`, inviteID)
-
-	// Issue JWT
-	accessToken, err := auth.IssueAccessToken(h.jwtSecret, userID, req.Email, role)
+	accessToken, err := auth.IssueAccessToken(h.jwtSecret, userID, req.Email, role, org.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "jwt_failed", "Failed to issue token")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"user": map[string]interface{}{
 			"id":         userID,
 			"email":      req.Email,
@@ -123,7 +171,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 			"status":     status,
 			"created_at": createdAt.Format(time.RFC3339),
 		},
-		"zer0_key":     fullKey,
+		"org":          org,
 		"access_token": accessToken,
 	})
 }
@@ -160,7 +208,17 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accessToken, err := auth.IssueAccessToken(h.jwtSecret, userID, req.Email, role)
+	var orgOut *orgJSON
+	orgID := ""
+	if o, err := h.orgs.GetForUser(ctx, userID); err == nil {
+		orgOut = &orgJSON{ID: o.ID, Name: o.Name, Role: o.Role}
+		orgID = o.ID
+	} else if !errors.Is(err, orgs.ErrNoOrg) {
+		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to load org")
+		return
+	}
+
+	accessToken, err := auth.IssueAccessToken(h.jwtSecret, userID, req.Email, role, orgID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "jwt_failed", "Failed to issue token")
 		return
@@ -189,6 +247,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 			"role":   role,
 			"status": status,
 		},
+		"org": orgOut,
 	})
 }
 
@@ -214,13 +273,21 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "auth_error", "invalid_refresh_token", "Invalid or expired refresh token")
 		return
 	}
-	var email, role string
-	err = h.pool.QueryRow(r.Context(), `SELECT email, role FROM users WHERE id = $1`, userID).Scan(&email, &role)
+	var email, role, status string
+	err = h.pool.QueryRow(r.Context(), `SELECT email, role, status FROM users WHERE id = $1`, userID).Scan(&email, &role, &status)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "auth_error", "user_not_found", "User not found")
 		return
 	}
-	accessToken, err := auth.IssueAccessToken(h.jwtSecret, userID, email, role)
+	if status == "disabled" {
+		writeError(w, http.StatusForbidden, "forbidden", "account_disabled", "Account is disabled")
+		return
+	}
+	orgID := ""
+	if o, err := h.orgs.GetForUser(r.Context(), userID); err == nil {
+		orgID = o.ID
+	}
+	accessToken, err := auth.IssueAccessToken(h.jwtSecret, userID, email, role, orgID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "jwt_failed", "Failed to issue token")
 		return
@@ -231,23 +298,26 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 
 func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 	userID := auth.UserIDFromCtx(r.Context())
-	var email, role, status, keyPrefix string
-	var createdAt time.Time
+	var email, role, status string
 	err := h.pool.QueryRow(r.Context(),
-		`SELECT email, role, status, zer0_key_prefix, created_at FROM users WHERE id = $1`,
-		userID,
-	).Scan(&email, &role, &status, &keyPrefix, &createdAt)
+		`SELECT email, role, status FROM users WHERE id = $1`, userID,
+	).Scan(&email, &role, &status)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to fetch user")
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"id":              userID,
-		"email":           email,
-		"role":            role,
-		"status":          status,
-		"zer0_key_prefix": keyPrefix,
-		"created_at":      createdAt.Format(time.RFC3339),
+	var orgOut *orgJSON
+	if o, err := h.orgs.GetForUser(r.Context(), userID); err == nil {
+		orgOut = &orgJSON{ID: o.ID, Name: o.Name, Role: o.Role}
+	} else if !errors.Is(err, orgs.ErrNoOrg) {
+		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to load org")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"id":     userID,
+		"email":  email,
+		"role":   role,
+		"status": status,
+		"org":    orgOut,
 	})
 }

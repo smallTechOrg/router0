@@ -1,33 +1,23 @@
-version: '3.9'
+# DEPLOYMENT EXAMPLE ONLY. Not used for local development or tests: router0 runs
+# bare-local against Homebrew PostgreSQL (see README.md). This file shows the one
+# external dependency (PostgreSQL) for people who deploy with containers; there is
+# no Redis. Adapt credentials and volumes before any real use.
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: zer0
-      POSTGRES_PASSWORD: zer0dev
-      POSTGRES_DB: zer0router
+      POSTGRES_USER: router0
+      POSTGRES_PASSWORD: change-me
+      POSTGRES_DB: router0
     ports:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U zer0 -d zer0router"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "pg_isready -U router0 -d router0"]
       interval: 5s
       timeout: 5s
       retries: 10
 
 volumes:
   postgres_data:
-  redis_data:

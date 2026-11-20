@@ -1,20 +1,21 @@
 package handlers
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
 	"github.com/zer0-router/zer0/internal/auth"
+	"github.com/zer0-router/zer0/internal/catalog"
 	"github.com/zer0-router/zer0/internal/keys"
 	"github.com/zer0-router/zer0/internal/metadata"
 	"github.com/zer0-router/zer0/internal/metrics"
@@ -22,636 +23,633 @@ import (
 	"github.com/zer0-router/zer0/internal/routing"
 )
 
-type InferenceHandler struct {
-	selector    *routing.Selector
-	recorder    *metadata.Recorder
-	rl          *routing.RateLimiter
-	rlObserver  *routing.RateLimitObserver
-	remediator  *routing.Remediator
-	keyRepo     *keys.Repository
+const (
+	maxRequestBody   = 10 << 20
+	providersHeader  = "X-Router0-Providers"
+	statusClientGone = 499 // logged only; nothing is written to a departed client
+)
+
+// ProviderOrderer is satisfied by *keys.PriorityStore.
+type ProviderOrderer interface {
+	ProviderOrder(ctx context.Context, orgID string) ([]string, error)
 }
 
-func NewInferenceHandler(pg *pgxpool.Pool, r *redis.Client) *InferenceHandler {
-	sel := routing.NewSelector(r, pg)
-	return &InferenceHandler{
-		selector:    sel,
-		recorder:    metadata.NewRecorder(pg),
-		rl:          routing.NewRateLimiter(r),
-		rlObserver:  routing.NewRateLimitObserver(pg, r),
-		remediator:  routing.NewRemediator(pg, sel.Pool()),
-		keyRepo:     keys.NewRepository(pg),
+// ActiveKeyLister is satisfied by *keys.Repository.
+type ActiveKeyLister interface {
+	ActiveByOrgProvider(ctx context.Context, orgID, provider string) ([]*keys.ProviderKey, error)
+}
+
+// InferenceConfig holds the explicit dependencies of the inference handler.
+type InferenceConfig struct {
+	Resolver catalog.Resolver // *catalog.CatalogResolver
+	Priority ProviderOrderer  // *keys.PriorityStore
+	Keys     ActiveKeyLister  // *keys.Repository
+	Executor *routing.Executor
+	Recorder *metadata.Recorder // optional (nil = no request log)
+	// FirstByteTimeout: streaming time allowed until the first upstream chunk.
+	// Zero reads ROUTER0_STREAM_FIRST_BYTE_TIMEOUT_SECONDS (20).
+	FirstByteTimeout time.Duration
+	// Decrypt turns a stored key into plaintext; nil uses keys.Decrypt.
+	Decrypt func(*keys.ProviderKey) (string, error)
+}
+
+// InferenceHandler serves POST /v1/chat/completions.
+type InferenceHandler struct {
+	resolver catalog.Resolver
+	priority ProviderOrderer
+	keys     ActiveKeyLister
+	exec     *routing.Executor
+	streamEx *routing.Executor
+	recorder *metadata.Recorder
+	firstB   time.Duration
+	decrypt  func(*keys.ProviderKey) (string, error)
+}
+
+// NewInferenceHandler wires the handler. The executor's per-attempt timeout
+// applies to non-streaming calls; streaming uses a copy without it and enforces
+// the first-byte timeout itself.
+func NewInferenceHandler(cfg InferenceConfig) *InferenceHandler {
+	fb := cfg.FirstByteTimeout
+	if fb <= 0 {
+		fb = 20 * time.Second
+		if v, err := strconv.Atoi(os.Getenv("ROUTER0_STREAM_FIRST_BYTE_TIMEOUT_SECONDS")); err == nil && v > 0 {
+			fb = time.Duration(v) * time.Second
+		}
 	}
+	dec := cfg.Decrypt
+	if dec == nil {
+		dec = func(k *keys.ProviderKey) (string, error) { return keys.Decrypt(k.Ciphertext, k.Nonce) }
+	}
+	return &InferenceHandler{
+		resolver: cfg.Resolver, priority: cfg.Priority, keys: cfg.Keys,
+		exec: cfg.Executor, streamEx: cfg.Executor.WithAttemptTimeout(0),
+		recorder: cfg.Recorder, firstB: fb, decrypt: dec,
+	}
+}
+
+// ---- request parsing ----
+
+type inMessage struct {
+	Role       string               `json:"role"`
+	Content    json.RawMessage      `json:"content"`
+	ToolCalls  []providers.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string               `json:"tool_call_id,omitempty"`
+	Name       string               `json:"name,omitempty"`
 }
 
 type chatRequest struct {
-	Model          string                  `json:"model"`
-	Messages       []providers.ChatMessage `json:"messages"`
-	MaxTokens      int                     `json:"max_tokens,omitempty"`
-	Temperature    float64                 `json:"temperature,omitempty"`
-	Stream         bool                    `json:"stream,omitempty"`
-	Stop           []string                `json:"stop,omitempty"`
-	Tools          []providers.Tool        `json:"tools,omitempty"`
-	ToolChoice     any                     `json:"tool_choice,omitempty"`
-	ConversationID string                  `json:"conversation_id,omitempty"`
+	Model               string          `json:"model"`
+	Messages            []inMessage     `json:"messages"`
+	MaxTokens           int             `json:"max_tokens"`
+	MaxCompletionTokens int             `json:"max_completion_tokens"`
+	Temperature         *float64        `json:"temperature"`
+	TopP                *float64        `json:"top_p"`
+	Stop                json.RawMessage `json:"stop"`
+	Stream              bool            `json:"stream"`
+	StreamOptions       *struct {
+		IncludeUsage bool `json:"include_usage"`
+	} `json:"stream_options"`
+	Tools          []providers.Tool `json:"tools"`
+	ToolChoice     any              `json:"tool_choice"`
+	ResponseFormat any              `json:"response_format"`
+	Seed           *int             `json:"seed"`
+	User           string           `json:"user"`
 }
 
+var errUnsupportedContent = fmt.Errorf("unsupported content part")
+
+// flattenContent turns a string or an array of text parts into a string.
+func flattenContent(raw json.RawMessage) (string, error) {
+	t := strings.TrimSpace(string(raw))
+	if t == "" || t == "null" {
+		return "", nil
+	}
+	if t[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return "", err
+		}
+		return s, nil
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return "", err
+	}
+	texts := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p.Type != "text" {
+			return "", errUnsupportedContent
+		}
+		texts = append(texts, p.Text)
+	}
+	return strings.Join(texts, "\n"), nil
+}
+
+func parseStop(raw json.RawMessage) []string {
+	t := strings.TrimSpace(string(raw))
+	if t == "" || t == "null" {
+		return nil
+	}
+	if t[0] == '"' {
+		var s string
+		if json.Unmarshal(raw, &s) == nil && s != "" {
+			return []string{s}
+		}
+		return nil
+	}
+	var arr []string
+	if json.Unmarshal(raw, &arr) == nil {
+		return arr
+	}
+	return nil
+}
+
+func (cr *chatRequest) toProvider() (*providers.ChatRequest, error) {
+	msgs := make([]providers.ChatMessage, 0, len(cr.Messages))
+	for _, m := range cr.Messages {
+		c, err := flattenContent(m.Content)
+		if err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, providers.ChatMessage{Role: m.Role, Content: c, ToolCalls: m.ToolCalls, ToolCallID: m.ToolCallID, Name: m.Name})
+	}
+	mt := cr.MaxTokens
+	if mt == 0 {
+		mt = cr.MaxCompletionTokens
+	}
+	return &providers.ChatRequest{
+		Messages: msgs, MaxTokens: mt, Temperature: cr.Temperature, TopP: cr.TopP, Seed: cr.Seed,
+		User: cr.User, Stream: cr.Stream, Stop: parseStop(cr.Stop), Tools: cr.Tools,
+		ToolChoice: cr.ToolChoice, ResponseFormat: cr.ResponseFormat,
+	}, nil
+}
+
+// ---- per-request state ----
+
+type reqState struct {
+	id, orgID, tokenID, requested, canonical string
+	stream                                   bool
+	start                                    time.Time
+}
+
+func (h *InferenceHandler) setBaseHeaders(w http.ResponseWriter, rs *reqState, attempts int) {
+	w.Header().Set("X-Router0-Request-Id", rs.id)
+	if rs.canonical != "" {
+		w.Header().Set("X-Router0-Canonical-Model", rs.canonical)
+	}
+	w.Header().Set("X-Router0-Attempts", strconv.Itoa(attempts))
+}
+
+func toMetaAttempts(in []routing.AttemptRecord) []metadata.Attempt {
+	out := make([]metadata.Attempt, len(in))
+	for i, a := range in {
+		out[i] = metadata.Attempt{
+			Order: a.Order, Provider: a.Provider, Model: a.ProviderModelID, KeyID: a.KeyID, KeyLabel: a.KeyLabel,
+			Outcome: a.Outcome, ErrorClass: a.Class, SkipReason: a.SkipReason, ProviderErrorCode: a.Code,
+			HTTPStatus: a.HTTP, RetryAfterS: retryAfterSeconds(a.RetryAfter), LatencyMs: a.LatencyMs,
+		}
+	}
+	return out
+}
+
+func retryAfterSeconds(d time.Duration) int {
+	if d <= 0 {
+		return 0
+	}
+	s := int(math.Ceil(d.Seconds()))
+	if s < 1 {
+		s = 1
+	}
+	return s
+}
+
+// trailJSON renders attempts per api.md (never provider bodies).
+func trailJSON(attempts []routing.AttemptRecord) []map[string]any {
+	out := make([]map[string]any, 0, len(attempts))
+	for _, a := range attempts {
+		m := map[string]any{"provider": a.Provider, "key": a.KeyLabel, "outcome": a.Outcome}
+		if a.Class != "" {
+			m["class"] = a.Class
+		}
+		if a.SkipReason != "" {
+			m["skip_reason"] = a.SkipReason
+		}
+		if s := retryAfterSeconds(a.RetryAfter); s > 0 {
+			m["retry_after_s"] = s
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+type outcome struct {
+	provider, providerModel, keyID, keyLabel string
+	status                                   string // success | error
+	httpStatus                               int
+	errorCode                                string
+	in, out                                  int
+	cost                                     float64
+	attempts                                 []routing.AttemptRecord
+}
+
+// finish records the request log row, metrics and the request_completed line.
+func (h *InferenceHandler) finish(rs *reqState, o outcome) {
+	lat := time.Since(rs.start)
+	provider := o.provider
+	if provider == "" {
+		provider = "none"
+	}
+	code := o.errorCode
+	if o.status == "success" {
+		code = "ok"
+	}
+	metrics.RequestsTotal.WithLabelValues(provider, o.status, code).Inc()
+	metrics.RequestDuration.WithLabelValues(provider, strconv.FormatBool(rs.stream)).Observe(lat.Seconds())
+	h.recorder.Record(metadata.Request{
+		RequestID: rs.id, OrgID: rs.orgID, TokenID: rs.tokenID, CanonicalModel: rs.canonical,
+		Provider: provider, Model: o.providerModel, KeyID: o.keyID, KeyLabel: o.keyLabel,
+		InputTokens: o.in, OutputTokens: o.out, LatencyMs: lat.Milliseconds(), CostUSD: o.cost,
+		Status: o.status, HTTPStatus: o.httpStatus, ErrorCode: o.errorCode, Stream: rs.stream,
+		Attempts: toMetaAttempts(o.attempts),
+	})
+	slog.Info("request_completed", "request_id", rs.id, "org_id", rs.orgID, "token_id", rs.tokenID,
+		"canonical_model", rs.canonical, "provider", provider, "provider_model_id", o.providerModel,
+		"key_label", o.keyLabel, "attempts", len(o.attempts), "status", o.status, "error_code", o.errorCode,
+		"latency_ms", lat.Milliseconds(), "input_tokens", o.in, "output_tokens", o.out)
+}
+
+func (h *InferenceHandler) failEarly(w http.ResponseWriter, rs *reqState, status int, errType, code, message, param string) {
+	h.setBaseHeaders(w, rs, 0)
+	writeOpenAIError(w, status, errType, code, message, param, map[string]any{"request_id": rs.id, "attempts": []any{}})
+	h.finish(rs, outcome{status: "error", httpStatus: status, errorCode: code})
+}
+
+// ---- handler ----
+
+// ChatCompletions handles POST /v1/chat/completions.
 func (h *InferenceHandler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	userID := auth.UserIDFromCtx(r.Context())
-	requestID := "zer0-" + newUUID()
+	ctx := r.Context()
+	rs := &reqState{id: "r0-" + strings.ReplaceAll(uuid.NewString(), "-", ""), start: time.Now()}
+	w.Header().Set("X-Router0-Request-Id", rs.id)
 
-	var req chatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "validation_error", "invalid_json", "Invalid request body")
+	p, ok := auth.PrincipalFromCtx(ctx)
+	if !ok {
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "Missing or invalid router0 token", "", nil)
+		return
+	}
+	rs.orgID, rs.tokenID = p.OrgID, p.TokenID
+
+	var cr chatRequest
+	body := http.MaxBytesReader(w, r.Body, maxRequestBody)
+	if err := json.NewDecoder(body).Decode(&cr); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_json", "Request body is not valid JSON", "", nil)
+		return
+	}
+	cr.Model = strings.TrimSpace(cr.Model)
+	if cr.Model == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "missing_model", "The 'model' field is required", "model", nil)
+		return
+	}
+	base, err := cr.toProvider()
+	if err != nil {
+		msg := "Message content must be a string or an array of text parts"
+		code := "invalid_json"
+		if err == errUnsupportedContent {
+			msg, code = "Only text content parts are supported", "unsupported_content"
+		}
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", code, msg, "messages", nil)
+		return
+	}
+	rs.requested, rs.stream = cr.Model, cr.Stream
+	rs.canonical = cr.Model
+
+	override, unknown := routing.ParseProviderOverride(r.Header.Get(providersHeader))
+	if unknown != "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_provider_override",
+			fmt.Sprintf("Unknown provider %q in %s", unknown, providersHeader), "", nil)
 		return
 	}
 
-	provReq := &providers.ChatRequest{
-		Model:       req.Model,
-		Messages:    req.Messages,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stream:      req.Stream,
-		Stop:        req.Stop,
-		Tools:       req.Tools,
-		ToolChoice:  req.ToolChoice,
-	}
-
-	if req.Stream {
-		h.handleStream(w, r, userID, requestID, req.ConversationID, provReq, start)
+	entries, err := h.resolver.Resolve(ctx, rs.orgID, cr.Model)
+	if err != nil {
+		slog.Error("catalog resolve failed", "request_id", rs.id, "error", err.Error())
+		h.failEarly(w, rs, http.StatusServiceUnavailable, "upstream_error", "router_unavailable", "Routing is temporarily unavailable", "")
 		return
 	}
-
-	tier := routing.TierFromModel(req.Model)
-
-	// Non-streaming path
-	scored, err := h.selector.Pool().SelectComboForSession(r.Context(), userID, req.ConversationID, tier)
-	if err != nil || len(scored) == 0 {
-		metrics.RequestsTotal.WithLabelValues("none", "none", "error").Inc()
-		h.recorder.RecordAsync(metadata.Record{
-			UserID:        userID,
-			Zer0RequestID: requestID,
-			Provider:      "none",
-			Model:         req.Model,
-			Pool:          tier.String(),
-			LatencyMs:     time.Since(start).Milliseconds(),
-			Status:        "no_providers",
-		})
-		writeError(w, http.StatusServiceUnavailable, "gateway_error", "no_providers", "No providers available")
+	if len(entries) == 0 {
+		h.failEarly(w, rs, http.StatusNotFound, "invalid_request_error", "model_not_found",
+			fmt.Sprintf("The model '%s' is not available for this organization.", cr.Model), "model")
 		return
 	}
+	rs.canonical = entries[0].Canonical
 
-	var (
-		resp       *providers.ChatResponse
-		selCombo   *routing.SelectedCombo
-		retryCount int
-		lastErr    error
-	)
-
-	const attemptTimeout = 15 * time.Second
-
-	// Collect per-attempt error details for diagnostics
-	var attemptErrors []string
-
-	// Sequential attempts through round-robin ordered candidates.
-	attemptOrder := 0
-	for _, sc := range scored {
-		if retryCount >= 6 {
-			break
-		}
-		attemptStart := time.Now()
-		k, err := h.keyRepo.GetByID(r.Context(), sc.ProviderKeyID, userID)
-		if err != nil {
-			attemptErrors = append(attemptErrors, fmt.Sprintf("%s/%s: key_lookup_failed", sc.Provider, sc.Model))
-			h.recorder.RecordAttemptAsync(metadata.Attempt{
-				Zer0RequestID: requestID, UserID: userID, Provider: sc.Provider, Model: sc.Model,
-				ProviderKeyID: sc.ProviderKeyID, AttemptOrder: attemptOrder,
-				Status: "error", ErrorClass: "internal", ErrorMessage: "key_lookup_failed",
-				LatencyMs: time.Since(attemptStart).Milliseconds(),
-			})
-			attemptOrder++
-			continue
-		}
-		decrypted, err := keys.Decrypt(k.Ciphertext, k.Nonce)
-		if err != nil {
-			attemptErrors = append(attemptErrors, fmt.Sprintf("%s/%s: key_decrypt_failed", sc.Provider, sc.Model))
-			attemptOrder++
-			continue
-		}
-		p, err := providers.Get(sc.Provider)
-		if err != nil {
-			attemptErrors = append(attemptErrors, fmt.Sprintf("%s/%s: unknown_provider", sc.Provider, sc.Model))
-			attemptOrder++
-			continue
-		}
-		comboReq := *provReq
-		comboReq.Model = sc.Model
-		attemptCtx, cancelAttempt := context.WithTimeout(r.Context(), attemptTimeout)
-		resp, err = p.Complete(attemptCtx, &comboReq, decrypted)
-		cancelAttempt()
-		attemptLatency := time.Since(attemptStart).Milliseconds()
-		if err == nil {
-			selCombo = &routing.SelectedCombo{Combo: sc.Combo, DecryptedKey: decrypted}
-			h.recorder.RecordAttemptAsync(metadata.Attempt{
-				Zer0RequestID: requestID, UserID: userID, Provider: sc.Provider, Model: sc.Model,
-				ProviderKeyID: sc.ProviderKeyID, AttemptOrder: attemptOrder,
-				Status: "success", LatencyMs: attemptLatency,
-			})
-			if resp.RateLimit != nil {
-				h.rlObserver.Observe(r.Context(), sc.Provider, sc.Model, resp.RateLimit)
-			}
-			break
-		}
-		lastErr = err
-		retryCount++
-
-		// Record the attempt
-		var errClass, errMsg string
-		var httpStatus int
-		if pe, ok := err.(*providers.ProviderError); ok {
-			errClass = string(pe.Class)
-			errMsg = pe.Message
-			httpStatus = pe.HTTP
-			attemptErrors = append(attemptErrors, fmt.Sprintf("%s/%s: %s (HTTP %d)", sc.Provider, sc.Model, pe.Class, pe.HTTP))
-		} else {
-			errClass = "unknown"
-			errMsg = err.Error()
-			attemptErrors = append(attemptErrors, fmt.Sprintf("%s/%s: %s", sc.Provider, sc.Model, err.Error()))
-		}
-		h.recorder.RecordAttemptAsync(metadata.Attempt{
-			Zer0RequestID: requestID, UserID: userID, Provider: sc.Provider, Model: sc.Model,
-			ProviderKeyID: sc.ProviderKeyID, AttemptOrder: attemptOrder,
-			Status: "error", ErrorClass: errClass, ErrorMessage: errMsg, HTTPStatus: httpStatus,
-			LatencyMs: attemptLatency,
-		})
-		attemptOrder++
-
-		slog.Warn("inference: provider failed", "provider", sc.Provider, "model", sc.Model, "error", err.Error())
-
-		// Auto-remediation based on error class
-		if pe, ok := err.(*providers.ProviderError); ok {
-			metrics.ProviderErrors.WithLabelValues(sc.Provider, sc.Model, string(pe.Class)).Inc()
-			switch pe.Class {
-			case providers.ErrorClassAuthError:
-				go h.remediator.HandleAuthError(context.Background(), userID, sc.Provider, sc.ProviderKeyID)
-			case providers.ErrorClassUpstream:
-				if pe.HTTP == 404 {
-					go h.remediator.HandleNotFound(context.Background(), sc.Provider, sc.Model)
-				} else {
-					h.rlObserver.MarkExhausted(r.Context(), sc.ProviderKeyID, sc.Provider, sc.Model)
-				}
-			case providers.ErrorClassRateLimit:
-				h.rlObserver.MarkExhausted(r.Context(), sc.ProviderKeyID, sc.Provider, sc.Model)
-			case providers.ErrorClassTimeout, providers.ErrorClassUnavailable:
-				h.rlObserver.MarkExhausted(r.Context(), sc.ProviderKeyID, sc.Provider, sc.Model)
-			}
-		} else {
-			h.rlObserver.MarkExhausted(r.Context(), sc.ProviderKeyID, sc.Provider, sc.Model)
-		}
-	}
-
-	recordFailure := func(lastErr error) {
-		latMs := time.Since(start).Milliseconds()
-		errStatus := "all_failed"
-		errClass := ""
-		if lastErr != nil {
-			if pe, ok := lastErr.(*providers.ProviderError); ok {
-				errStatus = "all_failed"
-				errClass = string(pe.Class)
-			}
-		}
-		errMsg := strings.Join(attemptErrors, "; ")
-		if len(errMsg) > 1000 {
-			errMsg = errMsg[:1000]
-		}
-		if len(attemptErrors) == 0 {
-			errMsg = "no candidates attempted"
-		}
-		metrics.RequestsTotal.WithLabelValues("none", "none", "error").Inc()
-		h.recorder.RecordAsync(metadata.Record{
-			UserID:        userID,
-			Zer0RequestID: requestID,
-			Provider:      "none",
-			Model:         req.Model,
-			Pool:          tier.String(),
-			LatencyMs:     latMs,
-			Status:        errStatus,
-			RetryCount:    retryCount,
-			ErrorClass:    errClass,
-			ErrorMessage:  errMsg,
-		})
-	}
-
-	latencyMs := time.Since(start).Milliseconds()
-
-	if selCombo == nil {
-		slog.Error("inference: all providers failed", "user_id", userID, "last_error", fmt.Sprint(lastErr))
-		recordFailure(lastErr)
-		writeError(w, http.StatusServiceUnavailable, "gateway_error", "all_providers_failed", "All available providers failed")
+	order, err := h.priority.ProviderOrder(ctx, rs.orgID)
+	if err != nil {
+		slog.Error("provider order failed", "request_id", rs.id, "error", err.Error())
+		h.failEarly(w, rs, http.StatusServiceUnavailable, "upstream_error", "router_unavailable", "Routing is temporarily unavailable", "")
 		return
 	}
-
-	w.Header().Set("X-Zer0-Model", selCombo.Model)
-	w.Header().Set("X-Zer0-Provider", selCombo.Provider)
-	w.Header().Set("X-Zer0-Latency-Ms", strconv.FormatInt(latencyMs, 10))
-	w.Header().Set("X-Zer0-Request-Id", requestID)
-	w.Header().Set("Content-Type", "application/json")
-
-	slog.Info("request_completed",
-		"event", "request_completed",
-		"request_id", requestID,
-		"user_id", userID,
-		"provider", selCombo.Provider,
-		"model", selCombo.Model,
-		"latency_ms", latencyMs,
-		"status", "success",
-	)
-
-	metrics.RequestsTotal.WithLabelValues(selCombo.Provider, selCombo.Model, "success").Inc()
-	metrics.RequestDuration.WithLabelValues(selCombo.Provider, selCombo.Model).Observe(float64(latencyMs) / 1000)
-
-	inputTokens := resp.Usage.PromptTokens
-	outputTokens := resp.Usage.CompletionTokens
-	cost := metadata.EstimateCost(selCombo.Provider, selCombo.Model, inputTokens, outputTokens)
-
-	h.recorder.RecordAsync(metadata.Record{
-		UserID:           userID,
-		Zer0RequestID:    requestID,
-		Provider:         selCombo.Provider,
-		Model:            selCombo.Model,
-		ProviderKeyID:    selCombo.ProviderKeyID,
-		Pool:             selCombo.Pool,
-		InputTokens:      inputTokens,
-		OutputTokens:     outputTokens,
-		LatencyMs:        latencyMs,
-		EstimatedCostUSD: cost,
-		Status:           "success",
-		RetryCount:       retryCount,
-	})
-	_ = h.rl.Increment(r.Context(), userID, selCombo.Provider, selCombo.Model)
-	h.selector.Pool().IncrementUsage(r.Context(), userID, tier, selCombo.Provider, selCombo.Model, selCombo.ProviderKeyID)
-
-	finishReason := resp.FinishReason
-	if finishReason == "" {
-		finishReason = "stop"
-	}
-	assistantMsg := map[string]interface{}{"role": "assistant", "content": resp.Content}
-	if len(resp.ToolCalls) > 0 {
-		assistantMsg["tool_calls"] = resp.ToolCalls
-		finishReason = "tool_calls"
-	}
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"id":      resp.ID,
-		"object":  "chat.completion",
-		"created": time.Now().Unix(),
-		"model":   selCombo.Model,
-		"choices": []map[string]interface{}{
-			{
-				"index":         0,
-				"message":       assistantMsg,
-				"finish_reason": finishReason,
-			},
-		},
-		"usage": map[string]interface{}{
-			"prompt_tokens":     resp.Usage.PromptTokens,
-			"completion_tokens": resp.Usage.CompletionTokens,
-			"total_tokens":      resp.Usage.TotalTokens,
-		},
-	})
-}
-
-func (h *InferenceHandler) handleStream(w http.ResponseWriter, r *http.Request, userID, requestID, conversationID string, req *providers.ChatRequest, start time.Time) {
-	tier := routing.TierFromModel(req.Model)
-	scored, err := h.selector.Pool().SelectComboForSession(r.Context(), userID, conversationID, tier)
-	if err != nil || len(scored) == 0 {
-		metrics.RequestsTotal.WithLabelValues("none", "none", "error").Inc()
-		h.recorder.RecordAsync(metadata.Record{
-			UserID:        userID,
-			Zer0RequestID: requestID,
-			Provider:      "none",
-			Model:         req.Model,
-			Pool:          tier.String(),
-			LatencyMs:     time.Since(start).Milliseconds(),
-			Status:        "no_providers",
-		})
-		writeError(w, http.StatusServiceUnavailable, "gateway_error", "no_providers", "No providers available")
-		return
-	}
-
-	const streamFirstByteTimeout = 10 * time.Second
-
-	var (
-		ch       <-chan providers.ChatChunk
-		selCombo *routing.SelectedCombo
-		retryCount int
-	)
-
-	var streamAttemptErrors []string
-
-	triedCombos := map[string]bool{}
-	allExhaustedS := true
-	for _, sc := range scored {
-		if !h.rlObserver.IsKeyExhausted(r.Context(), sc.ProviderKeyID, sc.Provider, sc.Model) {
-			allExhaustedS = false
-			break
-		}
-	}
-	attemptOrder := 0
-	for _, sc := range scored {
-		comboID := sc.Provider + ":" + sc.Model + ":" + sc.ProviderKeyID
-		if triedCombos[comboID] || retryCount >= 6 {
+	keysBy := map[string][]*keys.ProviderKey{}
+	keyByID := map[string]*keys.ProviderKey{}
+	for _, e := range entries {
+		prov := providers.CanonicalName(e.Provider)
+		if _, done := keysBy[prov]; done {
 			continue
 		}
-		if !allExhaustedS && h.rlObserver.IsKeyExhausted(r.Context(), sc.ProviderKeyID, sc.Provider, sc.Model) {
-			continue
-		}
-		triedCombos[comboID] = true
-		attemptStart := time.Now()
-
-		k, err := h.keyRepo.GetByID(r.Context(), sc.ProviderKeyID, userID)
+		ks, err := h.keys.ActiveByOrgProvider(ctx, rs.orgID, prov)
 		if err != nil {
-			streamAttemptErrors = append(streamAttemptErrors, fmt.Sprintf("%s/%s: key_lookup_failed", sc.Provider, sc.Model))
-			h.recorder.RecordAttemptAsync(metadata.Attempt{
-				Zer0RequestID: requestID, UserID: userID, Provider: sc.Provider, Model: sc.Model,
-				ProviderKeyID: sc.ProviderKeyID, AttemptOrder: attemptOrder,
-				Status: "error", ErrorClass: "internal", ErrorMessage: "key_lookup_failed",
-				LatencyMs: time.Since(attemptStart).Milliseconds(),
-			})
-			attemptOrder++
-			continue
-		}
-		decrypted, err := keys.Decrypt(k.Ciphertext, k.Nonce)
-		if err != nil {
-			streamAttemptErrors = append(streamAttemptErrors, fmt.Sprintf("%s/%s: key_decrypt_failed", sc.Provider, sc.Model))
-			attemptOrder++
-			continue
-		}
-		p, err := providers.Get(sc.Provider)
-		if err != nil {
-			streamAttemptErrors = append(streamAttemptErrors, fmt.Sprintf("%s/%s: unknown_provider", sc.Provider, sc.Model))
-			attemptOrder++
-			continue
-		}
-		comboReq := *req
-		comboReq.Model = sc.Model
-
-		attemptCtx, cancelAttempt := context.WithCancel(r.Context())
-		candidateCh, err := p.Stream(attemptCtx, &comboReq, decrypted)
-		if err != nil {
-			cancelAttempt()
-			retryCount++
-			attemptLatency := time.Since(attemptStart).Milliseconds()
-
-			var errClass, errMsg string
-			var httpStatus int
-			if pe, ok := err.(*providers.ProviderError); ok {
-				errClass = string(pe.Class)
-				errMsg = pe.Message
-				httpStatus = pe.HTTP
-				streamAttemptErrors = append(streamAttemptErrors, fmt.Sprintf("%s/%s: %s (HTTP %d)", sc.Provider, sc.Model, pe.Class, pe.HTTP))
-			} else {
-				errClass = "unknown"
-				errMsg = err.Error()
-				streamAttemptErrors = append(streamAttemptErrors, fmt.Sprintf("%s/%s: %s", sc.Provider, sc.Model, err.Error()))
-			}
-			h.recorder.RecordAttemptAsync(metadata.Attempt{
-				Zer0RequestID: requestID, UserID: userID, Provider: sc.Provider, Model: sc.Model,
-				ProviderKeyID: sc.ProviderKeyID, AttemptOrder: attemptOrder,
-				Status: "error", ErrorClass: errClass, ErrorMessage: errMsg, HTTPStatus: httpStatus,
-				LatencyMs: attemptLatency,
-			})
-			attemptOrder++
-
-			slog.Warn("inference: stream provider failed", "provider", sc.Provider, "model", sc.Model, "error", err.Error())
-
-			if pe, ok := err.(*providers.ProviderError); ok {
-				metrics.ProviderErrors.WithLabelValues(sc.Provider, sc.Model, string(pe.Class)).Inc()
-				switch pe.Class {
-				case providers.ErrorClassAuthError:
-					go h.remediator.HandleAuthError(context.Background(), userID, sc.Provider, sc.ProviderKeyID)
-				case providers.ErrorClassUpstream:
-					if pe.HTTP == 404 {
-						go h.remediator.HandleNotFound(context.Background(), sc.Provider, sc.Model)
-					} else {
-						h.rlObserver.MarkExhausted(r.Context(), sc.ProviderKeyID, sc.Provider, sc.Model)
-					}
-				case providers.ErrorClassRateLimit, providers.ErrorClassTimeout, providers.ErrorClassUnavailable:
-					h.rlObserver.MarkExhausted(r.Context(), sc.ProviderKeyID, sc.Provider, sc.Model)
-				}
-			} else {
-				h.rlObserver.MarkExhausted(r.Context(), sc.ProviderKeyID, sc.Provider, sc.Model)
-			}
-			continue
-		}
-
-		firstByteTimer := time.NewTimer(streamFirstByteTimeout)
-		var firstChunk *providers.ChatChunk
-		select {
-		case fc, ok := <-candidateCh:
-			firstByteTimer.Stop()
-			if !ok {
-				cancelAttempt()
-				retryCount++
-				streamAttemptErrors = append(streamAttemptErrors, fmt.Sprintf("%s/%s: stream_closed_immediately", sc.Provider, sc.Model))
-				h.recorder.RecordAttemptAsync(metadata.Attempt{
-					Zer0RequestID: requestID, UserID: userID, Provider: sc.Provider, Model: sc.Model,
-					ProviderKeyID: sc.ProviderKeyID, AttemptOrder: attemptOrder,
-					Status: "error", ErrorClass: "stream_closed", ErrorMessage: "stream_closed_immediately",
-					LatencyMs: time.Since(attemptStart).Milliseconds(),
-				})
-				attemptOrder++
-				h.rlObserver.MarkExhausted(r.Context(), sc.ProviderKeyID, sc.Provider, sc.Model)
-				continue
-			}
-			firstChunk = &fc
-		case <-firstByteTimer.C:
-			cancelAttempt()
-			retryCount++
-			streamAttemptErrors = append(streamAttemptErrors, fmt.Sprintf("%s/%s: first_byte_timeout_%.0fs", sc.Provider, sc.Model, streamFirstByteTimeout.Seconds()))
-			h.recorder.RecordAttemptAsync(metadata.Attempt{
-				Zer0RequestID: requestID, UserID: userID, Provider: sc.Provider, Model: sc.Model,
-				ProviderKeyID: sc.ProviderKeyID, AttemptOrder: attemptOrder,
-				Status: "error", ErrorClass: "timeout", ErrorMessage: fmt.Sprintf("first_byte_timeout_%.0fs", streamFirstByteTimeout.Seconds()),
-				LatencyMs: time.Since(attemptStart).Milliseconds(),
-			})
-			attemptOrder++
-			slog.Warn("inference: stream first-byte timeout", "provider", sc.Provider, "model", sc.Model,
-				"timeout_s", streamFirstByteTimeout.Seconds())
-			h.rlObserver.MarkExhausted(r.Context(), sc.ProviderKeyID, sc.Provider, sc.Model)
-			continue
-		case <-r.Context().Done():
-			firstByteTimer.Stop()
-			cancelAttempt()
+			slog.Error("load keys failed", "request_id", rs.id, "provider", prov, "error", err.Error())
+			h.failEarly(w, rs, http.StatusServiceUnavailable, "upstream_error", "router_unavailable", "Routing is temporarily unavailable", "")
 			return
 		}
-
-		h.recorder.RecordAttemptAsync(metadata.Attempt{
-			Zer0RequestID: requestID, UserID: userID, Provider: sc.Provider, Model: sc.Model,
-			ProviderKeyID: sc.ProviderKeyID, AttemptOrder: attemptOrder,
-			Status: "success", LatencyMs: time.Since(attemptStart).Milliseconds(),
-		})
-
-		mergedCh := make(chan providers.ChatChunk, 64)
-		go func() {
-			defer close(mergedCh)
-			defer cancelAttempt()
-			mergedCh <- *firstChunk
-			for chunk := range candidateCh {
-				mergedCh <- chunk
-			}
-		}()
-		ch = mergedCh
-		selCombo = &routing.SelectedCombo{Combo: sc.Combo, DecryptedKey: decrypted}
-		break
+		keysBy[prov] = ks
+		for _, k := range ks {
+			keyByID[k.ID] = k
+		}
 	}
 
-	if selCombo == nil {
-		errMsg := strings.Join(streamAttemptErrors, "; ")
-		if len(errMsg) > 1000 {
-			errMsg = errMsg[:1000]
+	plan := routing.BuildPlan(entries, order, override, keysBy)
+	if len(plan) == 0 {
+		msg := fmt.Sprintf("No provider key in this organization serves the model '%s'.", cr.Model)
+		if len(override) > 0 {
+			msg = fmt.Sprintf("The model '%s' is not offered by providers in %s (%s)", cr.Model, providersHeader, strings.Join(override, ","))
 		}
-		if len(streamAttemptErrors) == 0 {
-			errMsg = "no candidates attempted"
-		}
-		metrics.RequestsTotal.WithLabelValues("none", "none", "error").Inc()
-		h.recorder.RecordAsync(metadata.Record{
-			UserID:        userID,
-			Zer0RequestID: requestID,
-			Provider:      "none",
-			Model:         req.Model,
-			Pool:          tier.String(),
-			LatencyMs:     time.Since(start).Milliseconds(),
-			Status:        "all_failed",
-			RetryCount:    retryCount,
-			ErrorMessage:  errMsg,
-		})
-		writeError(w, http.StatusServiceUnavailable, "gateway_error", "all_providers_failed", "All available providers failed")
+		h.failEarly(w, rs, http.StatusNotFound, "invalid_request_error", "model_not_found", msg, "model")
 		return
 	}
 
-	latencyMs := time.Since(start).Milliseconds()
+	secret := func(c routing.Candidate) (string, error) {
+		k := keyByID[c.KeyID]
+		if k == nil {
+			return "", fmt.Errorf("key not loaded")
+		}
+		return h.decrypt(k)
+	}
+	if cr.Stream {
+		h.serveStream(w, r, rs, base, plan, secret, cr.StreamOptions != nil && cr.StreamOptions.IncludeUsage)
+		return
+	}
+	h.serveBlocking(w, r, rs, base, plan, secret)
+}
 
+func unknownProvider(name string) *providers.ProviderError {
+	return &providers.ProviderError{Class: providers.ErrorClassTransient, Code: "unknown_provider", Message: "provider adapter not registered: " + name}
+}
+
+// failFinal writes the exhausted-plan error and records it.
+func (h *InferenceHandler) failFinal(w http.ResponseWriter, rs *reqState, res routing.Result) {
+	if res.Cancelled {
+		h.finish(rs, outcome{status: "error", httpStatus: statusClientGone, errorCode: routing.CodeClientCancelled, attempts: res.Attempts})
+		return
+	}
+	ge := routing.FinalError(res)
+	h.setBaseHeaders(w, rs, len(res.Attempts))
+	if ge.RetryAfterSeconds > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(ge.RetryAfterSeconds))
+	}
+	writeOpenAIError(w, ge.HTTP, ge.Type, ge.Code, ge.Message, ge.Param,
+		map[string]any{"request_id": rs.id, "attempts": trailJSON(res.Attempts)})
+	h.finish(rs, outcome{status: "error", httpStatus: ge.HTTP, errorCode: ge.Code, attempts: res.Attempts})
+}
+
+func setWinnerHeaders(w http.ResponseWriter, c *routing.Candidate, lat time.Duration) {
+	w.Header().Set("X-Router0-Provider", c.Provider)
+	w.Header().Set("X-Router0-Model", c.ProviderModelID)
+	w.Header().Set("X-Router0-Key", c.KeyLabel)
+	w.Header().Set("X-Router0-Latency-Ms", strconv.FormatInt(lat.Milliseconds(), 10))
+}
+
+// ---- non-streaming ----
+
+func (h *InferenceHandler) serveBlocking(w http.ResponseWriter, r *http.Request, rs *reqState, base *providers.ChatRequest,
+	plan []routing.Candidate, secret func(routing.Candidate) (string, error)) {
+	ex := h.exec.ForRequest(rs.orgID, rs.requested, secret)
+	var resp *providers.ChatResponse
+	res := ex.Run(r.Context(), plan, func(ctx context.Context, c routing.Candidate, apiKey string) error {
+		prov, err := providers.Get(c.Provider)
+		if err != nil {
+			return unknownProvider(c.Provider)
+		}
+		req := *base
+		req.Model = c.ProviderModelID
+		req.Stream = false
+		out, err := prov.Complete(ctx, &req, apiKey)
+		if err != nil {
+			return err
+		}
+		resp = out
+		return nil
+	})
+	if res.Winner == nil || resp == nil {
+		h.failFinal(w, rs, res)
+		return
+	}
+	lat := time.Since(rs.start)
+	h.setBaseHeaders(w, rs, len(res.Attempts))
+	setWinnerHeaders(w, res.Winner, lat)
+
+	msg := map[string]any{"role": "assistant", "content": resp.Content}
+	if len(resp.ToolCalls) > 0 {
+		msg["tool_calls"] = resp.ToolCalls
+		if resp.Content == "" {
+			msg["content"] = nil
+		}
+	}
+	finish := resp.FinishReason
+	if finish == "" {
+		finish = "stop"
+		if len(resp.ToolCalls) > 0 {
+			finish = "tool_calls"
+		}
+	}
+	id := resp.ID
+	if id == "" {
+		id = "chatcmpl-" + strings.TrimPrefix(rs.id, "r0-")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": id, "object": "chat.completion", "created": time.Now().Unix(), "model": rs.canonical,
+		"choices": []map[string]any{{"index": 0, "message": msg, "finish_reason": finish}},
+		"usage": map[string]int{"prompt_tokens": resp.Usage.PromptTokens, "completion_tokens": resp.Usage.CompletionTokens,
+			"total_tokens": resp.Usage.TotalTokens},
+	})
+	cost := resp.Cost
+	if cost <= 0 {
+		cost = metadata.EstimateCost(res.Winner.Provider, res.Winner.ProviderModelID, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	}
+	h.finish(rs, outcome{
+		provider: res.Winner.Provider, providerModel: res.Winner.ProviderModelID, keyID: res.Winner.KeyID, keyLabel: res.Winner.KeyLabel,
+		status: "success", httpStatus: http.StatusOK, in: resp.Usage.PromptTokens, out: resp.Usage.CompletionTokens,
+		cost: cost, attempts: res.Attempts,
+	})
+}
+
+// ---- streaming ----
+
+type committedStream struct {
+	ch     <-chan providers.ChatChunk
+	first  providers.ChatChunk
+	cancel context.CancelFunc
+}
+
+func (h *InferenceHandler) serveStream(w http.ResponseWriter, r *http.Request, rs *reqState, base *providers.ChatRequest,
+	plan []routing.Candidate, secret func(routing.Candidate) (string, error), clientWantsUsage bool) {
+	ctx := r.Context()
+	ex := h.streamEx.ForRequest(rs.orgID, rs.requested, secret)
+	var cs *committedStream
+	defer func() {
+		if cs != nil {
+			cs.cancel()
+		}
+	}()
+
+	res := ex.Run(ctx, plan, func(actx context.Context, c routing.Candidate, apiKey string) error {
+		prov, err := providers.Get(c.Provider)
+		if err != nil {
+			return unknownProvider(c.Provider)
+		}
+		sctx, cancel := context.WithCancel(actx)
+		var timedOut atomic.Bool
+		timer := time.AfterFunc(h.firstB, func() { timedOut.Store(true); cancel() })
+		fail := func(err error) error {
+			timer.Stop()
+			cancel()
+			if timedOut.Load() && ctx.Err() == nil {
+				return &providers.ProviderError{Class: providers.ErrorClassTransient, Code: "first_byte_timeout", Message: "no response from provider in time"}
+			}
+			return err
+		}
+		req := *base
+		req.Model = c.ProviderModelID
+		req.Stream = true
+		ch, err := prov.Stream(sctx, &req, apiKey)
+		if err != nil {
+			return fail(err)
+		}
+		select {
+		case chunk, open := <-ch:
+			switch {
+			case !open:
+				return fail(&providers.ProviderError{Class: providers.ErrorClassTransient, Code: "stream_interrupted", Message: "upstream closed before any data"})
+			case chunk.Err != nil:
+				return fail(chunk.Err)
+			case chunk.Done:
+				return fail(&providers.ProviderError{Class: providers.ErrorClassTransient, Code: "empty_stream", Message: "upstream sent no data"})
+			}
+			if !timer.Stop() { // the first-byte timer already fired
+				return fail(nil)
+			}
+			cs = &committedStream{ch: ch, first: chunk, cancel: cancel}
+			return nil
+		case <-sctx.Done():
+			return fail(sctx.Err())
+		}
+	})
+	if res.Winner == nil || cs == nil {
+		h.failFinal(w, rs, res)
+		return
+	}
+
+	// Commit: from here on there is no failover.
+	win := res.Winner
+	h.setBaseHeaders(w, rs, len(res.Attempts))
+	setWinnerHeaders(w, win, time.Since(rs.start))
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("X-Zer0-Model", selCombo.Model)
-	w.Header().Set("X-Zer0-Provider", selCombo.Provider)
-	w.Header().Set("X-Zer0-Latency-Ms", strconv.FormatInt(latencyMs, 10))
-	w.Header().Set("X-Zer0-Request-Id", requestID)
+	w.WriteHeader(http.StatusOK)
+	rc := http.NewResponseController(w)
+	flush := func() { _ = rc.Flush() }
 
-	flusher, canFlush := w.(http.Flusher)
-	bw := bufio.NewWriter(w)
-
-	var inputTokens, outputTokens int
-	chunkCount := 0
-
-	for chunk := range ch {
-		if chunk.Done {
-			fmt.Fprint(bw, "data: [DONE]\n\n")
-			bw.Flush()
-			if canFlush {
-				flusher.Flush()
+	chunkID := "chatcmpl-" + strings.TrimPrefix(rs.id, "r0-")
+	created := time.Now().Unix()
+	sentRole := false
+	var usage *providers.Usage
+	emit := func(c providers.ChatChunk) {
+		if c.Usage != nil {
+			u := *c.Usage
+			usage = &u
+		}
+		usageOnly := c.Usage != nil && c.Content == "" && len(c.ToolCalls) == 0 && c.FinishReason == ""
+		if !usageOnly {
+			delta := map[string]any{}
+			if !sentRole {
+				delta["role"] = "assistant"
+				sentRole = true
 			}
-			break
-		}
-		// Pass through the raw SSE line if available
-		if chunk.Raw != "" {
-			fmt.Fprintf(bw, "%s\n\n", chunk.Raw)
-		} else {
-			// Build SSE data
-			data := map[string]interface{}{
-				"id":     chunk.ID,
-				"object": "chat.completion.chunk",
-				"model":  selCombo.Model,
-				"choices": []map[string]interface{}{
-					{"index": 0, "delta": map[string]string{"content": chunk.Content}},
-				},
+			if c.Content != "" {
+				delta["content"] = c.Content
 			}
-			b, _ := json.Marshal(data)
-			fmt.Fprintf(bw, "data: %s\n\n", string(b))
+			if len(c.ToolCalls) > 0 {
+				delta["tool_calls"] = c.ToolCalls
+			}
+			var fr any
+			if c.FinishReason != "" {
+				fr = c.FinishReason
+			}
+			writeSSE(w, map[string]any{"id": chunkID, "object": "chat.completion.chunk", "created": created, "model": rs.canonical,
+				"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": fr}}})
 		}
-		bw.Flush()
-		if canFlush {
-			flusher.Flush()
+		if c.Usage != nil && clientWantsUsage {
+			writeSSE(w, map[string]any{"id": chunkID, "object": "chat.completion.chunk", "created": created, "model": rs.canonical,
+				"choices": []any{}, "usage": c.Usage})
 		}
-		chunkCount++
-		outputTokens += countTokensApprox(chunk.Content)
+		flush()
 	}
 
-	// Estimate input tokens from messages
-	for _, msg := range req.Messages {
-		inputTokens += countTokensApprox(msg.Content)
+	emit(cs.first)
+	var streamErr *providers.ProviderError
+loop:
+	for c := range cs.ch {
+		switch {
+		case c.Err != nil:
+			streamErr = c.Err
+			break loop
+		case c.Done:
+			break loop
+		}
+		emit(c)
 	}
 
-	totalLatency := time.Since(start).Milliseconds()
-	cost := metadata.EstimateCost(selCombo.Provider, selCombo.Model, inputTokens, outputTokens)
-
-	slog.Info("request_completed",
-		"event", "stream_completed",
-		"request_id", requestID,
-		"user_id", userID,
-		"provider", selCombo.Provider,
-		"model", selCombo.Model,
-		"latency_ms", totalLatency,
-		"chunks", chunkCount,
-		"status", "success",
-	)
-
-	metrics.RequestsTotal.WithLabelValues(selCombo.Provider, selCombo.Model, "success").Inc()
-	metrics.RequestDuration.WithLabelValues(selCombo.Provider, selCombo.Model).Observe(float64(totalLatency) / 1000)
-
-	h.recorder.RecordAsync(metadata.Record{
-		UserID:           userID,
-		Zer0RequestID:    requestID,
-		Provider:         selCombo.Provider,
-		Model:            selCombo.Model,
-		ProviderKeyID:    selCombo.ProviderKeyID,
-		Pool:             selCombo.Pool,
-		InputTokens:      inputTokens,
-		OutputTokens:     outputTokens,
-		LatencyMs:        totalLatency,
-		EstimatedCostUSD: cost,
-		Status:           "success",
-		RetryCount:       retryCount,
-	})
-	_ = h.rl.Increment(r.Context(), userID, selCombo.Provider, selCombo.Model)
-	h.selector.Pool().IncrementUsage(r.Context(), userID, tier, selCombo.Provider, selCombo.Model, selCombo.ProviderKeyID)
+	o := outcome{provider: win.Provider, providerModel: win.ProviderModelID, keyID: win.KeyID, keyLabel: win.KeyLabel,
+		status: "success", httpStatus: http.StatusOK, attempts: res.Attempts}
+	switch {
+	case streamErr != nil:
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]any{"error": map[string]any{
+			"type": "upstream_error", "code": "stream_interrupted", "message": "The upstream provider interrupted the stream."}}))
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		flush()
+		ex.MarkFailure(ctx, *win, streamErr)
+		o.status, o.errorCode = "error", "stream_interrupted"
+		if n := len(o.attempts); n > 0 {
+			last := o.attempts[n-1]
+			last.Outcome, last.Class, last.HTTP, last.Code = routing.OutcomeError, string(streamErr.Class), streamErr.HTTP, streamErr.Code
+			o.attempts = append(append([]routing.AttemptRecord{}, o.attempts[:n-1]...), last)
+		}
+		slog.Warn("attempt_failed", "provider", win.Provider, "key_label", win.KeyLabel, "class", streamErr.Class, "code", streamErr.Code, "mid_stream", true)
+	case ctx.Err() != nil:
+		o.status, o.errorCode, o.httpStatus = "error", routing.CodeClientCancelled, statusClientGone
+	default:
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		flush()
+	}
+	if usage != nil {
+		o.in, o.out = usage.PromptTokens, usage.CompletionTokens
+		o.cost = metadata.EstimateCost(win.Provider, win.ProviderModelID, o.in, o.out)
+	}
+	h.finish(rs, o)
 }
 
-
-func countTokensApprox(s string) int {
-	// Rough approximation: 1 token ≈ 4 chars
-	return (len(strings.TrimSpace(s)) + 3) / 4
+func writeSSE(w http.ResponseWriter, v any) {
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", mustJSON(v))
 }
 
-func newUUID() string {
-	return strings.ReplaceAll(uuid.New().String(), "-", "")
-}
-
-// ListModels handles GET /v1/models — returns all Zer0 tier models.
-func ListModels(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"object": "list",
-		"data": []map[string]any{
-			{
-				"id":       "zer0-0.1-pro",
-				"object":   "model",
-				"created":  1700000000,
-				"owned_by": "zer0-router",
-			},
-			{
-				"id":       "zer0-0.1-flash",
-				"object":   "model",
-				"created":  1700000000,
-				"owned_by": "zer0-router",
-			},
-			{
-				"id":       "zer0-0.1-flash-lite",
-				"object":   "model",
-				"created":  1700000000,
-				"owned_by": "zer0-router",
-			},
-		},
-	})
+func mustJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return []byte(`{}`)
+	}
+	return b
 }
