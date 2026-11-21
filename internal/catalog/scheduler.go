@@ -35,7 +35,10 @@ func NewScheduler(repo *Repository, disc Discoverer, interval time.Duration) *Sc
 // pairs never refreshed (server startup), then every Interval over all pairs.
 func (s *Scheduler) Start(ctx context.Context) {
 	go func() {
-		s.runPass(ctx, true)
+		// Refresh every (org, provider) pair at startup, not only never-refreshed
+		// ones, so an upgrade that changes classification rules (e.g. model kinds)
+		// re-classifies stored rows immediately instead of after one interval.
+		s.runPass(ctx, false)
 		t := time.NewTicker(s.Interval)
 		defer t.Stop()
 		for {
