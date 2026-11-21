@@ -1,5 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Self-contained server output for the Docker/Cloud Run image.
+  output: 'standalone',
   async rewrites() {
     const go = process.env.ROUTER_BASE_URL || 'http://localhost:8080';
     return [

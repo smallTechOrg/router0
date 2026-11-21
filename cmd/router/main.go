@@ -40,8 +40,13 @@ func main() {
 	}
 
 	// ── Migrations path ──────────────────────────────────────────────────────
-	_, thisFile, _, _ := runtime.Caller(0)
-	migrationsPath := filepath.Join(filepath.Dir(thisFile), "..", "..", "migrations")
+	// MIGRATIONS_PATH overrides the default, which is derived from this source
+	// file's location (correct for `go run`, wrong inside a container image).
+	migrationsPath := os.Getenv("MIGRATIONS_PATH")
+	if migrationsPath == "" {
+		_, thisFile, _, _ := runtime.Caller(0)
+		migrationsPath = filepath.Join(filepath.Dir(thisFile), "..", "..", "migrations")
+	}
 
 	// ── PostgreSQL ───────────────────────────────────────────────────────────
 	ctx, stop := context.WithCancel(context.Background())

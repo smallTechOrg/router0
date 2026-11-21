@@ -1,0 +1,148 @@
+name: Deploy
+
+# Deploys to Cloud Run on every push to main (after CI passes), or manually.
+# One-time GCP setup: deploy/gcp-bootstrap.sh (see deploy/README.md), which also
+# sets the repository variables used below.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write   # Workload Identity Federation (no long-lived GCP keys)
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      PROJECT_NUMBER: ${{ vars.GCP_PROJECT_NUMBER }}
+      REGION: ${{ vars.GCP_REGION }}
+      RUNTIME_SA: ${{ vars.GCP_RUNTIME_SA }}
+      REGISTRY: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/router0
+      CLOUDSQL_INSTANCE: ${{ vars.GCP_CLOUDSQL_INSTANCE }}
+      ADMIN_EMAIL: ${{ vars.ROUTER0_ADMIN_EMAIL }}
+      GATEWAY_SERVICE: router0-gateway
+      DASHBOARD_SERVICE: router0-dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Docker auth to Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      # ── Gateway ─────────────────────────────────────────────────────────
+      - name: Build and push gateway image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/gateway:${{ github.sha }}
+          cache-from: type=gha,scope=gateway
+          cache-to: type=gha,mode=max,scope=gateway
+
+      - name: Deploy gateway to Cloud Run
+        run: |
+          set -euo pipefail
+          args=(
+            --image "${REGISTRY}/gateway:${GITHUB_SHA}"
+            --region "${REGION}"
+            --service-account "${RUNTIME_SA}"
+            --allow-unauthenticated      # the gateway authenticates callers itself (service tokens / JWT)
+            --port 8080
+            --min-instances 0
+            --max-instances 1            # single instance: key-state cache, Gemini thought-signature cache
+            --no-cpu-throttling          # async request-log writes + catalog scheduler need CPU between requests
+            --concurrency 80
+            --memory 512Mi
+            --timeout 900                # long streaming completions
+            --set-env-vars "LOG_LEVEL=info,ADMIN_EMAIL=${ADMIN_EMAIL}"
+            --set-secrets "DATABASE_URL=router0-database-url:latest,AES_KEY=router0-aes-key:latest,JWT_SECRET=router0-jwt-secret:latest,ADMIN_PASSWORD=router0-admin-password:latest"
+            --quiet
+          )
+          if [ -n "${CLOUDSQL_INSTANCE}" ]; then
+            args+=(--add-cloudsql-instances "${CLOUDSQL_INSTANCE}")
+          fi
+          gcloud run deploy "${GATEWAY_SERVICE}" "${args[@]}"
+          URL=$(gcloud run services describe "${GATEWAY_SERVICE}" --region "${REGION}" --format='value(status.url)')
+          echo "GATEWAY_URL=${URL}" >> "$GITHUB_ENV"
+          echo "Gateway: ${URL}"
+
+      - name: Gateway smoke test
+        run: |
+          for i in $(seq 1 15); do
+            if curl -fsS "${GATEWAY_URL}/healthz" | tee /dev/stderr | grep -q '"status":"ok"'; then exit 0; fi
+            sleep 4
+          done
+          echo "gateway did not become healthy" >&2; exit 1
+
+      # ── Dashboard ───────────────────────────────────────────────────────
+      # next.config.mjs bakes the gateway URL into the proxy rewrites at build time.
+      - name: Build and push dashboard image
+        uses: docker/build-push-action@v6
+        with:
+          context: dashboard
+          push: true
+          tags: ${{ env.REGISTRY }}/dashboard:${{ github.sha }}
+          build-args: ROUTER_BASE_URL=${{ env.GATEWAY_URL }}
+          cache-from: type=gha,scope=dashboard
+          cache-to: type=gha,mode=max,scope=dashboard
+
+      - name: Deploy dashboard to Cloud Run
+        run: |
+          set -euo pipefail
+          # Cloud Run's stable URL format; NextAuth needs its own public URL.
+          DASH_URL="https://${DASHBOARD_SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"
+          gcloud run deploy "${DASHBOARD_SERVICE}" \
+            --image "${REGISTRY}/dashboard:${GITHUB_SHA}" \
+            --region "${REGION}" \
+            --service-account "${RUNTIME_SA}" \
+            --allow-unauthenticated \
+            --port 8080 \
+            --min-instances 0 \
+            --max-instances 2 \
+            --memory 512Mi \
+            --set-env-vars "ROUTER_BASE_URL=${GATEWAY_URL},NEXTAUTH_URL=${DASH_URL}" \
+            --set-secrets "NEXTAUTH_SECRET=router0-nextauth-secret:latest" \
+            --quiet
+          URL=$(gcloud run services describe "${DASHBOARD_SERVICE}" --region "${REGION}" --format='value(status.url)')
+          echo "DASHBOARD_URL=${URL}" >> "$GITHUB_ENV"
+          if [ "${URL}" != "${DASH_URL}" ]; then
+            echo "::warning::Dashboard URL ${URL} differs from the assumed NEXTAUTH_URL ${DASH_URL}; updating."
+            gcloud run services update "${DASHBOARD_SERVICE}" --region "${REGION}" --update-env-vars "NEXTAUTH_URL=${URL}" --quiet
+          fi
+
+      - name: Dashboard smoke test
+        run: |
+          for i in $(seq 1 15); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "${DASHBOARD_URL}/auth/login" || true)
+            [ "${code}" = "200" ] && exit 0
+            sleep 4
+          done
+          echo "dashboard did not become healthy (last status ${code:-none})" >&2; exit 1
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed ${GITHUB_SHA::7}"
+            echo "- Dashboard: ${DASHBOARD_URL}"
+            echo "- Gateway (OpenAI-compatible base URL): ${GATEWAY_URL}/v1"
+          } >> "$GITHUB_STEP_SUMMARY"
