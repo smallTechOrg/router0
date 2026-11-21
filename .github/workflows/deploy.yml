@@ -115,10 +115,14 @@ jobs:
           cache-to: type=gha,mode=max,scope=dashboard
 
       - name: Deploy dashboard to Cloud Run
+        env:
+          CUSTOM_DASH_URL: ${{ vars.ROUTER0_DASHBOARD_URL }}
         run: |
           set -euo pipefail
           # Cloud Run's stable URL format; NextAuth needs its own public URL.
           DASH_URL="https://${DASHBOARD_SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"
+          # Custom domain (repo variable ROUTER0_DASHBOARD_URL) wins once its DNS resolves.
+          DASH_URL="${CUSTOM_DASH_URL:-$DASH_URL}"
           gcloud run deploy "${DASHBOARD_SERVICE}" \
             --image "${REGISTRY}/dashboard:${GITHUB_SHA}" \
             --region "${REGION}" \
