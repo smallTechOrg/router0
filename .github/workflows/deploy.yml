@@ -31,6 +31,8 @@ jobs:
       RUNTIME_SA: ${{ vars.GCP_RUNTIME_SA }}
       REGISTRY: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/router0
       CLOUDSQL_INSTANCE: ${{ vars.GCP_CLOUDSQL_INSTANCE }}
+      VPC_NETWORK: ${{ vars.GCP_VPC_NETWORK }}
+      VPC_SUBNET: ${{ vars.GCP_VPC_SUBNET }}
       ADMIN_EMAIL: ${{ vars.ROUTER0_ADMIN_EMAIL }}
       DB_MAX_CONNS: ${{ vars.ROUTER0_DB_MAX_CONNS }}
       GATEWAY_SERVICE: router0-gateway
@@ -80,6 +82,11 @@ jobs:
           )
           if [ -n "${CLOUDSQL_INSTANCE}" ]; then
             args+=(--add-cloudsql-instances "${CLOUDSQL_INSTANCE}")
+          fi
+          # Private-IP-only Cloud SQL (ipv4Enabled=false) is reachable only through the VPC:
+          # Direct VPC egress, private ranges only (public LLM-provider traffic stays direct).
+          if [ -n "${VPC_NETWORK}" ]; then
+            args+=(--network "${VPC_NETWORK}" --subnet "${VPC_SUBNET:-${VPC_NETWORK}}" --vpc-egress private-ranges-only)
           fi
           gcloud run deploy "${GATEWAY_SERVICE}" "${args[@]}"
           URL=$(gcloud run services describe "${GATEWAY_SERVICE}" --region "${REGION}" --format='value(status.url)')

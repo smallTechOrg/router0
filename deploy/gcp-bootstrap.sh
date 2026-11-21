@@ -15,7 +15,8 @@
 #
 # Optional: REGION (us-central1), GITHUB_REPO (smallTechOrg/router0),
 #           ADMIN_PASSWORD (generated + printed once if unset), DB_NAME (router0),
-#           DB_MAX_CONNS (1: gateway connection-pool cap, for small shared instances).
+#           DB_MAX_CONNS (1: gateway connection-pool cap, for small shared instances),
+#           VPC_SUBNET (defaults to the instance's private network name).
 set -euo pipefail
 
 : "${PROJECT_ID:?set PROJECT_ID}"
@@ -147,6 +148,21 @@ g iam service-accounts add-iam-policy-binding "$DEPLOY_SA" \
   --member "principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL}/attribute.repository/${GITHUB_REPO}" \
   --role roles/iam.workloadIdentityUser >/dev/null
 
+# Private-IP-only Cloud SQL needs Direct VPC egress from Cloud Run (the project's other
+# services use network/subnet "default"). Detect it and let the deploy SA use the subnet.
+VPC_NETWORK=""; VPC_SUBNET_NAME=""
+if [ -n "${CLOUDSQL_INSTANCE:-}" ]; then
+  PUBLIC_IP="$(g sql instances describe "${CLOUDSQL_INSTANCE##*:}" --format='value(settings.ipConfiguration.ipv4Enabled)')"
+  PRIVATE_NET="$(g sql instances describe "${CLOUDSQL_INSTANCE##*:}" --format='value(settings.ipConfiguration.privateNetwork)')"
+  if [ "$PUBLIC_IP" != "True" ] && [ -n "$PRIVATE_NET" ]; then
+    VPC_NETWORK="${PRIVATE_NET##*/}"
+    VPC_SUBNET_NAME="${VPC_SUBNET:-$VPC_NETWORK}"
+    say "Instance is private-IP only: Direct VPC egress via ${VPC_NETWORK}/${VPC_SUBNET_NAME}"
+    g compute networks subnets add-iam-policy-binding "$VPC_SUBNET_NAME" --region "$REGION" \
+      --member "serviceAccount:${DEPLOY_SA}" --role roles/compute.networkUser >/dev/null
+  fi
+fi
+
 say "GitHub repository variables (${GITHUB_REPO})"
 setvar() { gh variable set "$1" --repo "$GITHUB_REPO" --body "$2" >/dev/null && echo "  $1 set"; }
 setvar GCP_PROJECT_ID "$PROJECT_ID"
@@ -156,6 +172,8 @@ setvar GCP_RUNTIME_SA "$RUNTIME_SA"
 setvar GCP_DEPLOY_SA "$DEPLOY_SA"
 setvar GCP_WIF_PROVIDER "$WIF_PROVIDER"
 setvar GCP_CLOUDSQL_INSTANCE "${CLOUDSQL_INSTANCE:-}"
+setvar GCP_VPC_NETWORK "$VPC_NETWORK"
+setvar GCP_VPC_SUBNET "$VPC_SUBNET_NAME"
 setvar ROUTER0_ADMIN_EMAIL "$ADMIN_EMAIL"
 setvar ROUTER0_DB_MAX_CONNS "${DB_MAX_CONNS:-1}"
 
