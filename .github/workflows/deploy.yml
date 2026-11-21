@@ -71,11 +71,10 @@ jobs:
             --port 8080
             --min-instances 0
             --max-instances 1            # single instance: key-state cache, Gemini thought-signature cache
-            --no-cpu-throttling          # async request-log writes + catalog scheduler need CPU between requests
             --concurrency 80
             --memory 512Mi
             --timeout 900                # long streaming completions
-            --set-env-vars "LOG_LEVEL=info,ADMIN_EMAIL=${ADMIN_EMAIL},DB_MAX_CONNS=${DB_MAX_CONNS:-1}"
+            --set-env-vars "LOG_LEVEL=info,ADMIN_EMAIL=${ADMIN_EMAIL},DB_MAX_CONNS=${DB_MAX_CONNS:-1},ROUTER0_RECORDER_SYNC=true"
             --set-secrets "DATABASE_URL=router0-database-url:latest,AES_KEY=router0-aes-key:latest,JWT_SECRET=router0-jwt-secret:latest,ADMIN_PASSWORD=router0-admin-password:latest"
             --quiet
           )

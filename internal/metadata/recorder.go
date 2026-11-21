@@ -6,6 +6,7 @@ package metadata
 import (
 	"context"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -65,6 +66,11 @@ type Request struct {
 type Options struct {
 	Buffer  int
 	Workers int
+	// Sync writes each record inline in Record (no background workers). Use it on
+	// platforms that only grant CPU while a request is in flight (Cloud Run
+	// request-based billing), where async writers would be starved between
+	// requests. Also enabled by ROUTER0_RECORDER_SYNC=true.
+	Sync bool
 }
 
 // Recorder is a buffered async writer. Methods are safe on a nil *Recorder.
@@ -75,6 +81,7 @@ type Recorder struct {
 	mu      sync.RWMutex
 	closed  bool
 	workers int
+	sync    bool
 }
 
 // NewRecorder starts the worker pool (4 workers, 10 000 buffered records).
@@ -88,7 +95,16 @@ func NewRecorder(db DB, opts ...Options) *Recorder {
 			o.Workers = opts[0].Workers
 		}
 	}
-	r := &Recorder{db: db, ch: make(chan Request, o.Buffer), workers: o.Workers}
+	if len(opts) > 0 && opts[0].Sync {
+		o.Sync = true
+	}
+	if os.Getenv("ROUTER0_RECORDER_SYNC") == "true" {
+		o.Sync = true
+	}
+	r := &Recorder{db: db, ch: make(chan Request, o.Buffer), workers: o.Workers, sync: o.Sync}
+	if o.Sync {
+		return r // no workers: Record writes inline
+	}
 	for i := 0; i < o.Workers; i++ {
 		r.wg.Add(1)
 		go r.worker()
@@ -106,6 +122,15 @@ func (r *Recorder) Record(req Request) {
 	defer r.mu.RUnlock()
 	if r.closed {
 		metrics.MetadataDroppedTotal.Inc()
+		return
+	}
+	if r.sync {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := r.write(ctx, req); err != nil {
+			metrics.MetadataDroppedTotal.Inc()
+			slog.Error("metadata write failed", "request_id", req.RequestID, "error", err.Error())
+		}
 		return
 	}
 	select {

@@ -48,8 +48,12 @@ both URLs in the run summary.
 - `--max-instances 1` on the gateway: key cooldown state and Gemini 3 thought
   signatures are cached in-process. Postgres stays the source of truth, but
   several instances would briefly disagree and lose signatures across turns.
-- `--no-cpu-throttling`: the request log and catalog refresh run in the
-  background between requests.
+- Request-based billing (CPU only while a request is in flight): this GCP project's
+  org policy (`custom.denyInstanceBilling`) forbids always-allocated CPU. So the
+  request log is written synchronously before each request returns
+  (`ROUTER0_RECORDER_SYNC=true`), and the 6-hourly catalog refresh may be delayed
+  while the service is idle (it also refreshes at start-up, on a model miss, and
+  from the Catalog page's Refresh button).
 - `--timeout 900`: long streaming completions.
 - Provider keys are entered in the dashboard by each org (BYOK); none are deployed.
 - `DB_MAX_CONNS` (optional env var) caps the gateway's connection pool.

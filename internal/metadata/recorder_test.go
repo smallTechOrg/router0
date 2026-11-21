@@ -172,3 +172,46 @@ func counterVal() float64 {
 	_ = metrics.MetadataDroppedTotal.Write(&m)
 	return m.GetCounter().GetValue()
 }
+
+// Sync mode (Cloud Run request-based billing): the row must exist as soon as
+// Record returns, with no background worker involved.
+func TestRecorderSyncWritesBeforeReturn(t *testing.T) {
+	db := testPool(t)
+	ctx := context.Background()
+	org := uuid.NewString()
+	if _, err := db.Exec(ctx, `INSERT INTO orgs (id, name) VALUES ($1,$2)`, org, "recsync-"+org); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = db.Exec(ctx, `DELETE FROM orgs WHERE id=$1`, org) })
+
+	rec := NewRecorder(db, Options{Sync: true})
+	rid := "r0-" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	rec.Record(Request{RequestID: rid, OrgID: org, CanonicalModel: "m", Provider: "groq", Model: "m", Status: "success", HTTPStatus: 200,
+		Attempts: []Attempt{{Order: 0, Provider: "groq", Model: "m", Outcome: "success"}}})
+
+	var n, a int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM request_metadata WHERE zer0_request_id=$1`, rid).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM request_attempts WHERE zer0_request_id=$1`, rid).Scan(&a); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || a != 1 {
+		t.Fatalf("sync record not visible immediately: request rows=%d attempt rows=%d", n, a)
+	}
+	// Close stays safe and Record after Close is a no-op, not a panic.
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := rec.Close(cctx); err != nil {
+		t.Fatal(err)
+	}
+	rec.Record(Request{RequestID: "late"})
+}
+
+func TestRecorderSyncViaEnv(t *testing.T) {
+	t.Setenv("ROUTER0_RECORDER_SYNC", "true")
+	rec := NewRecorder(&blockingDB{release: make(chan struct{})})
+	if !rec.sync {
+		t.Fatal("ROUTER0_RECORDER_SYNC=true must enable sync mode")
+	}
+}
