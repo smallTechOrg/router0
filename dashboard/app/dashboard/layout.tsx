@@ -9,6 +9,7 @@ const navItems = [
   { label: 'Provider Keys', href: '/dashboard/keys' },
   { label: 'Routing', href: '/dashboard/routing' },
   { label: 'Requests', href: '/dashboard/requests' },
+  { label: 'Catalog', href: '/dashboard/catalog' },
   { label: 'Costs', href: '/dashboard/costs' },
 ];
 

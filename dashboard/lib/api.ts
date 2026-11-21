@@ -275,16 +275,32 @@ export const getPriority = (token: string) =>
 export const putPriority = (token: string, body: PriorityUpdate) =>
   request<PriorityResponse>('/api/routing/priority', { method: 'PUT', token, body });
 
-// ---------- Catalog (API only in Phase 1; page is Phase 2) ----------
+// ---------- Catalog and aliases ----------
 
-export const getCatalog = (token: string, q?: string) =>
-  request<CatalogResponse>('/api/catalog', { token, query: { q } });
+export type CatalogKind = 'chat' | 'image' | 'audio' | 'embedding' | 'other';
+export interface Alias { alias: string; canonical_model: string; created_at: string }
+
+export const getCatalog = (token: string, opts: { q?: string; kind?: CatalogKind | '' } = {}) =>
+  request<CatalogResponse>('/api/catalog', { token, query: { q: opts.q, kind: opts.kind } });
 export const refreshCatalog = (token: string, provider?: string) =>
   request<{ refreshes: CatalogRefresh[] }>('/api/catalog/refresh', {
     method: 'POST',
     token,
     body: provider ? { provider } : {},
   });
+
+export const listAliases = (token: string) => request<{ aliases: Alias[] }>('/api/aliases', { token });
+export const createAlias = (token: string, body: { alias: string; canonical_model: string }) =>
+  request<Alias | undefined>('/api/aliases', { method: 'POST', token, body });
+export const deleteAlias = (token: string, alias: string) =>
+  request<void>(`/api/aliases/${encodeURIComponent(alias)}`, { method: 'DELETE', token });
+
+/** Display label for a provider id; unknown ids fall back to the id itself. */
+const PROVIDER_LABELS: Record<string, string> = {
+  groq: 'Groq', openrouter: 'OpenRouter', google: 'Gemini', nvidia: 'NVIDIA', together: 'Together',
+  baseten: 'Baseten', anthropic: 'Anthropic', meshapi: 'Mesh API (AI Fiesta)',
+};
+export const providerLabelFor = (id: string) => PROVIDER_LABELS[id] || id;
 
 /** OpenAI-compatible model list for a service token (r0-sk-...). Not used by the dashboard session. */
 export const listV1Models = (serviceToken: string) =>

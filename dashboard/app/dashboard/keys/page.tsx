@@ -3,10 +3,14 @@ import { useMemo, useState } from 'react';
 import { useAuth, useLoader } from '@/lib/hooks';
 import {
   addKey, deleteKey, errorMessage, getPriority, listKeys, listProviders, putPriority, testKey,
-  type ProviderKey,
+  providerLabelFor, type ProviderKey,
 } from '@/lib/api';
 import KeyStateBadge from '@/components/KeyStateBadge';
 import { btnDanger, btnGhost, btnPrimary, Card, EmptyState, ErrorBanner, fmtTime, inputCls, Loading, Notice, PageHeader } from '@/components/ui';
+
+const KEY_HINTS: Record<string, string> = {
+  groq: 'gsk_…', anthropic: 'sk-ant-…', meshapi: 'rsk_…', openrouter: 'sk-or-…',
+};
 
 export default function KeysPage() {
   const { token, canWrite } = useAuth();
@@ -26,7 +30,7 @@ export default function KeysPage() {
   const providerLabel = useMemo(() => {
     const m: Record<string, string> = {};
     providers.data?.providers.forEach((p) => { m[p.id] = p.label; });
-    return (id: string) => m[id] || id;
+    return (id: string) => m[id] || providerLabelFor(id);
   }, [providers.data]);
 
   const byId = useMemo(() => {
@@ -132,7 +136,7 @@ export default function KeysPage() {
             <div>
               <label htmlFor="k-provider" className="mb-1.5 block text-sm font-medium text-neutral-300">Provider</label>
               <select id="k-provider" className={inputCls} value={effectiveProvider} onChange={(e) => setProvider(e.target.value)}>
-                {(providers.data?.providers ?? []).map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+                {(providers.data?.providers ?? []).map((p) => <option key={p.id} value={p.id}>{p.label || providerLabelFor(p.id)}</option>)}
               </select>
             </div>
             <div>
@@ -141,7 +145,7 @@ export default function KeysPage() {
             </div>
             <div>
               <label htmlFor="k-secret" className="mb-1.5 block text-sm font-medium text-neutral-300">API key</label>
-              <input id="k-secret" type="password" autoComplete="off" className={inputCls} value={secret} onChange={(e) => setSecret(e.target.value)} required />
+              <input id="k-secret" type="password" autoComplete="off" className={inputCls} value={secret} onChange={(e) => setSecret(e.target.value)} placeholder={KEY_HINTS[effectiveProvider] || ''} required />
             </div>
             {effectiveProvider === 'baseten' && (
               <div>
@@ -159,7 +163,7 @@ export default function KeysPage() {
       {loading ? (
         <Card><Loading /></Card>
       ) : groups.length === 0 ? (
-        <Card><EmptyState title="No provider keys yet" hint={canWrite ? 'Add a Groq or OpenRouter key above.' : 'Ask an org owner or admin to add one.'} /></Card>
+        <Card><EmptyState title="No provider keys yet" hint={canWrite ? 'Add a provider key (Groq, OpenRouter, Anthropic, Mesh API …) above.' : 'Ask an org owner or admin to add one.'} /></Card>
       ) : (
         groups.map((g, gi) => (
           <Card key={g.provider} title={`${providerLabel(g.provider)}${gi === 0 ? ' (highest priority)' : ''}`}>
