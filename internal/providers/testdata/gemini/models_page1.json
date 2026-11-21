@@ -1,0 +1,6 @@
+{"models":[
+{"name":"models/gemini-2.5-flash","displayName":"Gemini 2.5 Flash","inputTokenLimit":1048576,"outputTokenLimit":65536,"supportedGenerationMethods":["generateContent","countTokens","streamGenerateContent"]},
+{"name":"models/gemini-2.5-flash-image","displayName":"Nano Banana","inputTokenLimit":32768,"outputTokenLimit":32768,"supportedGenerationMethods":["generateContent","countTokens"]},
+{"name":"models/gemini-2.5-flash-preview-tts","displayName":"Gemini 2.5 Flash TTS","inputTokenLimit":8192,"outputTokenLimit":16384,"supportedGenerationMethods":["generateContent"]},
+{"name":"models/lyria-realtime-exp","displayName":"Lyria","supportedGenerationMethods":["bidiGenerateContent"]}
+],"nextPageToken":"tok2"}
