@@ -324,7 +324,7 @@ func TestGroqListModelsBaseURLAndAuthError(t *testing.T) {
 
 func TestRegistry(t *testing.T) {
 	got := strings.Join(ValidProviders(), ",")
-	if got != "baseten,google,groq,nvidia,openrouter,together" {
+	if got != "anthropic,baseten,google,groq,nvidia,openrouter,together" {
 		t.Fatalf("ValidProviders = %s", got)
 	}
 	if p, err := Get("gemini"); err != nil || p.Name() != "google" {
