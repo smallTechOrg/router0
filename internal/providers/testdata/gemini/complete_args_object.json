@@ -1,0 +1,1 @@
+{"id":"r3","model":"gemini-2.5-flash","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","tool_calls":[{"id":"abc","type":"function","function":{"name":"get_weather","arguments":{"city":"Rome"}}},{"id":"abd","type":"function","function":{"name":"ping"}}]}}]}

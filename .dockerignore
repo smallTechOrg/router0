@@ -1,0 +1,12 @@
+.git
+.claude
+.github
+.env
+.env.*
+!.env.example
+bin
+spec
+dashboard
+deploy
+NOTES.md
+*.test

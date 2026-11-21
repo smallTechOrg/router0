@@ -1,0 +1,1 @@
+{"id":"r5","model":"gemini-2.5-flash","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"It is sunny."}}],"usage":{"prompt_tokens":4,"completion_tokens":3,"total_tokens":7}}

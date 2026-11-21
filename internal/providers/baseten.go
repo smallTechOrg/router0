@@ -15,11 +15,11 @@ func (p *BasetenProvider) baseURL() string {
 }
 
 func (p *BasetenProvider) Complete(ctx context.Context, req *ChatRequest, apiKey string) (*ChatResponse, error) {
-	return doOpenAIComplete(ctx, p.baseURL(), apiKey, req, nil)
+	return doOpenAIComplete(ctx, p.baseURL(), apiKey, req, nil, nil)
 }
 
 func (p *BasetenProvider) Stream(ctx context.Context, req *ChatRequest, apiKey string) (<-chan ChatChunk, error) {
-	return doOpenAIStream(ctx, p.baseURL(), apiKey, req, nil)
+	return doOpenAIStream(ctx, p.baseURL(), apiKey, req, nil, nil)
 }
 
 func (p *BasetenProvider) HealthCheck(ctx context.Context, apiKey string) (*HealthResult, error) {
@@ -30,3 +30,5 @@ func (p *BasetenProvider) HealthCheck(ctx context.Context, apiKey string) (*Heal
 func (p *BasetenProvider) ListModels(ctx context.Context, apiKey string) ([]ModelInfo, error) {
 	return nil, nil
 }
+
+func init() { Register(&BasetenProvider{}) }

@@ -1,8 +1,8 @@
-// cmd/loadtest runs a concurrent load test against a running Zer0 Router instance.
+// cmd/loadtest runs a concurrent load test against a running router0 instance.
 //
 // Usage:
 //
-//	ZER0_KEY=zer0:sk-... go run ./cmd/loadtest \
+//	ROUTER0_TOKEN=r0-sk-... go run ./cmd/loadtest \
 //	  -url http://localhost:8080 \
 //	  -concurrency 10 \
 //	  -requests 100 \
@@ -31,20 +31,20 @@ type result struct {
 }
 
 func main() {
-	baseURL := flag.String("url", "http://localhost:8080", "Zer0 Router base URL")
+	baseURL := flag.String("url", "http://localhost:8080", "router0 base URL")
 	concurrency := flag.Int("concurrency", 5, "Concurrent workers")
 	totalReqs := flag.Int("requests", 50, "Total requests to send")
 	prompt := flag.String("prompt", "Say one word", "Prompt to send")
 	stream := flag.Bool("stream", false, "Use streaming")
 	flag.Parse()
 
-	zer0Key := os.Getenv("ZER0_KEY")
-	if zer0Key == "" {
-		fmt.Fprintln(os.Stderr, "Error: ZER0_KEY env var required (zer0:sk-...)")
+	token := os.Getenv("ROUTER0_TOKEN")
+	if token == "" {
+		fmt.Fprintln(os.Stderr, "Error: ROUTER0_TOKEN env var required (r0-sk-...)")
 		os.Exit(1)
 	}
 
-	fmt.Printf("Zer0 Router load test\n")
+	fmt.Printf("router0 load test\n")
 	fmt.Printf("  URL:         %s\n", *baseURL)
 	fmt.Printf("  Concurrency: %d\n", *concurrency)
 	fmt.Printf("  Requests:    %d\n", *totalReqs)
@@ -69,7 +69,7 @@ func main() {
 			defer wg.Done()
 			client := &http.Client{Timeout: 90 * time.Second}
 			for range work {
-				r := sendRequest(client, *baseURL, zer0Key, *prompt, *stream)
+				r := sendRequest(client, *baseURL, token, *prompt, *stream)
 				mu.Lock()
 				results = append(results, r)
 				mu.Unlock()
@@ -135,9 +135,9 @@ func main() {
 	}
 }
 
-func sendRequest(client *http.Client, baseURL, zer0Key, prompt string, stream bool) result {
+func sendRequest(client *http.Client, baseURL, token, prompt string, stream bool) result {
 	payload := map[string]any{
-		"model":      "zer0-0.1",
+		"model":      "llama-3.3-70b",
 		"messages":   []map[string]string{{"role": "user", "content": prompt}},
 		"max_tokens": 10,
 		"stream":     stream,
@@ -149,7 +149,7 @@ func sendRequest(client *http.Client, baseURL, zer0Key, prompt string, stream bo
 		return result{err: err}
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+zer0Key)
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	t0 := time.Now()
 	resp, err := client.Do(req)
@@ -164,8 +164,8 @@ func sendRequest(client *http.Client, baseURL, zer0Key, prompt string, stream bo
 	}
 	json.NewDecoder(resp.Body).Decode(&out)
 
-	provider := resp.Header.Get("X-Zer0-Provider")
-	model := resp.Header.Get("X-Zer0-Model")
+	provider := resp.Header.Get("X-Router0-Provider")
+	model := resp.Header.Get("X-Router0-Model")
 
 	if out.Error != nil {
 		return result{statusCode: resp.StatusCode, latency: latency,

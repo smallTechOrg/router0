@@ -2,10 +2,25 @@ package providers
 
 import (
 	"context"
+	"net/http"
 	"strings"
 )
 
 type GroqProvider struct{}
+
+func init() { Register(&GroqProvider{}) }
+
+// Classify applies Groq-specific rules on top of the generic ones.
+func (g *GroqProvider) Classify(status int, h http.Header, body []byte) *ProviderError {
+	pe := Classify(status, h, body)
+	switch {
+	case status == 498: // flex-tier capacity exceeded
+		pe.Class = ErrorClassTransient
+	case status == 400 && pe.Code == "organization_restricted":
+		pe.Class = ErrorClassAuth
+	}
+	return pe
+}
 
 func (g *GroqProvider) Name() string { return "groq" }
 
@@ -18,43 +33,43 @@ func (g *GroqProvider) baseURL() string {
 }
 
 func (g *GroqProvider) Complete(ctx context.Context, req *ChatRequest, apiKey string) (*ChatResponse, error) {
-	return doOpenAIComplete(ctx, g.baseURL(), apiKey, req, nil)
+	return doOpenAIComplete(ctx, g.baseURL(), apiKey, req, nil, g)
 }
 
 func (g *GroqProvider) Stream(ctx context.Context, req *ChatRequest, apiKey string) (<-chan ChatChunk, error) {
-	return doOpenAIStream(ctx, g.baseURL(), apiKey, req, nil)
+	return doOpenAIStream(ctx, g.baseURL(), apiKey, req, nil, g)
 }
 
 func (g *GroqProvider) HealthCheck(ctx context.Context, apiKey string) (*HealthResult, error) {
-	return doOpenAIHealthCheck(ctx, g.baseURL(), apiKey, "llama-3.3-70b-versatile", nil)
+	return doOpenAIHealthCheck(ctx, g.baseURL(), apiKey, "llama-3.3-70b-versatile", nil, g)
 }
 
 func (g *GroqProvider) ProbeModel(ctx context.Context, apiKey, model string) (*HealthResult, error) {
-	return doOpenAIProbeModel(ctx, g.baseURL(), apiKey, model, nil)
+	return doOpenAIProbeModel(ctx, g.baseURL(), apiKey, model, nil, g)
 }
 
 // Groq pricing (USD per million tokens) sourced from https://console.groq.com/docs/models
 var groqPricing = map[string][2]float64{
-	"llama-3.3-70b-versatile":        {0.59, 0.79},
-	"llama-3.3-70b-specdec":          {0.59, 0.99},
-	"llama-3.1-70b-versatile":        {0.59, 0.79},
-	"llama-3.1-8b-instant":           {0.05, 0.08},
-	"llama3-70b-8192":                {0.59, 0.79},
-	"llama3-8b-8192":                 {0.05, 0.08},
-	"llama-3.2-90b-vision-preview":   {0.90, 0.90},
-	"llama-3.2-11b-vision-preview":   {0.18, 0.18},
-	"llama-3.2-3b-preview":           {0.06, 0.06},
-	"llama-3.2-1b-preview":           {0.04, 0.04},
-	"mixtral-8x7b-32768":             {0.24, 0.24},
-	"gemma2-9b-it":                   {0.20, 0.20},
-	"gemma-7b-it":                    {0.07, 0.07},
-	"llama-guard-3-8b":               {0.20, 0.20},
-	"deepseek-r1-distill-llama-70b":  {0.75, 0.99},
-	"qwen-qwq-32b":                   {0.29, 0.39},
+	"llama-3.3-70b-versatile":       {0.59, 0.79},
+	"llama-3.3-70b-specdec":         {0.59, 0.99},
+	"llama-3.1-70b-versatile":       {0.59, 0.79},
+	"llama-3.1-8b-instant":          {0.05, 0.08},
+	"llama3-70b-8192":               {0.59, 0.79},
+	"llama3-8b-8192":                {0.05, 0.08},
+	"llama-3.2-90b-vision-preview":  {0.90, 0.90},
+	"llama-3.2-11b-vision-preview":  {0.18, 0.18},
+	"llama-3.2-3b-preview":          {0.06, 0.06},
+	"llama-3.2-1b-preview":          {0.04, 0.04},
+	"mixtral-8x7b-32768":            {0.24, 0.24},
+	"gemma2-9b-it":                  {0.20, 0.20},
+	"gemma-7b-it":                   {0.07, 0.07},
+	"llama-guard-3-8b":              {0.20, 0.20},
+	"deepseek-r1-distill-llama-70b": {0.75, 0.99},
+	"qwen-qwq-32b":                  {0.29, 0.39},
 }
 
 func (g *GroqProvider) ListModels(ctx context.Context, apiKey string) ([]ModelInfo, error) {
-	raw, err := doListModelsOpenAI(ctx, g.baseURL(), apiKey, nil)
+	raw, err := doListModelsOpenAI(ctx, g.baseURL(), apiKey, nil, g)
 	if err != nil {
 		return nil, err
 	}
@@ -67,14 +82,14 @@ func (g *GroqProvider) ListModels(ctx context.Context, apiKey string) ([]ModelIn
 		}
 		paramB, arch := LookupModelMeta(id)
 		info := ModelInfo{
-			ID:               id,
-			DisplayName:      id,
-			ContextWindow:    jsonInt(m, "context_window"),
-			MaxOutputTokens:  8192,
+			ID:                id,
+			DisplayName:       id,
+			ContextWindow:     jsonInt(m, "context_window"),
+			MaxOutputTokens:   8192,
 			SupportsStreaming: true,
-			ParameterCountB:  paramB,
-			Architecture:     arch,
-			Extra:            map[string]any{"owned_by": jsonStr(m, "owned_by")},
+			ParameterCountB:   paramB,
+			Architecture:      arch,
+			Extra:             map[string]any{"owned_by": jsonStr(m, "owned_by")},
 		}
 		if p, ok := groqPricing[id]; ok {
 			info.InputCostPerMTok = p[0]

@@ -3,8 +3,8 @@ import './globals.css';
 import { SessionProviderWrapper } from '@/components/SessionProviderWrapper';
 
 export const metadata: Metadata = {
-  title: 'Zer0 Router Dashboard',
-  description: 'Manage your AI provider pool and routing configuration.',
+  title: 'router0 dashboard',
+  description: 'Org-scoped LLM gateway: service tokens, provider keys, routing and request log.',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

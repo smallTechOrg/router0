@@ -1,53 +1,53 @@
-# Capability: Auth & Onboarding
+# Capability: Orgs, Auth & Onboarding
+
+Phase 1.
 
 ## What It Does
 
-Manages invite-only user registration, email/password authentication, and issuance of a single `zer0:sk-xxx` API key that the user presents on every inference request.
+Turns the existing single-user accounts into members of an **org** (the tenant). Keeps invite-only registration and email/password login for humans using the dashboard. Every dashboard API call is scoped to the caller's org. Service-to-service auth is a separate capability (service-tokens.md).
 
 ## Inputs
 
 | Input | Type | Source | Required |
-|-------|------|---------|----------|
-| Invite token | String (UUID) | Admin-created invite email | Yes (registration only) |
-| Email | String | User form | Yes |
-| Password | String | User form | Yes (min 12 chars) |
-| Zer0 API key (`zer0:sk-xxx`) | String | User's HTTP `Authorization: Bearer` header | Yes (inference requests) |
+|-------|------|--------|----------|
+| Invite token | UUID string | Invite link created by platform admin | Registration |
+| Email, password (≥12 chars) | strings | Register / login form | Yes |
+| Org name | string ≤ 80 chars | Register form | No (default = email) |
+| JWT access token | HS256 string | `Authorization: Bearer` on `/api/*` | Dashboard API |
 
 ## Outputs
 
-| Output | Type | Destination |
-|--------|------|-------------|
-| JWT access token (15 min TTL) | String | HTTP response body → client |
-| JWT refresh token (30 day TTL) | String | HTTP-only cookie |
-| Zer0 API key (full, shown once) | String | Registration response body |
-| User record | PostgreSQL `users` row | Database |
+| Output | Destination |
+|--------|-------------|
+| `users`, `orgs`, `org_members` rows | PostgreSQL |
+| JWT access token (15 min) with claims `sub`, `email`, `role`, `org_id` | Response body → NextAuth session |
+| Refresh token (30 days) | HTTP-only cookie (unchanged) |
 
 ## External Calls
 
 | System | Operation | On Failure |
 |--------|-----------|------------|
-| PostgreSQL | INSERT user, INSERT/UPDATE invite | Return 500; log structured error |
-| PostgreSQL | SELECT user by email for login | Return 401 on mismatch |
+| PostgreSQL | Transaction: INSERT user, INSERT org (or look up invite org), INSERT org_member, UPDATE invite | Roll back; 500 `internal_error/db_error` |
 
 ## Business Rules
 
-- Registration is invite-only. An invite is a single-use token (UUID) with a 7-day expiry. Accepting an invite marks it consumed; presenting an already-consumed or expired token returns HTTP 409.
-- Password is bcrypt-hashed (cost 12) before storage. Password is never logged or returned.
-- The Zer0 API key format: `zer0:sk-` prefix followed by 32 cryptographically-random base58 characters, e.g. `zer0:sk-3fGhJ8kLmNpQrStUvWxYzAb`. The full key is returned exactly once at registration and never stored in plaintext. The database stores a bcrypt hash (cost 12) of the key and a non-secret display prefix (first 12 chars after `zer0:sk-`) for dashboard identification.
-- Each user has exactly one Zer0 API key at a time. Key rotation issues a new key and immediately invalidates the previous hash.
-- Authentication for inference requests: extract the `Authorization: Bearer zer0:sk-xxx` header, bcrypt-compare against all active key hashes for the resolved user. Lookup is by the display prefix stored in plaintext (non-secret) to avoid a full-table scan, then bcrypt comparison.
-- Authentication for dashboard API routes: JWT (HS256, secret from env `JWT_SECRET`). JWTs do not contain the Zer0 key or provider keys.
-- Admin role is assigned directly in the database (`users.role = 'admin'`). No self-service admin promotion.
-- A disabled user (`users.status = 'disabled'`) is rejected at both JWT validation and Zer0-key lookup.
-- No OAuth in Phase 1. The registration/login form is the only onboarding path.
+- Registration stays invite-only. Platform admins (`users.role='admin'`) create invites via `POST /admin/invites`.
+- An invite with no `org_id` creates a new org on registration and makes the registrant `owner`. An invite with `org_id` adds the registrant to that org with `invites.org_role` (default `member`).
+- Assumed: one org per user (unique index on `org_members.user_id`). Existing users are backfilled into one personal org each, as `owner` (migration 000014).
+- Registration, org creation, membership, and invite consumption happen in one DB transaction (today the invite update is a separate, unchecked statement; that is fixed).
+- Registration no longer generates a `zer0:sk-` key. The response carries `org` and `access_token`. The dashboard then sends the user to create a service token.
+- Org roles: `owner` and `admin` may write (keys, priority, tokens, catalog refresh, aliases); `member` is read-only. Enforced by `auth.RequireOrgRole("owner","admin")` on every write route under `/api/*`.
+- `JWTMiddleware` puts `org_id` in the context. When an older JWT has no `org_id` claim, the middleware loads it from `org_members`. A user with no membership gets `403 forbidden/no_org`.
+- Platform admin bootstrap (`ADMIN_EMAIL`/`ADMIN_PASSWORD` in `main.go`) also creates the admin's org if missing.
+- A disabled user (`users.status='disabled'`) is rejected at login and at JWT validation. Disabling a user does not revoke the org's service tokens. Tokens belong to the org, not the person. Assumed.
+- Passwords: bcrypt cost 12, never logged (unchanged).
 
 ## Success Criteria
 
-- [ ] `POST /auth/register` with a valid, unused invite token, email, and password returns HTTP 201, body contains `zer0_key` (full key, once), and the user row appears in PostgreSQL with `password_hash` populated and `zer0_key` absent.
-- [ ] A second `POST /auth/register` with the same invite token returns HTTP 409.
-- [ ] An expired invite token (manually backdated in DB) returns HTTP 410.
-- [ ] `POST /auth/login` with correct credentials returns HTTP 200 with a JWT access token.
-- [ ] `POST /auth/login` with wrong password returns HTTP 401; no timing difference observable at >10 ms granularity (constant-time compare).
-- [ ] A valid Zer0 API key in the `Authorization: Bearer` header on `POST /v1/chat/completions` resolves to the correct user; an invalid key returns HTTP 401.
-- [ ] A disabled user's Zer0 key returns HTTP 403.
-- [ ] `POST /admin/invites` by an admin user creates an invite row and returns the invite token; the same call by a non-admin returns HTTP 403.
+- [ ] `POST /auth/register` with a valid invite (no `org_id`) returns 201 with `org.role = "owner"`; `orgs`, `org_members` rows exist; the response has no `zer0_key` field.
+- [ ] Registering with an invite carrying `org_id = X` and `org_role = member` makes the user a `member` of X; that user's `POST /api/tokens` returns 403 `org_role_required`, and `GET /api/tokens` returns 200.
+- [ ] A reused invite returns 409; an expired invite returns 410; a 10-char password returns 422.
+- [ ] `GET /auth/me` returns the `org` object.
+- [ ] User in org A calling `GET /api/keys/{id}` or `DELETE /api/tokens/{id}` for org B's resource gets 404.
+- [ ] After migration 000014 on a DB holding pre-existing users, every user has exactly one `org_members` row with role `owner`.
+- [ ] A JWT issued without an `org_id` claim still works on `/api/keys` (org resolved from membership).

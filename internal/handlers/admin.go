@@ -3,66 +3,126 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
+	"regexp"
 	"sync"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
 	"github.com/zer0-router/zer0/internal/auth"
 	"github.com/zer0-router/zer0/internal/keys"
 	"github.com/zer0-router/zer0/internal/models"
+	"github.com/zer0-router/zer0/internal/orgs"
 	"github.com/zer0-router/zer0/internal/providers"
-	"github.com/zer0-router/zer0/internal/routing"
 )
 
 type AdminHandler struct {
-	pgPool      *pgxpool.Pool
-	redis       *redis.Client
-	routingPool *routing.Pool
-	registry    *models.Registry
-	discovery   *models.DiscoveryJob
+	pgPool    *pgxpool.Pool
+	orgs      *orgs.Repository
+	registry  *models.Registry
+	discovery *models.DiscoveryJob
 }
 
-func NewAdminHandler(pg *pgxpool.Pool, r *redis.Client, routingPool *routing.Pool, registry *models.Registry, discovery *models.DiscoveryJob) *AdminHandler {
-	return &AdminHandler{pgPool: pg, redis: r, routingPool: routingPool, registry: registry, discovery: discovery}
+func NewAdminHandler(pg *pgxpool.Pool, registry *models.Registry, discovery *models.DiscoveryJob) *AdminHandler {
+	return &AdminHandler{pgPool: pg, orgs: orgs.NewRepository(pg), registry: registry, discovery: discovery}
 }
 
+var adminUUIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// CreateInvite: POST /admin/invites. Optional org_id (+ org_role admin|member) invites into
+// an existing org; without org_id the invitee gets a new org of their own.
 func (h *AdminHandler) CreateInvite(w http.ResponseWriter, r *http.Request) {
 	adminID := auth.UserIDFromCtx(r.Context())
 	var req struct {
-		Email string `json:"email"`
+		Email   string `json:"email"`
+		OrgID   string `json:"org_id"`
+		OrgRole string `json:"org_role"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Email == "" {
 		writeError(w, http.StatusBadRequest, "validation_error", "invalid_request", "email is required")
 		return
 	}
+	if req.OrgID == "" && req.OrgRole != "" {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", "org_role_without_org", "org_role requires org_id")
+		return
+	}
+	if req.OrgRole != "" && req.OrgRole != orgs.RoleAdmin && req.OrgRole != orgs.RoleMember {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", "invalid_org_role", "org_role must be admin or member")
+		return
+	}
+	if req.OrgID != "" {
+		if !adminUUIDRe.MatchString(req.OrgID) {
+			writeError(w, http.StatusUnprocessableEntity, "validation_error", "invalid_org_id", "org_id must be a UUID")
+			return
+		}
+		ok, err := h.orgs.Exists(r.Context(), req.OrgID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to look up org")
+			return
+		}
+		if !ok {
+			writeError(w, http.StatusNotFound, "not_found", "org_not_found", "Org not found")
+			return
+		}
+		if req.OrgRole == "" {
+			req.OrgRole = orgs.RoleMember
+		}
+	}
 
 	var token string
 	var expiresAt time.Time
 	err := h.pgPool.QueryRow(r.Context(),
-		`INSERT INTO invites (email, token, created_by, invited_by, expires_at)
-		 VALUES ($1, gen_random_uuid()::text, $2, $2, NOW() + INTERVAL '7 days')
+		`INSERT INTO invites (email, token, created_by, invited_by, expires_at, org_id, org_role)
+		 VALUES ($1, gen_random_uuid()::text, $2, $2, NOW() + INTERVAL '7 days', NULLIF($3, '')::uuid, NULLIF($4, ''))
 		 RETURNING token, expires_at`,
-		req.Email, adminID,
+		req.Email, adminID, req.OrgID, req.OrgRole,
 	).Scan(&token, &expiresAt)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to create invite")
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]interface{}{
+	resp := map[string]interface{}{
 		"token":      token,
 		"email":      req.Email,
 		"expires_at": expiresAt.Format(time.RFC3339),
-	})
+	}
+	if req.OrgID != "" {
+		resp["org_id"] = req.OrgID
+		resp["org_role"] = req.OrgRole
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+// ListOrgs: GET /admin/orgs. Orgs with member, live-token and active-key counts.
+func (h *AdminHandler) ListOrgs(w http.ResponseWriter, r *http.Request) {
+	list, err := h.orgs.ListSummaries(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to list orgs")
+		return
+	}
+	type orgOut struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		CreatedAt   string `json:"created_at"`
+		MemberCount int    `json:"member_count"`
+		TokenCount  int    `json:"token_count"`
+		KeyCount    int    `json:"key_count"`
+	}
+	out := make([]orgOut, 0, len(list))
+	for _, o := range list {
+		out = append(out, orgOut{o.ID, o.Name, o.CreatedAt.Format(time.RFC3339), o.MemberCount, o.TokenCount, o.KeyCount})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"orgs": out})
 }
 
 func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.pgPool.Query(r.Context(),
-		`SELECT id, email, role, status, created_at FROM users ORDER BY created_at DESC`,
+		`SELECT u.id::text, u.email, u.role, u.status, u.created_at, o.id::text, o.name, m.role
+		   FROM users u
+		   LEFT JOIN org_members m ON m.user_id = u.id
+		   LEFT JOIN orgs o ON o.id = m.org_id
+		  ORDER BY u.created_at DESC`,
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to list users")
@@ -76,13 +136,26 @@ func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 		Role      string `json:"role"`
 		Status    string `json:"status"`
 		CreatedAt string `json:"created_at"`
+		Org       *struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+			Role string `json:"role"`
+		} `json:"org"`
 	}
 	var users []userJSON
 	for rows.Next() {
 		var u userJSON
 		var createdAt time.Time
-		if err := rows.Scan(&u.ID, &u.Email, &u.Role, &u.Status, &createdAt); err != nil {
+		var orgID, orgName, orgRole *string
+		if err := rows.Scan(&u.ID, &u.Email, &u.Role, &u.Status, &createdAt, &orgID, &orgName, &orgRole); err != nil {
 			continue
+		}
+		if orgID != nil && orgName != nil && orgRole != nil {
+			u.Org = &struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+				Role string `json:"role"`
+			}{*orgID, *orgName, *orgRole}
 		}
 		u.CreatedAt = createdAt.Format(time.RFC3339)
 		users = append(users, u)
@@ -116,37 +189,6 @@ func (h *AdminHandler) SetProviderKey(w http.ResponseWriter, r *http.Request) {
 	if err := h.registry.SaveAdminKey(r.Context(), req.Provider, ciphertext, nonce, req.Label); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to save key")
 		return
-	}
-
-	// Also register as a user-facing key for the admin so they can route through it immediately
-	adminID := auth.UserIDFromCtx(r.Context())
-	label := req.Label
-	if label == "" {
-		label = req.Provider + " admin key"
-	}
-	hint := req.Key
-	if len(hint) > 8 {
-		hint = hint[:8]
-	}
-	hint += "…"
-	keyRepo := keys.NewRepository(h.pgPool)
-	k, err := keyRepo.Create(r.Context(), adminID, req.Provider, label, hint, "", ciphertext, nonce)
-	if err == nil {
-		prov, _ := providers.Get(req.Provider)
-		if prov != nil {
-			for _, model := range prov.DefaultModels() {
-				var paramB float64
-				var ctxWindow int
-				_ = h.pgPool.QueryRow(r.Context(),
-					`SELECT COALESCE(parameter_count_b,0), context_window FROM provider_models WHERE provider=$1 AND model_id=$2`,
-					req.Provider, model).Scan(&paramB, &ctxWindow)
-				if paramB <= 0 {
-					paramB = 50
-					ctxWindow = 128000
-				}
-				h.routingPool.AddComboToAll(r.Context(), adminID, req.Provider, model, k.ID, paramB, ctxWindow)
-			}
-		}
 	}
 
 	// Trigger immediate discovery in background using a fresh context
@@ -193,40 +235,40 @@ func (h *AdminHandler) ListModels(w http.ResponseWriter, r *http.Request) {
 		ErrorRate    *float64 `json:"error_rate"`
 		AvgLatencyMs *int     `json:"avg_latency_ms"`
 		// Component weights
-		ReliabilityWeight  float64  `json:"reliability_weight"`
-		LatencyWeight      float64  `json:"latency_weight"`
-		BaselineWeight     float64  `json:"baseline_weight"`
-		AvailabilityWeight float64  `json:"availability_weight"`
+		ReliabilityWeight  float64 `json:"reliability_weight"`
+		LatencyWeight      float64 `json:"latency_weight"`
+		BaselineWeight     float64 `json:"baseline_weight"`
+		AvailabilityWeight float64 `json:"availability_weight"`
 		// Component values (nil if not enough data)
-		ReliabilityScore  *float64 `json:"reliability_score"`
-		LatencyScore      *float64 `json:"latency_score"`
-		FinalScore        *float64 `json:"final_score"`
-		DataSufficient    bool     `json:"data_sufficient"`
+		ReliabilityScore *float64 `json:"reliability_score"`
+		LatencyScore     *float64 `json:"latency_score"`
+		FinalScore       *float64 `json:"final_score"`
+		DataSufficient   bool     `json:"data_sufficient"`
 	}
 	type modelJSON struct {
-		Provider          string          `json:"provider"`
-		ModelID           string          `json:"model_id"`
-		DisplayName       string          `json:"display_name"`
-		ContextWindow     int             `json:"context_window"`
-		MaxOutputTokens   int             `json:"max_output_tokens"`
-		InputCostPerMTok  float64         `json:"input_cost_per_mtok"`
-		OutputCostPerMTok float64         `json:"output_cost_per_mtok"`
-		ParameterCountB   *float64        `json:"parameter_count_b"`
-		Architecture      *string         `json:"architecture"`
-		Score             *float64        `json:"score"`
-		AvgLatencyMs      *int            `json:"avg_latency_ms"`
-		ErrorRate         *float64        `json:"error_rate"`
-		ProbeStatus       string          `json:"probe_status"`
+		Provider          string   `json:"provider"`
+		ModelID           string   `json:"model_id"`
+		DisplayName       string   `json:"display_name"`
+		ContextWindow     int      `json:"context_window"`
+		MaxOutputTokens   int      `json:"max_output_tokens"`
+		InputCostPerMTok  float64  `json:"input_cost_per_mtok"`
+		OutputCostPerMTok float64  `json:"output_cost_per_mtok"`
+		ParameterCountB   *float64 `json:"parameter_count_b"`
+		Architecture      *string  `json:"architecture"`
+		Score             *float64 `json:"score"`
+		AvgLatencyMs      *int     `json:"avg_latency_ms"`
+		ErrorRate         *float64 `json:"error_rate"`
+		ProbeStatus       string   `json:"probe_status"`
 		// Historical stats from model_perf_stats
-		TotalRequests  *int64   `json:"total_requests"`
-		TotalErrors    *int64   `json:"total_errors"`
-		P50LatencyMs   *int     `json:"p50_latency_ms"`
-		P95LatencyMs   *int     `json:"p95_latency_ms"`
-		P99LatencyMs   *int     `json:"p99_latency_ms"`
-		MinLatencyMs   *int     `json:"min_latency_ms"`
-		MaxLatencyMs   *int     `json:"max_latency_ms"`
-		ScoreBreakdown    scoreBreakdown  `json:"score_breakdown"`
-		RateLimits        []rateLimitJSON `json:"rate_limits"`
+		TotalRequests  *int64          `json:"total_requests"`
+		TotalErrors    *int64          `json:"total_errors"`
+		P50LatencyMs   *int            `json:"p50_latency_ms"`
+		P95LatencyMs   *int            `json:"p95_latency_ms"`
+		P99LatencyMs   *int            `json:"p99_latency_ms"`
+		MinLatencyMs   *int            `json:"min_latency_ms"`
+		MaxLatencyMs   *int            `json:"max_latency_ms"`
+		ScoreBreakdown scoreBreakdown  `json:"score_breakdown"`
+		RateLimits     []rateLimitJSON `json:"rate_limits"`
 	}
 
 	// Only show probe_ok models with context_window >= 100K.
@@ -367,77 +409,6 @@ func (h *AdminHandler) TriggerDiscovery(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "discovery_started"})
 }
 
-// ResetPool flushes all Redis pool keys for every user and re-seeds from DB.
-// This forces the router to re-evaluate all combos from a clean slate.
-func (h *AdminHandler) ResetPool(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	// Collect all user IDs
-	rows, err := h.pgPool.Query(ctx, `SELECT id FROM users WHERE status = 'active'`)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to list users")
-		return
-	}
-	var userIDs []string
-	for rows.Next() {
-		var id string
-		if rows.Scan(&id) == nil {
-			userIDs = append(userIDs, id)
-		}
-	}
-	rows.Close()
-
-	// Flush all tier pool keys
-	var keysDeleted int
-	for _, uid := range userIDs {
-		for _, tier := range []routing.Tier{routing.TierFlashLite, routing.TierFlash, routing.TierPro} {
-			h.redis.Del(ctx, fmt.Sprintf("pool:%s:%s", uid, tier.String()))
-			keysDeleted++
-		}
-	}
-
-	// Re-seed pool from provider_keys + probe_ok models with tier assignment
-	pkRows, err := h.pgPool.Query(ctx,
-		`SELECT pk.id, pk.user_id, pk.provider
-		 FROM provider_keys pk WHERE pk.status = 'active'`)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to seed pool")
-		return
-	}
-	seeded := 0
-	for pkRows.Next() {
-		var keyID, userID, provider string
-		if pkRows.Scan(&keyID, &userID, &provider) != nil {
-			continue
-		}
-		modelRows, err := h.pgPool.Query(ctx,
-			`SELECT model_id, COALESCE(parameter_count_b, 0), context_window
-			 FROM provider_models
-			 WHERE provider = $1 AND probe_status = 'probe_ok'
-			   AND parameter_count_b > 0`, provider)
-		if err != nil {
-			continue
-		}
-		for modelRows.Next() {
-			var modelID string
-			var paramB float64
-			var ctxWindow int
-			if modelRows.Scan(&modelID, &paramB, &ctxWindow) == nil {
-				h.routingPool.AddComboToAll(ctx, userID, provider, modelID, keyID, paramB, ctxWindow)
-				seeded++
-			}
-		}
-		modelRows.Close()
-	}
-	pkRows.Close()
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":      "pool_reset",
-		"users":       len(userIDs),
-		"combos_seeded": seeded,
-	})
-}
-
 // PerfTest hits every probe_ok model directly using provider keys, logs results
 // to request_metadata so they feed into scoring, and returns per-model results.
 func (h *AdminHandler) PerfTest(w http.ResponseWriter, r *http.Request) {
@@ -463,10 +434,10 @@ func (h *AdminHandler) PerfTest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type target struct {
-		provider  string
-		model     string
-		keyID     string
-		apiKey    string
+		provider string
+		model    string
+		keyID    string
+		apiKey   string
 	}
 	seen := map[string]bool{} // deduplicate provider+model (use first key found)
 	var targets []target
@@ -571,30 +542,4 @@ func (h *AdminHandler) PerfTest(w http.ResponseWriter, r *http.Request) {
 		"results": results,
 		"summary": map[string]int{"total": len(results), "pass": pass, "fail": fail},
 	})
-}
-
-func (h *AdminHandler) GetPoolForUser(w http.ResponseWriter, r *http.Request) {
-	userID := chi.URLParam(r, "user_id")
-	type comboJSON struct {
-		Provider      string `json:"provider"`
-		Model         string `json:"model"`
-		ProviderKeyID string `json:"provider_key_id"`
-		Pool          string `json:"pool"`
-	}
-	toJSON := func(combos []routing.Combo) []comboJSON {
-		out := make([]comboJSON, 0, len(combos))
-		for _, c := range combos {
-			out = append(out, comboJSON{c.Provider, c.Model, c.ProviderKeyID, c.Pool})
-		}
-		return out
-	}
-	result := map[string]interface{}{}
-	for _, tier := range []routing.Tier{routing.TierFlashLite, routing.TierFlash, routing.TierPro} {
-		combos, err := h.routingPool.LoadPool(r.Context(), userID, tier)
-		if err != nil {
-			continue
-		}
-		result[tier.String()] = toJSON(combos)
-	}
-	writeJSON(w, http.StatusOK, result)
 }

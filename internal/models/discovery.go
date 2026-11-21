@@ -6,10 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
 	"github.com/zer0-router/zer0/internal/keys"
 	"github.com/zer0-router/zer0/internal/providers"
-	"github.com/zer0-router/zer0/internal/routing"
 )
 
 const discoveryInterval = 6 * time.Hour
@@ -18,18 +16,16 @@ const discoveryInterval = 6 * time.Hour
 type DiscoveryJob struct {
 	registry   *Registry
 	pg         *pgxpool.Pool
-	redis      *redis.Client
-	pool       *routing.Pool
 	stop       chan struct{}
 	onComplete func() // optional hook called after each full discovery run
 }
 
-func NewDiscoveryJob(pg *pgxpool.Pool, r *redis.Client, pool *routing.Pool) *DiscoveryJob {
+// NewDiscoveryJob builds the legacy global (admin) model-discovery job. It only
+// writes the provider_models registry; request routing uses the per-org catalog.
+func NewDiscoveryJob(pg *pgxpool.Pool) *DiscoveryJob {
 	return &DiscoveryJob{
 		registry: NewRegistry(pg),
 		pg:       pg,
-		redis:    r,
-		pool:     pool,
 		stop:     make(chan struct{}),
 	}
 }
@@ -138,7 +134,6 @@ func (j *DiscoveryJob) runDiscoveryWithKey(ctx context.Context, provider, apiKey
 		j.registry.MarkDiscoveryRun(ctx, provider)
 	}
 	slog.Info("discovery: models discovered", "provider", provider, "count", len(discovered))
-	j.backfillPool(ctx, provider, discovered)
 }
 
 // RunForProvider triggers immediate discovery for one provider using any available key.
@@ -155,29 +150,6 @@ func (j *DiscoveryJob) RunForProvider(ctx context.Context, provider, apiKey stri
 	if len(discovered) > 0 {
 		j.registry.Upsert(ctx, provider, discovered)
 		slog.Info("discovery: triggered for provider", "provider", provider, "count", len(discovered))
-		j.backfillPool(ctx, provider, discovered)
-	}
+		}
 	return discovered, nil
-}
-
-// backfillPool ensures every user key for a provider has pool combos for all discovered models.
-func (j *DiscoveryJob) backfillPool(ctx context.Context, provider string, discovered []providers.ModelInfo) {
-	rows, err := j.pg.Query(ctx,
-		`SELECT id, user_id FROM provider_keys WHERE provider = $1 AND status = 'active'`, provider)
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var keyID, userID string
-		if err := rows.Scan(&keyID, &userID); err != nil {
-			continue
-		}
-		for _, m := range discovered {
-			if m.ParameterCountB <= 0 {
-				continue
-			}
-			j.pool.AddComboToAll(ctx, userID, provider, m.ID, keyID, m.ParameterCountB, m.ContextWindow)
-		}
-	}
 }

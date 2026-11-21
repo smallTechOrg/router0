@@ -1,81 +1,68 @@
-import { getServerSession } from 'next-auth';
-import { authOptions } from '@/lib/auth';
+'use client';
+import { useAuth, useLoader } from '@/lib/hooks';
+import { getCosts } from '@/lib/api';
+import { Card, EmptyState, ErrorBanner, Loading, PageHeader, tdCls, thCls } from '@/components/ui';
 
-async function getCosts(token: string) {
-  try {
-    const res = await fetch('http://localhost:8080/api/costs', {
-      headers: { Authorization: `Bearer ${token}` },
-      cache: 'no-store',
-    });
-    if (!res.ok) return { month: '', by_provider: [], total_estimated_cost_usd: 0 };
-    return res.json();
-  } catch { return { month: '', by_provider: [], total_estimated_cost_usd: 0 }; }
+// api.md only says: grouped by (provider, canonical model, key label) over the last 30 days.
+// The response is parsed defensively: the first array-valued field is treated as the rows.
+type Row = Record<string, any>;
+
+function extractRows(d: Record<string, unknown> | null): Row[] {
+  if (!d) return [];
+  for (const k of ['rows', 'costs', 'items', 'by_key', 'by_provider']) {
+    if (Array.isArray(d[k])) return d[k] as Row[];
+  }
+  const first = Object.values(d).find(Array.isArray);
+  return (first as Row[]) ?? [];
 }
 
-export default async function CostsPage() {
-  const session = await getServerSession(authOptions) as any;
-  const costs = await getCosts(session?.accessToken || '');
+const num = (v: unknown) => (typeof v === 'number' ? v : Number(v) || 0);
+
+export default function CostsPage() {
+  const { token } = useAuth();
+  const { data, error, loading, reload } = useLoader((t) => getCosts(t), token);
+  const rows = extractRows(data);
+  const total = rows.reduce((s, r) => s + num(r.estimated_cost_usd), 0);
+  const requests = rows.reduce((s, r) => s + num(r.request_count ?? r.requests), 0);
 
   return (
-    <div>
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-white">Cost Tracker</h1>
-        <p className="mt-1 text-sm text-neutral-400">Estimated spend for {costs.month || 'current month'}.</p>
-      </div>
-
-      {/* Summary card */}
-      <div className="grid grid-cols-3 gap-4 mb-6">
-        <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
-          <p className="text-xs text-neutral-400 mb-1">Total this month</p>
-          <p className="text-2xl font-bold text-white">${Number(costs.total_estimated_cost_usd).toFixed(4)}</p>
-        </div>
-        <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
-          <p className="text-xs text-neutral-400 mb-1">Providers active</p>
-          <p className="text-2xl font-bold text-white">{costs.by_provider?.length || 0}</p>
-        </div>
-        <div className="rounded-xl border border-neutral-800 bg-neutral-900 p-4">
-          <p className="text-xs text-neutral-400 mb-1">Total requests</p>
-          <p className="text-2xl font-bold text-white">
-            {(costs.by_provider || []).reduce((s: number, p: any) => s + (p.request_count || 0), 0)}
-          </p>
-        </div>
-      </div>
-
-      {/* By provider table */}
-      <div className="rounded-xl border border-neutral-800 bg-neutral-900 overflow-hidden mb-6">
-        <div className="px-6 py-4 border-b border-neutral-800">
-          <h2 className="text-sm font-semibold text-neutral-200">By Provider</h2>
-        </div>
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-neutral-800">
-              <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Provider</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Requests</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Input tokens</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Output tokens</th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-neutral-400 uppercase">Estimated cost</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(costs.by_provider || []).length === 0 ? (
-              <tr><td colSpan={5} className="px-6 py-12 text-center text-sm text-neutral-500">No data yet.</td></tr>
-            ) : (costs.by_provider || []).map((p: any) => (
-              <tr key={p.provider} className="border-b border-neutral-800/50">
-                <td className="px-6 py-3 text-neutral-200 capitalize">{p.provider}</td>
-                <td className="px-6 py-3 text-neutral-400">{p.request_count}</td>
-                <td className="px-6 py-3 text-neutral-400">{p.input_tokens?.toLocaleString()}</td>
-                <td className="px-6 py-3 text-neutral-400">{p.output_tokens?.toLocaleString()}</td>
-                <td className="px-6 py-3 text-neutral-200 font-mono">${Number(p.estimated_cost_usd).toFixed(6)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {/* Chart stub */}
-      <div className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-8 text-center">
-        <p className="text-sm text-neutral-500">Spend chart — <span className="text-neutral-400">Coming soon in Phase 2.</span></p>
-      </div>
+    <div className="space-y-6">
+      <PageHeader title="Costs" subtitle="Estimated spend over the last 30 days, grouped by provider, model and key." />
+      <ErrorBanner message={error} onRetry={() => reload()} />
+      {loading && !data ? <Card><Loading /></Card> : (
+        <>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Card className="p-4"><p className="mb-1 text-xs text-neutral-400">Estimated total</p><p className="text-2xl font-bold text-white">${total.toFixed(4)}</p></Card>
+            <Card className="p-4"><p className="mb-1 text-xs text-neutral-400">Requests</p><p className="text-2xl font-bold text-white">{requests.toLocaleString()}</p></Card>
+          </div>
+          <Card>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <caption className="sr-only">Costs by provider, model and key</caption>
+                <thead>
+                  <tr className="border-b border-neutral-800">
+                    {['Provider', 'Model', 'Key', 'Requests', 'Input tokens', 'Output tokens', 'Est. cost'].map((h) => <th key={h} scope="col" className={thCls}>{h}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r, i) => (
+                    <tr key={i} className="border-b border-neutral-800/50">
+                      <td className={tdCls}>{r.provider ?? '—'}</td>
+                      <td className={`${tdCls} font-mono text-xs`}>{r.canonical_model ?? r.model ?? '—'}</td>
+                      <td className={tdCls}>{r.key_label ?? '—'}</td>
+                      <td className={tdCls}>{num(r.request_count ?? r.requests).toLocaleString()}</td>
+                      <td className={tdCls}>{num(r.input_tokens).toLocaleString()}</td>
+                      <td className={tdCls}>{num(r.output_tokens).toLocaleString()}</td>
+                      <td className={`${tdCls} font-mono`}>${num(r.estimated_cost_usd).toFixed(6)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {!error && rows.length === 0 && <EmptyState title="No cost data yet" hint="Costs appear after requests are served." />}
+          </Card>
+        </>
+      )}
     </div>
   );
 }

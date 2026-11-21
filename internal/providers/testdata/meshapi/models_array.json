@@ -1,0 +1,10 @@
+[
+  {"id":"mistral/mistral-7b-instruct-v0","name":"Mistral 7B Instruct","context_length":32768,"is_free":false,"model_type":"text","supports_completions_api":true,"supports_responses_api":false,"supports_tools":true,"input_modalities":["text"],"output_modalities":["text"]},
+  {"id":"openai/gpt-5-pro","name":"GPT-5 Pro","context_length":400000,"is_free":false,"model_type":"text","supports_completions_api":false,"supports_responses_api":true,"supports_tools":true,"input_modalities":["text"],"output_modalities":["text"]},
+  {"id":"openai/text-embedding-3-large","name":"Embedding 3 Large","context_length":8191,"is_free":false,"model_type":"embedding","supports_completions_api":false,"supports_embeddings":true,"input_modalities":["text"],"output_modalities":["embedding"]},
+  {"id":"openai/dall-e-3","name":"DALL-E 3","context_length":null,"context_window":4000,"is_free":false,"model_type":"image","supports_completions_api":false,"input_modalities":["text"],"output_modalities":["image"]},
+  {"id":"google/veo-3","name":"Veo 3","is_free":false,"model_type":"video","supports_completions_api":false,"input_modalities":["text"],"output_modalities":["video"]},
+  {"id":"openai/whisper-1","name":"Whisper","is_free":false,"model_type":"audio","supports_completions_api":false,"input_modalities":["audio"],"output_modalities":["text"]},
+  {"id":"mesh/judge-1","name":"Judge","is_free":true,"model_type":"evaluation","supports_completions_api":false,"input_modalities":["text"],"output_modalities":["text"]},
+  {"id":"","name":"no id","model_type":"text"}
+]

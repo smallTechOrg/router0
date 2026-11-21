@@ -1,23 +1,24 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Self-contained server output for the Docker/Cloud Run image.
+  output: 'standalone',
   async rewrites() {
+    const go = process.env.ROUTER_BASE_URL || 'http://localhost:8080';
     return [
-      // Explicit Go API paths — avoids accidentally capturing /api/auth/* which
-      // must be handled locally by the NextAuth route handler.
-      { source: '/api/keys', destination: 'http://localhost:8080/api/keys' },
-      { source: '/api/keys/:path*', destination: 'http://localhost:8080/api/keys/:path*' },
-      { source: '/api/pool', destination: 'http://localhost:8080/api/pool' },
-      { source: '/api/requests', destination: 'http://localhost:8080/api/requests' },
-      { source: '/api/costs', destination: 'http://localhost:8080/api/costs' },
-      { source: '/admin/provider-keys', destination: 'http://localhost:8080/admin/provider-keys' },
-      { source: '/admin/provider-keys/:path*', destination: 'http://localhost:8080/admin/provider-keys/:path*' },
-      { source: '/admin/models', destination: 'http://localhost:8080/admin/models' },
-      { source: '/admin/discovery', destination: 'http://localhost:8080/admin/discovery' },
-      { source: '/admin/:path*', destination: 'http://localhost:8080/admin/:path*' },
-      { source: '/v1/:path*', destination: 'http://localhost:8080/v1/:path*' },
-      // Go auth endpoints — prefixed /go/auth/* to avoid conflict with Next.js /auth/* pages
-      { source: '/go/auth/:path*', destination: 'http://localhost:8080/auth/:path*' },
-      { source: '/api/me', destination: 'http://localhost:8080/auth/me' },
+      // Explicit Go API paths. Avoids capturing /api/auth/*, which is handled
+      // locally by the NextAuth route handler.
+      { source: '/api/tokens/:path*', destination: `${go}/api/tokens/:path*` },
+      { source: '/api/providers', destination: `${go}/api/providers` },
+      { source: '/api/keys/:path*', destination: `${go}/api/keys/:path*` },
+      { source: '/api/routing/:path*', destination: `${go}/api/routing/:path*` },
+      { source: '/api/catalog/:path*', destination: `${go}/api/catalog/:path*` },
+      { source: '/api/requests/:path*', destination: `${go}/api/requests/:path*` },
+      { source: '/api/costs', destination: `${go}/api/costs` },
+      { source: '/api/me', destination: `${go}/auth/me` },
+      { source: '/admin/:path*', destination: `${go}/admin/:path*` },
+      { source: '/v1/:path*', destination: `${go}/v1/:path*` },
+      // Go auth endpoints are prefixed /go/auth/* to avoid the Next.js /auth/* pages.
+      { source: '/go/auth/:path*', destination: `${go}/auth/:path*` },
     ];
   },
 };

@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"time"
+	"strings"
 )
 
 type OpenRouterProvider struct{}
+
+func init() { Register(&OpenRouterProvider{}) }
 
 func (p *OpenRouterProvider) Name() string { return "openrouter" }
 
@@ -19,50 +21,65 @@ func (p *OpenRouterProvider) baseURL() string {
 	return envOrDef("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 }
 
+// headers are OpenRouter's app-attribution headers.
 func (p *OpenRouterProvider) headers() map[string]string {
 	return map[string]string{
-		"HTTP-Referer": "https://zer0-router.local",
-		"X-Title":      "Zer0 Router",
+		"HTTP-Referer": "https://router0.local",
+		"X-Title":      "router0",
 	}
+}
+
+// Classify applies OpenRouter-specific rules on top of the generic ones.
+func (p *OpenRouterProvider) Classify(status int, h http.Header, body []byte) *ProviderError {
+	// A 200 response (or SSE event) carrying {"error":{"code":<int>,...}} is
+	// classified using the numeric code as the HTTP status.
+	if status >= 200 && status < 300 {
+		if eb := parseErrBody(body); eb.Present && eb.CodeNum >= 400 {
+			pe := p.Classify(eb.CodeNum, h, body)
+			return pe
+		}
+		return Classify(status, h, body)
+	}
+	pe := Classify(status, h, body)
+	switch status {
+	case http.StatusPaymentRequired:
+		pe.Class = ErrorClassInsufficientCredit
+	case http.StatusForbidden: // input flagged by moderation
+		pe.Class = ErrorClassBadRequest
+	case http.StatusBadGateway, http.StatusServiceUnavailable:
+		pe.Class = ErrorClassTransient
+	}
+	return pe
 }
 
 func (p *OpenRouterProvider) Complete(ctx context.Context, req *ChatRequest, apiKey string) (*ChatResponse, error) {
-	return doOpenAIComplete(ctx, p.baseURL(), apiKey, req, p.headers())
+	return doOpenAIComplete(ctx, p.baseURL(), apiKey, req, p.headers(), p)
 }
 
 func (p *OpenRouterProvider) Stream(ctx context.Context, req *ChatRequest, apiKey string) (<-chan ChatChunk, error) {
-	return doOpenAIStream(ctx, p.baseURL(), apiKey, req, p.headers())
+	return doOpenAIStream(ctx, p.baseURL(), apiKey, req, p.headers(), p)
 }
 
 func (p *OpenRouterProvider) HealthCheck(ctx context.Context, apiKey string) (*HealthResult, error) {
-	return doOpenAIHealthCheck(ctx, p.baseURL(), apiKey, "openai/gpt-oss-20b:free", p.headers())
+	return doOpenAIHealthCheck(ctx, p.baseURL(), apiKey, "openai/gpt-oss-20b:free", p.headers(), p)
 }
 
 func (p *OpenRouterProvider) ProbeModel(ctx context.Context, apiKey, model string) (*HealthResult, error) {
-	return doOpenAIProbeModel(ctx, p.baseURL(), apiKey, model, p.headers())
+	return doOpenAIProbeModel(ctx, p.baseURL(), apiKey, model, p.headers(), p)
 }
 
-// ListModels queries OpenRouter's model catalog — it returns pricing natively.
+// ListModels queries OpenRouter's model catalog (paid and :free), which returns pricing natively.
 func (p *OpenRouterProvider) ListModels(ctx context.Context, apiKey string) ([]ModelInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://openrouter.ai/api/v1/models", nil)
+	b, err := doGetJSON(ctx, strings.TrimRight(p.baseURL(), "/")+"/models", bearer(apiKey, p.headers()), p)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("HTTP-Referer", "https://zer0-router.local")
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
 	var result struct {
 		Data []struct {
-			ID          string `json:"id"`
-			Name        string `json:"name"`
-			ContextLen  int    `json:"context_length"`
-			Pricing     struct {
+			ID         string `json:"id"`
+			Name       string `json:"name"`
+			ContextLen int    `json:"context_length"`
+			Pricing    struct {
 				Prompt     string `json:"prompt"`
 				Completion string `json:"completion"`
 			} `json:"pricing"`
@@ -71,31 +88,28 @@ func (p *OpenRouterProvider) ListModels(ctx context.Context, apiKey string) ([]M
 			} `json:"top_provider"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+	if err := json.Unmarshal(b, &result); err != nil {
+		return nil, &ProviderError{Class: ErrorClassTransient, Code: "invalid_response", Message: "unparseable model list"}
 	}
 
-	// Only include :free-tier models — paid models require credits and are inaccessible
-	// on free-tier keys. OpenRouter marks free models with a ":free" suffix in the ID.
-	models := make([]ModelInfo, 0)
+	models := make([]ModelInfo, 0, len(result.Data))
 	for _, m := range result.Data {
-		if len(m.ID) < 5 || m.ID[len(m.ID)-5:] != ":free" {
+		if m.ID == "" {
 			continue
 		}
 		paramB, arch := LookupModelMeta(m.ID)
-		info := ModelInfo{
+		models = append(models, ModelInfo{
 			ID:                m.ID,
 			DisplayName:       m.Name,
 			ContextWindow:     m.ContextLen,
 			MaxOutputTokens:   m.TopProvider.MaxCompletionTokens,
-			SupportsStreaming:  true,
+			SupportsStreaming: true,
 			InputCostPerMTok:  parseMillionPrice(m.Pricing.Prompt),
 			OutputCostPerMTok: parseMillionPrice(m.Pricing.Completion),
 			ParameterCountB:   paramB,
 			Architecture:      arch,
 			Extra:             map[string]any{},
-		}
-		models = append(models, info)
+		})
 	}
 	return models, nil
 }

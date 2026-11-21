@@ -1,0 +1,4 @@
+data: {"id":"s5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"ping"}}]},"finish_reason":"stop"}]}
+
+data: [DONE]
+

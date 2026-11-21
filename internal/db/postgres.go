@@ -3,6 +3,8 @@ package db
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
@@ -15,6 +17,15 @@ func NewPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("db: parse dsn: %w", err)
+	}
+	// DB_MAX_CONNS caps the pool (e.g. a small managed Postgres with a low
+	// connection limit). Unset keeps pgx's default.
+	if v := os.Getenv("DB_MAX_CONNS"); v != "" {
+		n, convErr := strconv.Atoi(v)
+		if convErr != nil || n < 1 {
+			return nil, fmt.Errorf("db: DB_MAX_CONNS must be a positive integer, got %q", v)
+		}
+		cfg.MaxConns = int32(n)
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)

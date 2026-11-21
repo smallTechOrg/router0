@@ -1,141 +1,119 @@
 # Capability: Provider Adapters
 
+Phase 1: Groq and OpenRouter (OpenAI-compatible) hardened, with classification, usage in streams, and configurable base URLs. Phase 2: Anthropic (native Messages API), Gemini (tool-calling conformance), Mesh API by Fiesta Labs ("AI Fiesta Agent Mesh"; portal app.meshapi.ai). Existing NVIDIA, Together, and Baseten adapters stay registered but are not priorities.
+
 ## What It Does
 
-Implements a common Go interface for all supported LLM providers. Each provider is a single-file plugin that translates an internal `ChatRequest` into the provider's native HTTP request format, executes the call (with streaming SSE support), and translates the response back into the internal `ChatResponse` format. New providers are added by implementing the interface and registering the file — no changes to core routing logic.
+Translates router0's internal `ChatRequest` into each provider's wire format, performs the HTTP call (streaming or not), translates responses and stream chunks back to OpenAI shape, lists models for the catalog, and classifies failures.
 
 ## Inputs
 
-| Input | Type | Source | Required |
-|-------|------|---------|----------|
-| Internal `ChatRequest` | Go struct | Routing Engine / request handler | Yes |
-| Decrypted provider API key | String (in-memory only) | Key Management (AES-decrypt at call time) | Yes |
-| `context.Context` with deadline | Go context | Request handler | Yes |
+| Input | Source |
+|-------|--------|
+| `*providers.ChatRequest` (model = provider_model_id, messages, tools, tool_choice, stream, params) | Routing executor |
+| Decrypted API key (parameter) | Executor attempt func |
+| Base URL env var (read per call) | Environment / tests |
 
 ## Outputs
 
-| Output | Type | Destination |
-|--------|------|-------------|
-| Streaming SSE channel or `io.ReadCloser` | Go channel / reader | Routing Engine → HTTP response writer |
-| `ChatResponse` (non-streaming) | Go struct | Routing Engine (for metadata recording) |
-| Provider error with classification | `ProviderError` struct | Routing Engine (for retry/hedge decision) |
+| Output | Destination |
+|--------|-------------|
+| `*ChatResponse` (content, tool_calls, finish_reason, usage) | Inference handler |
+| `<-chan ChatChunk` (content delta, tool_call deltas, finish_reason, usage, or `Err`) | Inference handler |
+| `[]ModelInfo` | Catalog discovery |
+| `*ProviderError` | Routing executor |
 
 ## External Calls
 
-| System | Operation | On Failure |
-|--------|-----------|------------|
-| Google AI Studio API | `POST https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent` | Return `ProviderError{Class: ErrClassProviderError}` |
-| Groq Cloud API | `POST https://api.groq.com/openai/v1/chat/completions` (OpenAI-compat) | Return `ProviderError` |
-| OpenRouter API | `POST https://openrouter.ai/api/v1/chat/completions` (OpenAI-compat) | Return `ProviderError` |
-| NVIDIA NIM API | `POST https://integrate.api.nvidia.com/v1/chat/completions` (OpenAI-compat) | Return `ProviderError` |
-| Together AI API | `POST https://api.together.xyz/v1/chat/completions` (OpenAI-compat) | Return `ProviderError` |
-| Baseten API | `POST https://model-<id>.api.baseten.co/production/predict` | Return `ProviderError` |
+| Provider | id | Base URL (env) | Auth | Chat | Models |
+|----------|----|----------------|------|------|--------|
+| Groq | `groq` | `GROQ_BASE_URL` = `https://api.groq.com/openai/v1` | `Authorization: Bearer` | `POST /chat/completions` | `GET /models` |
+| OpenRouter | `openrouter` | `OPENROUTER_BASE_URL` = `https://openrouter.ai/api/v1` | Bearer + `HTTP-Referer: https://router0.local`, `X-Title: router0` | `POST /chat/completions` | `GET /models` |
+| Anthropic (P2) | `anthropic` | `ANTHROPIC_BASE_URL` = `https://api.anthropic.com/v1` | `x-api-key`, `anthropic-version: 2023-06-01` | `POST /messages` | `GET /models?limit=1000` (paginate `after_id`) |
+| Gemini (P2) | `google` (alias `gemini`) | `GOOGLE_BASE_URL` = `https://generativelanguage.googleapis.com` | Bearer on `/v1beta/openai/*`; `?key=` on native list | `POST /v1beta/openai/chat/completions` | `GET /v1beta/models` |
+| Mesh API (P2) | `meshapi` (aliases `aifiesta`, `mesh`) | `MESHAPI_BASE_URL` = `https://api.meshapi.ai/v1` | `Authorization: Bearer rsk_…` | `POST /chat/completions` | `GET /models` |
+
+All calls: on failure → `Classify` (error-classification.md). Response bodies of failed calls are read up to 64 KiB.
+
+Assumed: Gemini keeps the provider id `google` so existing key rows need no data migration; the UI labels it "Gemini" and the header override accepts `gemini`.
+
+Mesh API facts taken from the user's copy of Mesh's docs: base URL `https://api.meshapi.ai/v1`, `POST /v1/chat/completions` with `Authorization: Bearer rsk_…`, `Content-Type: application/json`, an OpenAI-style body, and vendor-prefixed model ids, e.g. `{"model":"mistral/mistral-7b-instruct-v0","messages":[{"role":"user","content":"Hello!"}]}`. Everything else below is Assumed and covered by fixtures so a wrong guess is a one-line fix.
 
 ## Business Rules
 
-### Provider Interface
-
-Every adapter implements:
+### Interface (extended, existing methods kept)
 
 ```go
 type Provider interface {
     Name() string
-    Models() []string
-    Complete(ctx context.Context, req *ChatRequest, key string) (*ChatResponse, error)
-    Stream(ctx context.Context, req *ChatRequest, key string) (<-chan StreamChunk, error)
-    Probe(ctx context.Context, key string) (*ProbeResult, error)
+    Complete(ctx context.Context, req *ChatRequest, apiKey string) (*ChatResponse, error)
+    Stream(ctx context.Context, req *ChatRequest, apiKey string) (<-chan ChatChunk, error)
+    HealthCheck(ctx context.Context, apiKey string) (*HealthResult, error)
+    DefaultModels() []string
+    ListModels(ctx context.Context, apiKey string) ([]ModelInfo, error)
 }
+type Classifier interface { Classify(status int, h http.Header, body []byte) *ProviderError }  // optional
 ```
 
-- `Name()` returns the canonical provider identifier string (matches `provider_keys.provider` column).
-- `Models()` returns the list of model slugs this adapter supports.
-- `Complete()` is the non-streaming path.
-- `Stream()` opens a streaming SSE connection and returns a channel that emits `StreamChunk` values; the channel is closed when the stream ends or the context is cancelled.
-- `Probe()` sends a minimal-token request (prompt: "hi", max_tokens: 1) and returns latency + status.
+`ChatRequest` gains `TopP *float64`, `ResponseFormat any`, `Seed *int`, `User string`. `Temperature` becomes `*float64`, so that `0` is forwarded and not dropped by `omitempty` (a current bug). `ChatChunk` gains `Usage *Usage`, `Err *ProviderError`, and tool-call deltas carry `Index`. `ToolCall` gains `Index *int` for streaming.
 
-### Supported Providers and Models (Phase 1)
+### Phase 1 — OpenAI-compatible core (`openai_compat.go`)
 
-| Provider | Canonical Name | Models |
-|----------|---------------|--------|
-| Google AI Studio | `google` | `gemini-1.5-flash`, `gemini-1.5-pro` |
-| Groq Cloud | `groq` | `llama-3.1-70b-versatile`, `mixtral-8x7b-32768` |
-| OpenRouter | `openrouter` | All models available under the user's OpenRouter key (aggregator) |
-| NVIDIA NIM | `nvidia` | `meta/llama-3.1-70b-instruct`, `meta/llama-3.1-8b-instruct` |
-| Together AI | `together` | `meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo`, `mistralai/Mixtral-8x7B-Instruct-v0.1` |
-| Baseten | `baseten` | Model IDs are user-configured at key registration time (not hardcoded) |
+- All non-2xx responses go through `Classify` (adapter's `Classifier` if implemented, else generic). The current ad-hoc 429/401/5xx mapping is replaced.
+- Network errors produce a `transient` `ProviderError`, not a bare `error`.
+- Timeouts come from the caller's context (the executor sets them). The hard-coded `http.Client{Timeout: 15s}` is removed, and one shared `http.Transport` with keep-alive is reused across calls.
+- Streaming: send `stream_options: {"include_usage": true}`; parse `usage` from the final chunk into `ChatChunk.Usage`. Parse tool-call deltas with `index`. An SSE line `data: {"error":…}` → chunk with `Err` (classified). Scanner buffer raised to 1 MiB (long tool-argument lines).
+- `tools`, `tool_choice`, assistant `tool_calls`, `tool` role messages with `tool_call_id`, and `content: null` on tool-calling assistant messages are forwarded unchanged.
+- `ListModels` uses the configured base URL for every provider (fixes OpenRouter's hard-coded URL and removes its `:free`-only filter).
+- Registration: each adapter registers in its own file's `init()`; `ValidProviders()` returns the sorted registry keys.
 
-### Streaming SSE
+### Phase 2 — Anthropic native (`anthropic.go`, `anthropic_translate.go`, `anthropic_stream.go`)
 
-- The adapter opens an HTTP/1.1 persistent connection to the provider and reads SSE data lines.
-- Each `data: {…}` line is parsed into a `StreamChunk{Delta string, FinishReason string, InputTokens int, OutputTokens int}`.
-- The adapter emits each chunk on the returned channel immediately — no buffering.
-- On `data: [DONE]` or context cancellation, the channel is closed.
-- Token counts are accumulated from the final chunk's `usage` field (or summed from streaming deltas where the provider supplies per-chunk counts).
+Request translation (OpenAI → Anthropic Messages):
 
-### Error Classification
+| OpenAI | Anthropic |
+|--------|-----------|
+| `system` / `developer` messages | concatenated into top-level `system` (string), in order |
+| `user` string content | `{"role":"user","content":[{"type":"text","text":…}]}` |
+| `assistant` content + `tool_calls[]` | `{"role":"assistant","content":[{"type":"text",…}?, {"type":"tool_use","id":tc.id,"name":tc.function.name,"input":<JSON-parsed arguments>}…]}`; unparseable arguments → `400 bad_request` before calling (not failover-worthy, but failover still proceeds per brief) |
+| `tool` messages (`tool_call_id`, content) | `{"type":"tool_result","tool_use_id":…,"content":…}` blocks; consecutive tool messages merged into one `user` message |
+| Consecutive same-role messages | merged (Anthropic requires alternation) |
+| `tools[]` (`type:function`) | `{"name","description","input_schema": parameters or {"type":"object","properties":{}}}` |
+| `tool_choice` `"auto"` / `"none"` / `"required"` / `{"type":"function","function":{"name":X}}` | `{"type":"auto"}` / `{"type":"none"}` / `{"type":"any"}` / `{"type":"tool","name":X}` |
+| `parallel_tool_calls: false` | `tool_choice.disable_parallel_tool_use: true` |
+| `max_tokens` (absent) | required by Anthropic; default `4096`. Assumed |
+| `temperature` | clamped to [0, 1]. Assumed |
+| `stop` | `stop_sequences` |
+| `top_p` | `top_p` |
 
-`ProviderError` carries a `Class` field:
+Response translation: `text` blocks are concatenated into `message.content`; `tool_use` blocks → `tool_calls[{id, type:"function", function:{name, arguments: JSON-encoded input}}]`. `stop_reason`: `end_turn`/`stop_sequence` → `stop`, `max_tokens` → `length`, `tool_use` → `tool_calls`. `usage.input_tokens`/`output_tokens` → `prompt_tokens`/`completion_tokens`.
 
-| Class | Meaning | Routing Engine action |
-|-------|---------|----------------------|
-| `ErrClassRateLimit` | Provider returned 429; user key exhausted | Mark key rate-limited; do not select for the exhausted window |
-| `ErrClassProviderThrottle` | Provider blocked at platform/IP level (not key-specific) | Mark provider globally throttled; skip all keys for this provider |
-| `ErrClassAuth` | 401/403 — key is invalid or revoked | Set key `status = error`; remove from pool |
-| `ErrClassTimeout` | Context deadline exceeded before first byte | Count toward p95 latency; eligible for retry |
-| `ErrClassUpstream` | 5xx from provider | Count toward error rate; eligible for retry |
-| `ErrClassUnknown` | Any other error | Count toward error rate; eligible for retry |
+Streaming translation: `message_start` → first chunk with `role: assistant` (also prompt-token usage). `content_block_start` (tool_use) → `tool_calls[{index:i, id, type, function:{name, arguments:""}}]`. `content_block_delta` `text_delta` → `content`; `input_json_delta` → `tool_calls[{index:i, function:{arguments: partial_json}}]`. `message_delta` → `finish_reason` + output usage. `message_stop` → done. `ping` is ignored. `error` event → `Err`. Tool-call `index` counts tool_use blocks only, starting at 0.
 
-### Rate-Limit Header Parsing
+### Phase 2 — Gemini (`google.go`)
 
-Adapters for OpenAI-compatible providers (Groq, OpenRouter, NVIDIA, Together) must parse these response headers when present and return them in `ChatResponse.RateLimitHints`:
+Kept on Google's OpenAI-compatible endpoint (extend, not rewrite). Phase 2 adds a conformance test suite against mock and optional real keys: tools, `tool_choice`, multiple tool calls in one response, tool-result round trip, and streaming tool calls. It also adds fixes that normalise compat-layer quirks (missing tool-call ids → generate `call_<n>`; array-wrapped error bodies; `content: null`). `ListModels` uses native `GET /v1beta/models` and returns every listed model with its `supportedGenerationMethods`; the catalog decides the kind (model-catalog.md › Model kinds), so image, TTS, music, computer-use, and robotics models do not reach `/v1/models`. Assumed: Google's OpenAI-compatible endpoint supports function calling well enough; if the conformance suite finds an unfixable gap, the slice switches only the failing path to native `generateContent` translation, inside `google.go`.
 
-- `x-ratelimit-remaining-requests`
-- `x-ratelimit-remaining-tokens`
-- `x-ratelimit-reset-requests`
-- `x-ratelimit-reset-tokens`
+### Phase 2 — Mesh API (`meshapi.go`)
 
-Google AI Studio uses `x-goog-quota-remaining`. NVIDIA NIM uses `x-ratelimit-remaining-requests`. Baseten does not expose rate-limit headers; use probe-only health assessment.
+Thin adapter over `openai_compat.go` in `internal/providers/meshapi.go`, self-registered under id `meshapi`; `registry.go` maps the aliases `aifiesta` and `mesh` to it (so `X-Router0-Providers: aifiesta`, `POST /api/keys {"provider":"mesh"}` work; the stored and returned id is always `meshapi`). Assumed: the aliases are a convenience; the user calls the product "AI Fiesta Agent Mesh".
 
-### Google AI Studio Adapter
-
-Google's API uses a different request/response schema from OpenAI. The adapter translates:
-- `messages` array → `contents` array (roles `user`/`assistant` → `user`/`model`)
-- `max_tokens` → `generationConfig.maxOutputTokens`
-- Response `candidates[0].content.parts[0].text` → `message.content`
-- Streaming uses `?alt=sse` query param and returns SSE lines.
-
-### Baseten Adapter
-
-Baseten model IDs are deployment-specific. The `provider_keys` record for Baseten stores the model ID in an additional `model_id` column set at key registration. The adapter constructs the endpoint URL as `https://model-{model_id}.api.baseten.co/production/predict`. The request/response schema is OpenAI-compatible for Baseten-hosted models.
-
-### OpenRouter Adapter
-
-OpenRouter accepts any model slug via the `model` field. When the user's request specifies `model: "auto"` or omits the model, the adapter passes through the OpenRouter-selected model. The `X-OpenRouter-Model-Used` response header is captured and reported in `ChatResponse.ActualModel`.
-
-### Adapter Registration
-
-Adapters are registered at process startup in `internal/providers/registry.go`:
-
-```go
-var registry = map[string]Provider{
-    "google":      &GoogleProvider{},
-    "groq":        &GroqProvider{},
-    "openrouter":  &OpenRouterProvider{},
-    "nvidia":      &NvidiaProvider{},
-    "together":    &TogetherProvider{},
-    "baseten":     &BasetenProvider{},
-}
-```
-
-Adding a new provider: implement the interface, add one file under `internal/providers/`, add one line to the registry map.
+- Base URL read per call from `MESHAPI_BASE_URL` (default `https://api.meshapi.ai/v1`), mirroring `GROQ_BASE_URL` / `OPENROUTER_BASE_URL`; tests point it at the `:9905` mock or an `httptest` server. Chat URL `{base}/chat/completions`; model list URL `{base}/models`.
+- Auth: `Authorization: Bearer <key>`. Keys look like `rsk_…` (key hint `rsk_xxxx…`). No other required headers. Assumed: optional attribution headers are not needed; router0 sends none.
+- Model ids are sent exactly as discovered (vendor-prefixed, e.g. `mistral/mistral-7b-instruct-v0`); the catalog stores that string as `provider_model_id` and the canonical name is derived by stripping the prefix and normalising (model-catalog.md fixture rows).
+- `ListModels`: `GET {base}/models`, parsed as the OpenAI list shape `{"data":[{"id":…}]}`. Assumed: Mesh returns that shape; pricing/context fields are read when present and left NULL otherwise.
+- Streaming, tool calls, `tool_choice`, and `stream_options.include_usage` are passed through unchanged. Assumed: Mesh forwards them to the underlying vendor like OpenRouter does. If a model behind Mesh rejects `stream_options` with a 400, the adapter retries that one attempt once without it (a `meshapi.go`-local fallback; usage is then estimated as unknown and logged `NULL`). Assumed.
+- Mesh may front non-chat models; the catalog's kind classification filters them from `/v1/models`.
+- Classification: generic rules, no `Classifier` override until Mesh's error shapes are verified (error-classification.md).
 
 ## Success Criteria
 
-- [ ] `GroqProvider.Stream()` with a valid Groq API key and prompt "count to 3" returns at least 3 `StreamChunk` values on the channel and the channel closes without error.
-- [ ] `GoogleProvider.Complete()` with a valid Google AI Studio key and prompt "say hi" returns a non-empty `ChatResponse.Message.Content` and `InputTokens > 0`.
-- [ ] `GroqProvider.Probe()` with a valid key returns `ProbeResult{OK: true, LatencyMs: <N>}` with N < 5000.
-- [ ] An intentionally invalid API key passed to any adapter's `Complete()` returns a `ProviderError` with `Class = ErrClassAuth`.
-- [ ] A request to Groq with a deliberately exhausted key (mocked 429 response in unit test) returns `ProviderError{Class: ErrClassRateLimit}`.
-- [ ] The Google adapter correctly maps `messages: [{role:"user", content:"hello"}]` to `contents: [{role:"user", parts:[{text:"hello"}]}]` — verified by an integration test that asserts a non-error response.
-- [ ] `OpenRouterProvider.Stream()` streams at least one chunk and the `ChatResponse.ActualModel` is non-empty.
-- [ ] Cancelling the context passed to `Stream()` causes the channel to close within 200 ms.
+- [ ] Phase 1 unit (httptest): Groq and OpenRouter `Complete` and `Stream` produce the expected `ChatResponse`/chunks, including tool-call deltas with indices and the final usage chunk.
+- [ ] Phase 1 unit: `temperature: 0` is present in the upstream JSON body.
+- [ ] Phase 1 unit: OpenRouter `ListModels` hits `OPENROUTER_BASE_URL/models` and returns paid and `:free` models.
+- [ ] Phase 1 unit: a 16 KB single SSE line (large tool arguments) is parsed.
+- [ ] Phase 2 unit: Anthropic translation golden tests: (a) system + user; (b) assistant with 2 tool_calls + 2 tool results → one assistant message with 2 `tool_use` blocks and one user message with 2 `tool_result` blocks; (c) every `tool_choice` mapping; (d) response with text + tool_use → OpenAI message with `content` and `tool_calls`, `finish_reason: tool_calls`.
+- [ ] Phase 2 unit: recorded Anthropic SSE fixture with text then a tool_use whose JSON arrives in 3 `input_json_delta`s → OpenAI chunks whose concatenated `arguments` parse to the original object.
+- [ ] Phase 2 unit (Mesh): request goes to `POST {MESHAPI_BASE_URL}/chat/completions` with `Authorization: Bearer rsk_…` and the vendor-prefixed `model` unchanged; `ListModels` parses a fixture listing containing `mistral/mistral-7b-instruct-v0`; a streamed tool-call fixture yields indexed deltas and a final usage chunk; alias `aifiesta` resolves to `meshapi` in `providers.CanonicalName`.
+- [ ] Phase 2 integration (tool calling, the user's priority): an OpenAI-SDK-style agent loop (tools → `tool_calls` → `tool` message → final answer; parallel calls; two rounds; non-stream and stream) through router0 to the mock Groq, OpenRouter, Anthropic, Gemini, and Mesh servers gives the same final OpenAI-shaped output on every flavour (`TestPhase2_AgentLoopToolCalling`, `TestPhase2_AgentLoopToolCallingStream`).
+- [ ] Phase 2 smoke (optional, real keys; Gemini is the priority): the same tool-calling conversation, non-stream and stream, succeeds against real Gemini, Anthropic, and Mesh API when `TEST_ANTHROPIC_KEY` / `TEST_GEMINI_KEY` / `TEST_MESHAPI_KEY` are set.

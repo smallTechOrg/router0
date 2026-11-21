@@ -1,322 +1,389 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/zer0-router/zer0/internal/auth"
-	"github.com/zer0-router/zer0/internal/routing"
 )
 
-type PoolHandler struct {
-	pgPool      *pgxpool.Pool
-	routingPool *routing.Pool
+// RequestLogHandler serves the org-scoped request log and cost endpoints.
+type RequestLogHandler struct {
+	db *pgxpool.Pool
 }
 
-func NewPoolHandler(pg *pgxpool.Pool, routingPool *routing.Pool) *PoolHandler {
-	return &PoolHandler{pgPool: pg, routingPool: routingPool}
+func NewRequestLogHandler(db *pgxpool.Pool) *RequestLogHandler {
+	return &RequestLogHandler{db: db}
 }
 
-func (h *PoolHandler) GetPool(w http.ResponseWriter, r *http.Request) {
-	userID := auth.UserIDFromCtx(r.Context())
-
-	// Load scored combos from Redis directly so scores are real
-	ctx := r.Context()
-	type comboJSON struct {
-		Provider      string  `json:"provider"`
-		Model         string  `json:"model"`
-		ProviderKeyID string  `json:"provider_key_id"`
-		Score         float64 `json:"score"`
-		Pool          string  `json:"pool"`
-	}
-
-	loadScoredFromRedis := func(redisKey, poolLabel string) []comboJSON {
-		members, err := h.routingPool.Redis().ZRevRangeWithScores(ctx, redisKey, 0, -1).Result()
-		if err != nil {
-			return []comboJSON{}
-		}
-		out := make([]comboJSON, 0, len(members))
-		for _, m := range members {
-			if m.Score == 0 {
-				continue
-			}
-			memberStr := m.Member.(string)
-			lastColon := strings.LastIndex(memberStr, ":")
-			if lastColon <= 0 {
-				continue
-			}
-			keyID := memberStr[lastColon+1:]
-			rest := memberStr[:lastColon]
-			firstColon := strings.Index(rest, ":")
-			if firstColon <= 0 {
-				continue
-			}
-			out = append(out, comboJSON{
-				Provider:      rest[:firstColon],
-				Model:         rest[firstColon+1:],
-				ProviderKeyID: keyID,
-				Score:         m.Score,
-				Pool:          poolLabel,
-			})
-		}
-		return out
-	}
-
-	pro := loadScoredFromRedis("pool:"+userID+":pro", "pro")
-	flash := loadScoredFromRedis("pool:"+userID+":flash", "flash")
-	flashLite := loadScoredFromRedis("pool:"+userID+":flash-lite", "flash-lite")
-
-	// Per-model analytics from request_metadata (last 10 minutes only)
-	statsRows, _ := h.pgPool.Query(ctx, `
-		SELECT provider, model,
-			COUNT(*) AS total_reqs,
-			COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS reqs_1h,
-			COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS reqs_24h,
-			ROUND(AVG(latency_ms)) AS avg_latency_ms,
-			ROUND(AVG(latency_ms) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour')) AS avg_latency_1h,
-			SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) AS errors,
-			SUM(input_tokens + output_tokens) AS total_tokens,
-			MAX(created_at) AS last_seen
-		FROM request_metadata
-		WHERE user_id = $1 AND pool != 'perf_test' AND created_at > NOW() - INTERVAL '10 minutes'
-		GROUP BY provider, model`, userID)
-
-	type modelStats struct {
-		Provider      string  `json:"provider"`
-		Model         string  `json:"model"`
-		TotalReqs     int64   `json:"total_reqs"`
-		Reqs1h        int64   `json:"reqs_1h"`
-		Reqs24h       int64   `json:"reqs_24h"`
-		AvgLatencyMs  *int64  `json:"avg_latency_ms"`
-		AvgLatency1h  *int64  `json:"avg_latency_1h"`
-		Errors        int64   `json:"errors"`
-		TotalTokens   int64   `json:"total_tokens"`
-		LastSeen      string  `json:"last_seen"`
-	}
-	var stats []modelStats
-	if statsRows != nil {
-		defer statsRows.Close()
-		for statsRows.Next() {
-			var s modelStats
-			var lastSeen time.Time
-			if statsRows.Scan(&s.Provider, &s.Model, &s.TotalReqs, &s.Reqs1h, &s.Reqs24h,
-				&s.AvgLatencyMs, &s.AvgLatency1h, &s.Errors, &s.TotalTokens, &lastSeen) == nil {
-				s.LastSeen = lastSeen.Format(time.RFC3339)
-				stats = append(stats, s)
-			}
-		}
-	}
-	if stats == nil {
-		stats = []modelStats{}
-	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"pro":         pro,
-		"flash":       flash,
-		"flash_lite":  flashLite,
-		"model_stats": stats,
-	})
+type trailEntry struct {
+	Order      int     `json:"order"`
+	Provider   string  `json:"provider"`
+	KeyLabel   *string `json:"key_label"`
+	Outcome    string  `json:"outcome"`
+	Class      *string `json:"class,omitempty"`
+	HTTPStatus *int    `json:"http_status,omitempty"`
+	SkipReason *string `json:"skip_reason,omitempty"`
+	RetryAfter *int    `json:"retry_after_s,omitempty"`
+	ErrorCode  *string `json:"error_code,omitempty"`
+	LatencyMs  int     `json:"latency_ms"`
 }
 
+type requestItem struct {
+	RequestID        string       `json:"request_id"`
+	CreatedAt        string       `json:"created_at"`
+	TokenName        *string      `json:"token_name"`
+	CanonicalModel   string       `json:"canonical_model"`
+	Provider         string       `json:"provider"`
+	ProviderModelID  string       `json:"provider_model_id"`
+	KeyLabel         *string      `json:"key_label"`
+	Status           string       `json:"status"`
+	HTTPStatus       *int         `json:"http_status"`
+	ErrorCode        *string      `json:"error_code"`
+	Stream           bool         `json:"stream"`
+	LatencyMs        int          `json:"latency_ms"`
+	InputTokens      int          `json:"input_tokens"`
+	OutputTokens     int          `json:"output_tokens"`
+	EstimatedCostUSD float64      `json:"estimated_cost_usd"`
+	AttemptCount     int          `json:"attempt_count"`
+	Trail            []trailEntry `json:"trail"`
+}
 
-func (h *PoolHandler) GetRequests(w http.ResponseWriter, r *http.Request) {
-	userID := auth.UserIDFromCtx(r.Context())
-	limitStr := r.URL.Query().Get("limit")
-	limit := 50
-	if limitStr != "" {
-		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 50 {
-			limit = l
-		}
-	}
+type requestFilter struct {
+	Model    string
+	Provider string
+	Status   string
+	TokenID  string
+	Since    *time.Time // created_at >= Since
+	Until    *time.Time // created_at < Until
+	Before   *time.Time // cursor: created_at < Before
+	Limit    int
+}
 
-	rows, err := h.pgPool.Query(r.Context(),
-		`SELECT id, COALESCE(zer0_request_id,''), provider, model, COALESCE(pool,'flash'),
-		 input_tokens, output_tokens, latency_ms,
-		 COALESCE(estimated_cost_usd, cost_usd, 0), status, COALESCE(retry_count,0), created_at,
-		 COALESCE(error_class,''), COALESCE(error_message,'')
-		 FROM request_metadata
-		 WHERE user_id = $1
-		 ORDER BY created_at DESC
-		 LIMIT $2`,
-		userID, limit,
-	)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to fetch requests")
-		return
-	}
+type pgQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+const requestSelect = `
+SELECT rm.zer0_request_id, rm.created_at, st.name,
+       COALESCE(rm.canonical_model, rm.model), rm.provider, rm.model, rm.provider_key_label,
+       rm.status, rm.http_status::int, rm.error_code, rm.stream,
+       rm.latency_ms, rm.input_tokens, rm.output_tokens, rm.estimated_cost_usd::float8,
+       rm.attempt_count::int
+FROM request_metadata rm
+LEFT JOIN service_tokens st ON st.id = rm.service_token_id AND st.org_id = rm.org_id
+`
+
+func scanRequests(rows pgx.Rows) ([]requestItem, error) {
 	defer rows.Close()
-
-	type reqJSON struct {
-		ID              string  `json:"id"`
-		Zer0RequestID   string  `json:"zer0_request_id"`
-		Provider        string  `json:"provider"`
-		Model           string  `json:"model"`
-		Pool            string  `json:"pool"`
-		InputTokens     int     `json:"input_tokens"`
-		OutputTokens    int     `json:"output_tokens"`
-		LatencyMs       int64   `json:"latency_ms"`
-		EstimatedCostUSD float64 `json:"estimated_cost_usd"`
-		Status          string  `json:"status"`
-		RetryCount      int     `json:"retry_count"`
-		CreatedAt       string  `json:"created_at"`
-		ErrorClass      string  `json:"error_class,omitempty"`
-		ErrorMessage    string  `json:"error_message,omitempty"`
-	}
-
-	var requests []reqJSON
+	items := []requestItem{}
 	for rows.Next() {
-		var req reqJSON
-		var createdAt time.Time
-		if err := rows.Scan(&req.ID, &req.Zer0RequestID, &req.Provider, &req.Model, &req.Pool,
-			&req.InputTokens, &req.OutputTokens, &req.LatencyMs, &req.EstimatedCostUSD,
-			&req.Status, &req.RetryCount, &createdAt, &req.ErrorClass, &req.ErrorMessage); err != nil {
+		var it requestItem
+		var created time.Time
+		var rid *string
+		if err := rows.Scan(&rid, &created, &it.TokenName, &it.CanonicalModel, &it.Provider,
+			&it.ProviderModelID, &it.KeyLabel, &it.Status, &it.HTTPStatus, &it.ErrorCode, &it.Stream,
+			&it.LatencyMs, &it.InputTokens, &it.OutputTokens, &it.EstimatedCostUSD, &it.AttemptCount); err != nil {
+			return nil, err
+		}
+		if rid != nil {
+			it.RequestID = *rid
+		}
+		it.CreatedAt = created.UTC().Format(time.RFC3339Nano)
+		it.Trail = []trailEntry{}
+		items = append(items, it)
+	}
+	return items, rows.Err()
+}
+
+// attachTrails loads attempts for the given requests (org-scoped) in one query.
+func attachTrails(ctx context.Context, db pgQuerier, orgID string, items []requestItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(items))
+	idx := make(map[string]*requestItem, len(items))
+	for i := range items {
+		if items[i].RequestID == "" {
 			continue
 		}
-		req.CreatedAt = createdAt.Format(time.RFC3339)
-		requests = append(requests, req)
+		ids = append(ids, items[i].RequestID)
+		idx[items[i].RequestID] = &items[i]
 	}
-	if requests == nil {
-		requests = []reqJSON{}
+	if len(ids) == 0 {
+		return nil
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"requests": requests})
-}
-
-func (h *PoolHandler) GetCosts(w http.ResponseWriter, r *http.Request) {
-	userID := auth.UserIDFromCtx(r.Context())
-	now := time.Now().UTC()
-	monthStr := now.Format("2006-01")
-
-	rows, err := h.pgPool.Query(r.Context(),
-		`SELECT provider, COUNT(*) as request_count, 
-		 SUM(input_tokens) as input_tokens, SUM(output_tokens) as output_tokens,
-		 SUM(COALESCE(estimated_cost_usd, cost_usd, 0)) as total_cost
-		 FROM request_metadata
-		 WHERE user_id = $1 AND date_trunc('month', created_at) = date_trunc('month', NOW())
-		 GROUP BY provider`,
-		userID,
-	)
+	rows, err := db.Query(ctx, `
+		SELECT zer0_request_id, attempt_order::int, provider, provider_key_label, outcome,
+		       error_class, http_status::int, skip_reason, retry_after_s, provider_error_code, latency_ms
+		FROM request_attempts
+		WHERE org_id = $1 AND zer0_request_id = ANY($2)
+		ORDER BY zer0_request_id, attempt_order, created_at, id`, orgID, ids)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to fetch costs")
-		return
+		return err
 	}
 	defer rows.Close()
-
-	type costJSON struct {
-		Provider         string  `json:"provider"`
-		RequestCount     int64   `json:"request_count"`
-		InputTokens      int64   `json:"input_tokens"`
-		OutputTokens     int64   `json:"output_tokens"`
-		EstimatedCostUSD float64 `json:"estimated_cost_usd"`
+	for rows.Next() {
+		var rid string
+		var e trailEntry
+		if err := rows.Scan(&rid, &e.Order, &e.Provider, &e.KeyLabel, &e.Outcome, &e.Class,
+			&e.HTTPStatus, &e.SkipReason, &e.RetryAfter, &e.ErrorCode, &e.LatencyMs); err != nil {
+			return err
+		}
+		if it, ok := idx[rid]; ok {
+			it.Trail = append(it.Trail, e)
+		}
 	}
+	return rows.Err()
+}
 
-	var byProvider []costJSON
+// listRequests runs the org-scoped, filtered, keyset-paginated query.
+// next is non-empty when more rows exist.
+func listRequests(ctx context.Context, db pgQuerier, orgID string, f requestFilter) (items []requestItem, next string, err error) {
+	if f.Limit <= 0 || f.Limit > 200 {
+		f.Limit = 50
+	}
+	args := []any{orgID}
+	where := "WHERE rm.org_id = $1"
+	add := func(cond string, v any) {
+		args = append(args, v)
+		where += " AND " + replaceN(cond, len(args))
+	}
+	if f.Model != "" {
+		add("COALESCE(rm.canonical_model, rm.model) = $N", f.Model)
+	}
+	if f.Provider != "" {
+		add("rm.provider = $N", f.Provider)
+	}
+	if f.Status != "" {
+		add("rm.status = $N", f.Status)
+	}
+	if f.TokenID != "" {
+		add("rm.service_token_id = $N::uuid", f.TokenID)
+	}
+	if f.Since != nil {
+		add("rm.created_at >= $N", *f.Since)
+	}
+	if f.Until != nil {
+		add("rm.created_at < $N", *f.Until)
+	}
+	if f.Before != nil {
+		add("rm.created_at < $N", *f.Before)
+	}
+	args = append(args, f.Limit+1)
+	q := requestSelect + where + " ORDER BY rm.created_at DESC, rm.id DESC LIMIT $" + strconv.Itoa(len(args))
+	rows, err := db.Query(ctx, q, args...)
+	if err != nil {
+		return nil, "", err
+	}
+	items, err = scanRequests(rows)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(items) > f.Limit {
+		items = items[:f.Limit]
+		next = items[len(items)-1].CreatedAt
+	}
+	if err := attachTrails(ctx, db, orgID, items); err != nil {
+		return nil, "", err
+	}
+	return items, next, nil
+}
+
+func replaceN(s string, n int) string {
+	out := make([]byte, 0, len(s)+3)
+	for i := 0; i < len(s); i++ {
+		if s[i] == '$' && i+1 < len(s) && s[i+1] == 'N' {
+			out = append(out, '$')
+			out = strconv.AppendInt(out, int64(n), 10)
+			i++
+			continue
+		}
+		out = append(out, s[i])
+	}
+	return string(out)
+}
+
+func getRequest(ctx context.Context, db pgQuerier, orgID, requestID string) (*requestItem, error) {
+	rows, err := db.Query(ctx, requestSelect+"WHERE rm.org_id = $1 AND rm.zer0_request_id = $2 LIMIT 1", orgID, requestID)
+	if err != nil {
+		return nil, err
+	}
+	items, err := scanRequests(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	if err := attachTrails(ctx, db, orgID, items); err != nil {
+		return nil, err
+	}
+	return &items[0], nil
+}
+
+func parseTime(s string) (*time.Time, error) {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+func (h *RequestLogHandler) ListRequests(w http.ResponseWriter, r *http.Request) {
+	orgID := auth.OrgIDFromCtx(r.Context())
+	if orgID == "" {
+		writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_token", "Missing organization context")
+		return
+	}
+	q := r.URL.Query()
+	f := requestFilter{
+		Model:    q.Get("model"),
+		Provider: q.Get("provider"),
+		Status:   q.Get("status"),
+		TokenID:  q.Get("token_id"),
+		Limit:    50,
+	}
+	if f.TokenID == "" {
+		f.TokenID = q.Get("token")
+	}
+	bad := func(msg string) {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_parameter", msg)
+	}
+	if f.Status != "" && f.Status != "success" && f.Status != "error" {
+		bad("status must be success or error")
+		return
+	}
+	if f.TokenID != "" && !isUUID(f.TokenID) {
+		bad("token_id must be a UUID")
+		return
+	}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			bad("limit must be a positive integer")
+			return
+		}
+		if n > 200 {
+			n = 200
+		}
+		f.Limit = n
+	}
+	for name, dst := range map[string]**time.Time{"before": &f.Before, "since": &f.Since, "until": &f.Until} {
+		if v := q.Get(name); v != "" {
+			t, err := parseTime(v)
+			if err != nil {
+				bad(name + " must be an RFC3339 timestamp")
+				return
+			}
+			*dst = t
+		}
+	}
+	items, next, err := listRequests(r.Context(), h.db, orgID, f)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "db_error", "Failed to fetch requests")
+		return
+	}
+	var nb any
+	if next != "" {
+		nb = next
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"requests": items, "next_before": nb})
+}
+
+func (h *RequestLogHandler) GetRequest(w http.ResponseWriter, r *http.Request) {
+	orgID := auth.OrgIDFromCtx(r.Context())
+	if orgID == "" {
+		writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_token", "Missing organization context")
+		return
+	}
+	it, err := getRequest(r.Context(), h.db, orgID, chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "db_error", "Failed to fetch request")
+		return
+	}
+	if it == nil {
+		writeError(w, http.StatusNotFound, "invalid_request_error", "not_found", "Request not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, it)
+}
+
+type costRow struct {
+	Provider         string  `json:"provider"`
+	CanonicalModel   string  `json:"canonical_model"`
+	KeyLabel         *string `json:"key_label"`
+	RequestCount     int64   `json:"request_count"`
+	InputTokens      int64   `json:"input_tokens"`
+	OutputTokens     int64   `json:"output_tokens"`
+	EstimatedCostUSD float64 `json:"estimated_cost_usd"`
+}
+
+func costs(ctx context.Context, db pgQuerier, orgID string) ([]costRow, float64, error) {
+	rows, err := db.Query(ctx, `
+		SELECT provider, COALESCE(canonical_model, model), provider_key_label,
+		       COUNT(*), COALESCE(SUM(input_tokens),0)::bigint, COALESCE(SUM(output_tokens),0)::bigint,
+		       COALESCE(SUM(estimated_cost_usd),0)::float8
+		FROM request_metadata
+		WHERE org_id = $1 AND created_at >= NOW() - INTERVAL '30 days'
+		GROUP BY provider, COALESCE(canonical_model, model), provider_key_label
+		ORDER BY 7 DESC, 1, 2`, orgID)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := []costRow{}
 	var total float64
 	for rows.Next() {
-		var c costJSON
-		if err := rows.Scan(&c.Provider, &c.RequestCount, &c.InputTokens, &c.OutputTokens, &c.EstimatedCostUSD); err != nil {
-			continue
+		var c costRow
+		if err := rows.Scan(&c.Provider, &c.CanonicalModel, &c.KeyLabel, &c.RequestCount,
+			&c.InputTokens, &c.OutputTokens, &c.EstimatedCostUSD); err != nil {
+			return nil, 0, err
 		}
 		total += c.EstimatedCostUSD
-		byProvider = append(byProvider, c)
+		out = append(out, c)
 	}
-	if byProvider == nil {
-		byProvider = []costJSON{}
+	return out, total, rows.Err()
+}
+
+func (h *RequestLogHandler) GetCosts(w http.ResponseWriter, r *http.Request) {
+	orgID := auth.OrgIDFromCtx(r.Context())
+	if orgID == "" {
+		writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_token", "Missing organization context")
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"month":                    monthStr,
-		"by_provider":              byProvider,
+	rows, total, err := costs(r.Context(), h.db, orgID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "db_error", "Failed to fetch costs")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"window_days":              30,
+		"costs":                    rows,
 		"total_estimated_cost_usd": total,
 	})
 }
 
-func (h *PoolHandler) GetAttempts(w http.ResponseWriter, r *http.Request) {
-	userID := auth.UserIDFromCtx(r.Context())
-
-	rows, err := h.pgPool.Query(r.Context(), `
-		SELECT provider, model,
-			COUNT(*) AS total,
-			SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
-			SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
-			ROUND(AVG(latency_ms)) AS avg_latency_ms,
-			mode() WITHIN GROUP (ORDER BY error_class) FILTER (WHERE error_class IS NOT NULL) AS top_error_class,
-			MAX(created_at) AS last_seen
-		FROM request_attempts
-		WHERE user_id = $1 AND created_at > NOW() - INTERVAL '10 minutes'
-		GROUP BY provider, model
-		ORDER BY errors DESC, total DESC`, userID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to fetch attempts")
-		return
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
 	}
-	defer rows.Close()
-
-	type attemptStat struct {
-		Provider      string `json:"provider"`
-		Model         string `json:"model"`
-		Total         int64  `json:"total"`
-		Successes     int64  `json:"successes"`
-		Errors        int64  `json:"errors"`
-		AvgLatencyMs  *int64 `json:"avg_latency_ms"`
-		TopErrorClass *string `json:"top_error_class"`
-		LastSeen      string `json:"last_seen"`
-	}
-
-	var stats []attemptStat
-	for rows.Next() {
-		var s attemptStat
-		var lastSeen time.Time
-		if rows.Scan(&s.Provider, &s.Model, &s.Total, &s.Successes, &s.Errors,
-			&s.AvgLatencyMs, &s.TopErrorClass, &lastSeen) == nil {
-			s.LastSeen = lastSeen.Format(time.RFC3339)
-			stats = append(stats, s)
+	for i := 0; i < 36; i++ {
+		c := s[i]
+		switch {
+		case i == 8 || i == 13 || i == 18 || i == 23:
+			if c != '-' {
+				return false
+			}
+		case (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'):
+		default:
+			return false
 		}
 	}
-	if stats == nil {
-		stats = []attemptStat{}
-	}
-
-	// Recent individual errors for detail view
-	errRows, err := h.pgPool.Query(r.Context(), `
-		SELECT zer0_request_id, provider, model, error_class, error_message, http_status, latency_ms, created_at
-		FROM request_attempts
-		WHERE user_id = $1 AND status = 'error' AND created_at > NOW() - INTERVAL '10 minutes'
-		ORDER BY created_at DESC
-		LIMIT 50`, userID)
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"attempt_stats": stats, "recent_errors": []struct{}{}})
-		return
-	}
-	defer errRows.Close()
-
-	type recentError struct {
-		Zer0RequestID string  `json:"zer0_request_id"`
-		Provider      string  `json:"provider"`
-		Model         string  `json:"model"`
-		ErrorClass    *string `json:"error_class"`
-		ErrorMessage  *string `json:"error_message"`
-		HTTPStatus    *int    `json:"http_status"`
-		LatencyMs     int64   `json:"latency_ms"`
-		CreatedAt     string  `json:"created_at"`
-	}
-	var recentErrors []recentError
-	for errRows.Next() {
-		var e recentError
-		var createdAt time.Time
-		if errRows.Scan(&e.Zer0RequestID, &e.Provider, &e.Model, &e.ErrorClass, &e.ErrorMessage,
-			&e.HTTPStatus, &e.LatencyMs, &createdAt) == nil {
-			e.CreatedAt = createdAt.Format(time.RFC3339)
-			recentErrors = append(recentErrors, e)
-		}
-	}
-	if recentErrors == nil {
-		recentErrors = []recentError{}
-	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"attempt_stats": stats,
-		"recent_errors": recentErrors,
-	})
+	return true
 }

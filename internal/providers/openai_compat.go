@@ -7,22 +7,76 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 )
 
+// sharedTransport is reused by every adapter call (keep-alive pooling). There is
+// deliberately no client-level timeout: the caller bounds each attempt via ctx.
+var sharedTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          200,
+	MaxIdleConnsPerHost:   32,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: time.Second,
+}
+
+var sharedClient = &http.Client{Transport: sharedTransport}
+
+const (
+	sseScannerBuf   = 1 << 20  // 1 MiB max SSE line
+	maxResponseBody = 32 << 20 // cap for non-stream success bodies
+)
+
 // openAICompletionReq is the wire format sent to OpenAI-compatible APIs.
 type openAICompletionReq struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
-	Temperature float64       `json:"temperature,omitempty"`
-	Stream      bool          `json:"stream"`
-	Stop        []string      `json:"stop,omitempty"`
-	Tools       []Tool        `json:"tools,omitempty"`
-	ToolChoice  any           `json:"tool_choice,omitempty"`
+	Model          string         `json:"model"`
+	Messages       []ChatMessage  `json:"messages"`
+	MaxTokens      int            `json:"max_tokens,omitempty"`
+	Temperature    *float64       `json:"temperature,omitempty"`
+	TopP           *float64       `json:"top_p,omitempty"`
+	Seed           *int           `json:"seed,omitempty"`
+	User           string         `json:"user,omitempty"`
+	Stream         bool           `json:"stream"`
+	StreamOptions  *streamOptions `json:"stream_options,omitempty"`
+	Stop           []string       `json:"stop,omitempty"`
+	Tools          []Tool         `json:"tools,omitempty"`
+	ToolChoice     any            `json:"tool_choice,omitempty"`
+	ResponseFormat any            `json:"response_format,omitempty"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+func buildWireReq(req *ChatRequest, stream bool) openAICompletionReq {
+	w := openAICompletionReq{
+		Model:          req.Model,
+		Messages:       req.Messages,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		TopP:           req.TopP,
+		Seed:           req.Seed,
+		User:           req.User,
+		Stream:         stream,
+		Stop:           req.Stop,
+		Tools:          req.Tools,
+		ToolChoice:     req.ToolChoice,
+		ResponseFormat: req.ResponseFormat,
+	}
+	if stream {
+		w.StreamOptions = &streamOptions{IncludeUsage: true}
+	}
+	return w
 }
 
 type openAIChoice struct {
@@ -42,6 +96,7 @@ type openAIResponse struct {
 	Model   string         `json:"model"`
 	Choices []openAIChoice `json:"choices"`
 	Usage   openAIUsage    `json:"usage"`
+	Cost    float64        `json:"cost"`
 }
 
 func parseRateLimitHeaders(h http.Header) *RateLimitHeaders {
@@ -81,51 +136,72 @@ func envOrDef(key, def string) string {
 	return def
 }
 
-func doOpenAIComplete(ctx context.Context, baseURL, apiKey string, req *ChatRequest, extraHeaders map[string]string) (*ChatResponse, error) {
-	body, err := json.Marshal(openAICompletionReq{
-		Model:       req.Model,
-		Messages:    req.Messages,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stream:      false,
-		Stop:        req.Stop,
-		Tools:       req.Tools,
-		ToolChoice:  req.ToolChoice,
-	})
+func newChatRequest(ctx context.Context, baseURL, apiKey string, wire openAICompletionReq, extraHeaders map[string]string) (*http.Request, error) {
+	body, err := json.Marshal(wire)
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	if wire.Stream {
+		httpReq.Header.Set("Accept", "text/event-stream")
+	}
 	for k, v := range extraHeaders {
 		httpReq.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(httpReq)
+	return httpReq, nil
+}
+
+// doRequest sends the request; transport failures are classified (nil,err).
+// A cancelled ctx yields the raw context error.
+func doRequest(ctx context.Context, httpReq *http.Request) (*http.Response, error) {
+	resp, err := sharedClient.Do(httpReq)
 	if err != nil {
-		return nil, &ProviderError{Class: ErrorClassTimeout, Message: err.Error()}
+		if pe, cancelled := TransportError(ctx, err); !cancelled {
+			return nil, pe
+		}
+		return nil, context.Canceled
+	}
+	return resp, nil
+}
+
+// failureFromResponse classifies a non-2xx response and closes the body.
+func failureFromResponse(resp *http.Response, cls Classifier) *ProviderError {
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+	return classifyWith(cls, resp.StatusCode, resp.Header, b)
+}
+
+func doOpenAIComplete(ctx context.Context, baseURL, apiKey string, req *ChatRequest, extraHeaders map[string]string, cls Classifier) (*ChatResponse, error) {
+	httpReq, err := newChatRequest(ctx, baseURL, apiKey, buildWireReq(req, false), extraHeaders)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := doRequest(ctx, httpReq)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, failureFromResponse(resp, cls)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == 429 {
-		return nil, &ProviderError{Class: ErrorClassRateLimit, Message: "rate limit", HTTP: 429}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+	if err != nil {
+		if pe, cancelled := TransportError(ctx, err); !cancelled {
+			return nil, pe
+		}
+		return nil, context.Canceled
 	}
-	if resp.StatusCode == 401 {
-		return nil, &ProviderError{Class: ErrorClassAuthError, Message: "auth error", HTTP: 401}
-	}
-	if resp.StatusCode >= 500 {
-		return nil, &ProviderError{Class: ErrorClassUpstream, Message: fmt.Sprintf("provider returned %d", resp.StatusCode), HTTP: resp.StatusCode}
-	}
-	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, &ProviderError{Class: ErrorClassUpstream, Message: string(b), HTTP: resp.StatusCode}
+	if pe := classify200(cls, resp.Header, raw); pe != nil {
+		return nil, pe
 	}
 	var r openAIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-		return nil, err
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return nil, &ProviderError{Class: ErrorClassTransient, HTTP: resp.StatusCode, Code: "invalid_response", Message: "provider returned an unparseable response"}
 	}
 	var content string
 	var toolCalls []ToolCall
@@ -145,72 +221,52 @@ func doOpenAIComplete(ctx context.Context, baseURL, apiKey string, req *ChatRequ
 		ToolCalls:    toolCalls,
 		FinishReason: finishReason,
 		Usage:        Usage{PromptTokens: r.Usage.PromptTokens, CompletionTokens: r.Usage.CompletionTokens, TotalTokens: r.Usage.TotalTokens},
+		Cost:         r.Cost,
 		RateLimit:    parseRateLimitHeaders(resp.Header),
 	}, nil
 }
 
-func doOpenAIStream(ctx context.Context, baseURL, apiKey string, req *ChatRequest, extraHeaders map[string]string) (<-chan ChatChunk, error) {
-	body, err := json.Marshal(openAICompletionReq{
-		Model:       req.Model,
-		Messages:    req.Messages,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		Stream:      true,
-		Stop:        req.Stop,
-		Tools:       req.Tools,
-		ToolChoice:  req.ToolChoice,
-	})
+// doOpenAIStream opens the SSE stream. Errors before the stream starts are
+// returned as *ProviderError. Errors after it starts arrive as ChatChunk.Err.
+func doOpenAIStream(ctx context.Context, baseURL, apiKey string, req *ChatRequest, extraHeaders map[string]string, cls Classifier) (<-chan ChatChunk, error) {
+	httpReq, err := newChatRequest(ctx, baseURL, apiKey, buildWireReq(req, true), extraHeaders)
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/chat/completions", bytes.NewReader(body))
+	resp, err := doRequest(ctx, httpReq)
 	if err != nil {
 		return nil, err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
-	httpReq.Header.Set("Accept", "text/event-stream")
-	for k, v := range extraHeaders {
-		httpReq.Header.Set(k, v)
-	}
-	// ResponseHeaderTimeout bounds connection+headers to 12s without affecting body reads.
-	// Once streaming starts the body is read until ctx is cancelled or stream ends.
-	streamClient := &http.Client{
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: 12 * time.Second,
-		},
-	}
-	resp, err := streamClient.Do(httpReq)
-	if err != nil {
-		return nil, &ProviderError{Class: ErrorClassTimeout, Message: err.Error()}
-	}
-	if resp.StatusCode == 429 {
-		resp.Body.Close()
-		return nil, &ProviderError{Class: ErrorClassRateLimit, Message: "rate limit", HTTP: 429}
-	}
-	if resp.StatusCode == 401 {
-		resp.Body.Close()
-		return nil, &ProviderError{Class: ErrorClassAuthError, Message: "auth error", HTTP: 401}
-	}
-	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		return nil, &ProviderError{Class: ErrorClassUpstream, Message: string(b), HTTP: resp.StatusCode}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, failureFromResponse(resp, cls)
 	}
 
 	ch := make(chan ChatChunk, 64)
+	send := func(c ChatChunk) bool {
+		select {
+		case ch <- c:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
 	go func() {
 		defer resp.Body.Close()
 		defer close(ch)
 		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64<<10), sseScannerBuf)
 		for scanner.Scan() {
 			line := scanner.Text()
-			if !strings.HasPrefix(line, "data: ") {
+			data, ok := strings.CutPrefix(line, "data:")
+			if !ok {
 				continue
 			}
-			data := strings.TrimPrefix(line, "data: ")
+			data = strings.TrimSpace(data)
+			if data == "" {
+				continue
+			}
 			if data == "[DONE]" {
-				ch <- ChatChunk{Done: true, Raw: "data: [DONE]"}
+				send(ChatChunk{Done: true, Raw: "data: [DONE]"})
 				return
 			}
 			var chunk struct {
@@ -220,47 +276,63 @@ func doOpenAIStream(ctx context.Context, baseURL, apiKey string, req *ChatReques
 					Delta        ChatMessage `json:"delta"`
 					FinishReason string      `json:"finish_reason"`
 				} `json:"choices"`
+				Usage *openAIUsage    `json:"usage"`
+				Error json.RawMessage `json:"error"`
 			}
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 				continue
 			}
-			var content string
-			var toolCalls []ToolCall
-			var finishReason string
-			if len(chunk.Choices) > 0 {
-				content = chunk.Choices[0].Delta.Content
-				toolCalls = chunk.Choices[0].Delta.ToolCalls
-				finishReason = chunk.Choices[0].FinishReason
+			if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+				send(ChatChunk{Err: classifyWith(cls, http.StatusOK, resp.Header, []byte(data)), Raw: line})
+				return
 			}
-			select {
-			case ch <- ChatChunk{ID: chunk.ID, Model: chunk.Model, Content: content, ToolCalls: toolCalls, FinishReason: finishReason, Raw: line}:
-			case <-ctx.Done():
+			out := ChatChunk{ID: chunk.ID, Model: chunk.Model, Raw: line}
+			if len(chunk.Choices) > 0 {
+				out.Content = chunk.Choices[0].Delta.Content
+				out.ToolCalls = chunk.Choices[0].Delta.ToolCalls
+				out.FinishReason = chunk.Choices[0].FinishReason
+			}
+			if chunk.Usage != nil {
+				out.Usage = &Usage{PromptTokens: chunk.Usage.PromptTokens, CompletionTokens: chunk.Usage.CompletionTokens, TotalTokens: chunk.Usage.TotalTokens}
+			}
+			if !send(out) {
 				return
 			}
 		}
+		if ctx.Err() != nil {
+			return
+		}
+		// Reached EOF (or a read error) without [DONE]: interrupted stream.
+		code := "stream_interrupted"
+		if err := scanner.Err(); err != nil {
+			code = "stream_read_error"
+		}
+		send(ChatChunk{Err: &ProviderError{Class: ErrorClassTransient, Code: code, Message: "upstream stream ended unexpectedly"}})
 	}()
 	return ch, nil
 }
 
 // doOpenAIProbeModel tests a specific model by sending a 1-token completion.
-func doOpenAIProbeModel(ctx context.Context, baseURL, apiKey, model string, extraHeaders map[string]string) (*HealthResult, error) {
-	return doOpenAIHealthCheck(ctx, baseURL, apiKey, model, extraHeaders)
+func doOpenAIProbeModel(ctx context.Context, baseURL, apiKey, model string, extraHeaders map[string]string, cls Classifier) (*HealthResult, error) {
+	return doOpenAIHealthCheck(ctx, baseURL, apiKey, model, extraHeaders, cls)
 }
 
-func doOpenAIHealthCheck(ctx context.Context, baseURL, apiKey, model string, extraHeaders map[string]string) (*HealthResult, error) {
+func doOpenAIHealthCheck(ctx context.Context, baseURL, apiKey, model string, extraHeaders map[string]string, cls Classifier) (*HealthResult, error) {
 	start := time.Now()
 	req := &ChatRequest{
 		Model:     model,
 		Messages:  []ChatMessage{{Role: "user", Content: "1"}},
 		MaxTokens: 1,
 	}
-	resp, err := doOpenAIComplete(ctx, baseURL, apiKey, req, extraHeaders)
+	hctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	resp, err := doOpenAIComplete(hctx, baseURL, apiKey, req, extraHeaders, cls)
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
 		if pe, ok := err.(*ProviderError); ok {
 			return &HealthResult{OK: false, LatencyMs: latency, Error: string(pe.Class)}, nil
 		}
-		return &HealthResult{OK: false, LatencyMs: latency, Error: err.Error()}, nil
+		return &HealthResult{OK: false, LatencyMs: latency, Error: fmt.Sprintf("%T", err)}, nil
 	}
 	return &HealthResult{OK: true, LatencyMs: latency, RateLimit: resp.RateLimit}, nil
 }

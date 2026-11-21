@@ -28,7 +28,7 @@ export default function LoginPage() {
       <div className="w-full max-w-md">
         <div className="mb-8 text-center">
           <span className="text-3xl font-bold tracking-tight text-white">
-            Zer0<span className="text-indigo-400"> Router</span>
+            router<span className="text-indigo-400">0</span>
           </span>
           <p className="mt-2 text-sm text-neutral-400">Sign in to your dashboard</p>
         </div>

@@ -1,0 +1,6 @@
+data: {"id":"s4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"get_weather","arguments":"{\"city\":"}}]}}]}
+
+data: {"id":"s4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"get_weather","arguments":"\"Oslo\"}"}}]},"finish_reason":"stop"}]}
+
+data: [DONE]
+

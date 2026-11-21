@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,21 +15,89 @@ import (
 	"github.com/zer0-router/zer0/internal/auth"
 	"github.com/zer0-router/zer0/internal/keys"
 	"github.com/zer0-router/zer0/internal/providers"
-	"github.com/zer0-router/zer0/internal/routing"
 )
 
-type KeysHandler struct {
-	keyRepo  *keys.Repository
-	pool     *routing.Pool
-	pgPool   *pgxpool.Pool
+// Discoverer triggers catalog discovery for an (org, provider). Satisfied by
+// catalog.Discoverer (internal/catalog).
+type Discoverer interface {
+	RefreshProvider(ctx context.Context, orgID, provider string) (int, error)
 }
 
-func NewKeysHandler(pg *pgxpool.Pool, routingPool *routing.Pool) *KeysHandler {
-	return &KeysHandler{
-		keyRepo: keys.NewRepository(pg),
-		pool:    routingPool,
-		pgPool:  pg,
+// ModelLister lists models for a provider with a raw key (no tokens spent).
+// Used by POST /api/keys/{id}/test. Errors may be *providers.ProviderError.
+type ModelLister func(ctx context.Context, provider, apiKey string) (modelCount int, err error)
+
+// KeysDeps are the injected collaborators of KeysHandler.
+type KeysDeps struct {
+	// ValidProviders returns registered provider ids (providers.ValidProviders). Required.
+	ValidProviders func() []string
+	// States reads per-key live state. Nil defaults to keys.NewPGStateReader(pg).
+	States keys.StateReader
+	// Discoverer is optional; nil disables the post-add / post-test catalog refresh.
+	Discoverer Discoverer
+	// ListModels is optional; nil defaults to the registry adapter's ListModels.
+	ListModels ModelLister
+}
+
+type KeysHandler struct {
+	repo     *keys.Repository
+	priority *keys.PriorityStore
+	deps     KeysDeps
+}
+
+func NewKeysHandler(pg *pgxpool.Pool, deps KeysDeps) *KeysHandler {
+	if deps.ValidProviders == nil {
+		deps.ValidProviders = providers.ValidProviders
 	}
+	if deps.States == nil {
+		deps.States = keys.NewPGStateReader(pg)
+	}
+	if deps.ListModels == nil {
+		deps.ListModels = func(ctx context.Context, provider, apiKey string) (int, error) {
+			p, err := providers.Get(provider)
+			if err != nil {
+				return 0, err
+			}
+			ms, err := p.ListModels(ctx, apiKey)
+			return len(ms), err
+		}
+	}
+	return &KeysHandler{
+		repo:     keys.NewRepository(pg),
+		priority: keys.NewPriorityStore(pg, deps.ValidProviders),
+		deps:     deps,
+	}
+}
+
+// Priority returns the PriorityStore backing this handler so wiring can share it.
+func (h *KeysHandler) Priority() *keys.PriorityStore { return h.priority }
+
+// providerLabels is the display-name map for GET /api/providers; unknown ids fall back to the id.
+var providerLabels = map[string]string{
+	"groq":       "Groq",
+	"openrouter": "OpenRouter",
+	"google":     "Gemini",
+	"nvidia":     "NVIDIA",
+	"together":   "Together",
+	"baseten":    "Baseten",
+	"anthropic":  "Anthropic",
+	"meshapi":    "MeshAPI",
+}
+
+func providerLabel(id string) string {
+	if l, ok := providerLabels[id]; ok {
+		return l
+	}
+	return id
+}
+
+func (h *KeysHandler) isValidProvider(p string) bool {
+	for _, v := range h.deps.ValidProviders() {
+		if v == p {
+			return true
+		}
+	}
+	return false
 }
 
 type addKeyReq struct {
@@ -38,27 +107,82 @@ type addKeyReq struct {
 	ModelID  string `json:"model_id"`
 }
 
+type keyJSON struct {
+	ID             string     `json:"id"`
+	Provider       string     `json:"provider"`
+	Label          string     `json:"label"`
+	KeyHint        string     `json:"key_hint"`
+	Position       int        `json:"position"`
+	Status         string     `json:"status"`
+	LastTestedAt   *string    `json:"last_tested_at"`
+	LastTestResult *string    `json:"last_test_result"`
+	State          *stateJSON `json:"state"`
+	CreatedAt      string     `json:"created_at"`
+}
+
+type stateJSON struct {
+	Blocked     bool     `json:"blocked"`
+	Reason      string   `json:"reason,omitempty"`
+	RetryAfterS int      `json:"retry_after_s,omitempty"`
+	Models      []string `json:"models,omitempty"`
+}
+
+func toKeyJSON(k *keys.ProviderKey, st *keys.KeyState) keyJSON {
+	kj := keyJSON{
+		ID: k.ID, Provider: k.Provider, Label: k.Label, KeyHint: k.KeyHint,
+		Position: k.Position, Status: k.Status, CreatedAt: k.CreatedAt.Format(time.RFC3339),
+	}
+	if k.LastTestedAt != nil {
+		s := k.LastTestedAt.Format(time.RFC3339)
+		kj.LastTestedAt = &s
+	}
+	if k.LastTestResult != "" {
+		r := k.LastTestResult
+		kj.LastTestResult = &r
+	}
+	if st != nil {
+		secs := int((st.RetryAfter + time.Second - 1) / time.Second)
+		kj.State = &stateJSON{Blocked: st.Blocked, Reason: st.Reason, RetryAfterS: secs, Models: st.Models}
+	}
+	return kj
+}
+
+// refreshAsync triggers catalog discovery without blocking the request; errors are non-fatal.
+func (h *KeysHandler) refreshAsync(orgID, provider string) {
+	d := h.deps.Discoverer
+	if d == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := d.RefreshProvider(ctx, orgID, provider); err != nil {
+			slog.Warn("keys: catalog refresh failed", "org_id", orgID, "provider", provider, "error", err)
+		}
+	}()
+}
+
 func (h *KeysHandler) AddKey(w http.ResponseWriter, r *http.Request) {
+	orgID := auth.OrgIDFromCtx(r.Context())
 	userID := auth.UserIDFromCtx(r.Context())
 	var req addKeyReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "validation_error", "invalid_json", "Invalid request body")
 		return
 	}
+	req.Provider = strings.TrimSpace(req.Provider)
+	req.Key = strings.TrimSpace(req.Key)
+	req.Label = strings.TrimSpace(req.Label)
 	if req.Key == "" || req.Provider == "" {
 		writeError(w, http.StatusUnprocessableEntity, "validation_error", "missing_fields", "provider and key are required")
 		return
 	}
-
-	valid := false
-	for _, p := range providers.ValidProviders() {
-		if p == req.Provider {
-			valid = true
-			break
-		}
+	if !h.isValidProvider(req.Provider) {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", "invalid_provider", "Unknown provider")
+		return
 	}
-	if !valid {
-		writeError(w, http.StatusBadRequest, "validation_error", "invalid_provider", "Invalid provider")
+	if len(req.Label) > 64 {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", "label_too_long", "label must be at most 64 characters")
 		return
 	}
 	if req.Provider == "baseten" && req.ModelID == "" {
@@ -67,24 +191,21 @@ func (h *KeysHandler) AddKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hint := req.Key
-	if len(hint) > 8 {
-		hint = hint[:8]
+	if r := []rune(hint); len(r) > 8 {
+		hint = string(r[:8])
 	}
 	hint += "…"
 
-	if req.Label == "" {
-		req.Label = req.Provider + " key"
-	}
-
 	ciphertext, nonce, err := keys.Encrypt(req.Key)
 	if err != nil {
+		slog.Error("keys: encrypt failed")
 		writeError(w, http.StatusInternalServerError, "internal_error", "encrypt_failed", "Failed to encrypt key")
 		return
 	}
 
-	k, err := h.keyRepo.Create(r.Context(), userID, req.Provider, req.Label, hint, req.ModelID, ciphertext, nonce)
+	k, err := h.repo.Create(r.Context(), orgID, userID, req.Provider, req.Label, hint, req.ModelID, ciphertext, nonce)
 	if err != nil {
-		if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
+		if errors.Is(err, keys.ErrDuplicateLabel) {
 			writeError(w, http.StatusConflict, "conflict", "key_exists", "A key with this provider and label already exists")
 			return
 		}
@@ -93,173 +214,132 @@ func (h *KeysHandler) AddKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Add combos to appropriate tier pools based on model metadata
-	prov, _ := providers.Get(req.Provider)
-	if prov != nil {
-		bgCtx := context.Background()
-		for _, model := range prov.DefaultModels() {
-			var paramB float64
-			var ctxWindow int
-			_ = h.pgPool.QueryRow(bgCtx,
-				`SELECT COALESCE(parameter_count_b,0), context_window FROM provider_models WHERE provider=$1 AND model_id=$2`,
-				req.Provider, model).Scan(&paramB, &ctxWindow)
-			if paramB <= 0 {
-				paramB = 50
-				ctxWindow = 128000
-			}
-			_ = h.pool.AddComboToAll(bgCtx, userID, req.Provider, model, k.ID, paramB, ctxWindow)
-		}
-	}
-
-	writeJSON(w, http.StatusCreated, map[string]interface{}{
-		"id":           k.ID,
-		"provider":     k.Provider,
-		"label":        k.Label,
-		"key_hint":     k.KeyHint,
-		"status":       k.Status,
-		"created_at":   k.CreatedAt.Format(time.RFC3339),
-	})
+	h.refreshAsync(orgID, k.Provider)
+	writeJSON(w, http.StatusCreated, toKeyJSON(k, nil))
 }
 
 func (h *KeysHandler) ListKeys(w http.ResponseWriter, r *http.Request) {
-	userID := auth.UserIDFromCtx(r.Context())
-	ks, err := h.keyRepo.ListByUser(r.Context(), userID)
+	orgID := auth.OrgIDFromCtx(r.Context())
+	ks, err := h.repo.ListByOrg(r.Context(), orgID)
 	if err != nil {
+		slog.Error("keys: list failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to list keys")
 		return
 	}
 
-	type keyJSON struct {
-		ID             string  `json:"id"`
-		Provider       string  `json:"provider"`
-		Label          string  `json:"label"`
-		KeyHint        string  `json:"key_hint"`
-		Status         string  `json:"status"`
-		LastTestedAt   *string `json:"last_tested_at"`
-		LastTestResult *string `json:"last_test_result"`
-		CreatedAt      string  `json:"created_at"`
+	// Sort by provider priority, then position.
+	rank := map[string]int{}
+	if order, err := h.priority.ProviderOrder(r.Context(), orgID); err == nil {
+		for i, p := range order {
+			rank[p] = i
+		}
 	}
+	sort.SliceStable(ks, func(i, j int) bool {
+		ri, rj := rank[ks[i].Provider], rank[ks[j].Provider]
+		if ri != rj {
+			return ri < rj
+		}
+		if ks[i].Provider != ks[j].Provider {
+			return ks[i].Provider < ks[j].Provider
+		}
+		return ks[i].Position < ks[j].Position
+	})
+
+	// A keystate failure degrades to state:null; the page still renders.
+	var states map[string]keys.KeyState
+	if len(ks) > 0 {
+		ids := make([]string, len(ks))
+		for i, k := range ks {
+			ids[i] = k.ID
+		}
+		var serr error
+		states, serr = h.deps.States.States(r.Context(), ids)
+		if serr != nil {
+			slog.Warn("keys: key state unavailable", "error", serr)
+			states = nil
+		}
+	}
+
 	result := make([]keyJSON, 0, len(ks))
 	for _, k := range ks {
-		kj := keyJSON{
-			ID:        k.ID,
-			Provider:  k.Provider,
-			Label:     k.Label,
-			KeyHint:   k.KeyHint,
-			Status:    k.Status,
-			CreatedAt: k.CreatedAt.Format(time.RFC3339),
+		var st *keys.KeyState
+		if states != nil {
+			s := states[k.ID] // zero value = not blocked
+			st = &s
 		}
-		if k.LastTestedAt != nil {
-			s := k.LastTestedAt.Format(time.RFC3339)
-			kj.LastTestedAt = &s
-		}
-		if k.LastTestResult != "" {
-			kj.LastTestResult = &k.LastTestResult
-		}
-		result = append(result, kj)
+		result = append(result, toKeyJSON(k, st))
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"keys": result})
 }
 
 func (h *KeysHandler) DeleteKey(w http.ResponseWriter, r *http.Request) {
-	userID := auth.UserIDFromCtx(r.Context())
-	keyID := chi.URLParam(r, "id")
-
-	k, err := h.keyRepo.GetByID(r.Context(), keyID, userID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "not_found", "key_not_found", "Key not found")
-		return
-	}
-
-	if err := h.keyRepo.Disable(r.Context(), keyID, userID); err != nil {
+	orgID := auth.OrgIDFromCtx(r.Context())
+	if err := h.repo.Disable(r.Context(), chi.URLParam(r, "id"), orgID); err != nil {
 		if errors.Is(err, keys.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", "key_not_found", "Key not found")
 			return
 		}
+		slog.Error("keys: delete failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to delete key")
 		return
 	}
-
-	// Remove from pool
-	prov, _ := providers.Get(k.Provider)
-	if prov != nil {
-		for _, model := range prov.DefaultModels() {
-			_ = h.pool.RemoveCombo(r.Context(), userID, k.Provider, model, keyID)
-		}
-	}
-
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// TestKey calls the adapter's ListModels with the key (no tokens spent).
 func (h *KeysHandler) TestKey(w http.ResponseWriter, r *http.Request) {
-	userID := auth.UserIDFromCtx(r.Context())
+	orgID := auth.OrgIDFromCtx(r.Context())
 	keyID := chi.URLParam(r, "id")
 
-	k, err := h.keyRepo.GetByID(r.Context(), keyID, userID)
+	k, err := h.repo.GetByID(r.Context(), keyID, orgID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "not_found", "key_not_found", "Key not found")
+		if errors.Is(err, keys.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "key_not_found", "Key not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to load key")
 		return
 	}
-
-	decrypted, err := keys.Decrypt(k.Ciphertext, k.Nonce)
+	plain, err := keys.Decrypt(k.Ciphertext, k.Nonce)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "decrypt_failed", "Failed to decrypt key")
 		return
 	}
 
-	prov, err := providers.Get(k.Provider)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "unknown_provider", "Unknown provider")
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	start := time.Now()
+	n, lerr := h.deps.ListModels(ctx, k.Provider, plain)
+	latency := time.Since(start).Milliseconds()
+
+	if lerr != nil {
+		// Never echo err text: provider messages / transport errors could embed key material.
+		class, msg := "transient", "Could not reach the provider or it returned an error"
+		var pe *providers.ProviderError
+		if errors.As(lerr, &pe) && pe.Class != "" {
+			class = string(pe.Class)
+			switch pe.Class {
+			case providers.ErrorClassAuth:
+				msg = "The provider rejected this key"
+			case providers.ErrorClassRateLimit:
+				msg = "The provider rate-limited the request"
+			case providers.ErrorClassInsufficientCredit:
+				msg = "The key has insufficient credits"
+			default:
+				msg = "The provider returned an error"
+			}
+		}
+		isAuth := class == string(providers.ErrorClassAuth)
+		if err := h.repo.RecordTest(r.Context(), keyID, orgID, "error:"+class, false, isAuth); err != nil {
+			slog.Error("keys: record test failed", "error", err)
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "error", "class": class, "message": msg})
 		return
 	}
 
-	result, err := prov.HealthCheck(r.Context(), decrypted)
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "error", "message": err.Error()})
-		return
+	if err := h.repo.RecordTest(r.Context(), keyID, orgID, "ok", true, false); err != nil {
+		slog.Error("keys: record test failed", "error", err)
 	}
-
-	testResult := "ok"
-	if !result.OK {
-		testResult = "error:" + result.Error
-	}
-	_ = h.keyRepo.UpdateTestResult(r.Context(), keyID, testResult)
-
-	// On auth error, zero ALL combos for this key across all discovered models
-	if !result.OK && result.Error == "auth_error" {
-		rows, _ := h.pgPool.Query(r.Context(),
-			`SELECT model_id FROM provider_models WHERE provider = $1`, k.Provider,
-		)
-		var allModels []string
-		if rows != nil {
-			for rows.Next() {
-				var m string
-				if rows.Scan(&m) == nil {
-					allModels = append(allModels, m)
-				}
-			}
-			rows.Close()
-		}
-		if prov2, _ := providers.Get(k.Provider); prov2 != nil && len(allModels) == 0 {
-			allModels = prov2.DefaultModels()
-		}
-		for _, model := range allModels {
-			for _, tier := range []routing.Tier{routing.TierFlashLite, routing.TierFlash, routing.TierPro} {
-				h.pool.UpdateScore(r.Context(), userID, k.Provider, model, keyID, tier, 0.0)
-			}
-		}
-	} else if result.OK {
-		prov2, _ := providers.Get(k.Provider)
-		if prov2 != nil {
-			for _, model := range prov2.DefaultModels() {
-				h.pool.UpdateScore(r.Context(), userID, k.Provider, model, keyID, routing.TierFlash, 0.5)
-			}
-		}
-	}
-
-	if result.OK {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "latency_ms": result.LatencyMs})
-	} else {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "error", "message": result.Error})
-	}
+	h.refreshAsync(orgID, k.Provider)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "latency_ms": latency, "model_count": n})
 }
