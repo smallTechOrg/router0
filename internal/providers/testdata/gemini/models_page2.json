@@ -1,0 +1,7 @@
+{"models":[
+{"name":"models/gemini-2.5-computer-use-preview-10-2025","displayName":"Computer Use","supportedGenerationMethods":["generateContent"]},
+{"name":"models/gemini-robotics-er-1.5-preview","displayName":"Robotics ER","supportedGenerationMethods":["generateContent"]},
+{"name":"models/text-embedding-004","displayName":"Text Embedding 004","inputTokenLimit":2048,"supportedGenerationMethods":["embedContent"]},
+{"name":"models/gemini-2.5-flash-native-audio-preview","displayName":"Native audio","supportedGenerationMethods":["bidiGenerateContent"]},
+{"name":"models/no-methods-model","displayName":"No methods"}
+],"nextPageToken":"tok3"}

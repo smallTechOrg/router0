@@ -1,0 +1,1 @@
+{"id":"r4","model":"gemini-2.5-flash","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"upstream-id-1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}}]}

@@ -1,0 +1,4 @@
+data: {"id":"s6","choices":[{"index":0,"delta":{"content":"hi"}}]}
+
+data: [{"error":{"code":429,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"7s"}]}}]
+

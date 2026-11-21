@@ -1,0 +1,4 @@
+data: {"id":"s2","model":"gemini-2.5-flash","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"function":{"name":"a","arguments":"{\"x\":1}"},"type":"function"},{"function":{"name":"b","arguments":"{\"y\":2}"},"type":"function"}]},"finish_reason":"stop"}]}
+
+data: [DONE]
+
