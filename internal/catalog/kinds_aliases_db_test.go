@@ -195,3 +195,37 @@ func TestOnDemandConcurrent(t *testing.T) {
 	}
 	_ = time.Second
 }
+
+// A provider that declares each model's type itself (Mesh model_type) is
+// authoritative over the name-pattern rules, in both directions.
+func TestProviderDeclaredKindWinsOverNameRules(t *testing.T) {
+	e := newEnv(t, "meshapi")
+	ctx := context.Background()
+	e.provs["meshapi"].set("openai/gpt-5-pro", "mesh/image-chat", "mistral/mistral-7b-instruct-v0", "openai/whisper-1", "vendor/unknown-type")
+	e.provs["meshapi"].declared = map[string]string{
+		"openai/gpt-5-pro":               "other", // name rules say chat; Mesh says not chat-completions capable
+		"mesh/image-chat":                "chat",  // name rules say image; declared chat must win
+		"mistral/mistral-7b-instruct-v0": "chat",
+		"openai/whisper-1":               "audio",
+		"vendor/unknown-type":            "", // empty declared kind: fall back to name rules
+	}
+	if _, err := e.disc.RefreshProvider(ctx, e.org, "meshapi"); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"openai/gpt-5-pro":               "other",
+		"mesh/image-chat":                "chat",
+		"mistral/mistral-7b-instruct-v0": "chat",
+		"openai/whisper-1":               "audio",
+		"vendor/unknown-type":            "chat",
+	}
+	for id, k := range want {
+		if got := kindOf(t, e, "meshapi", id); got != k {
+			t.Errorf("%s kind=%s want %s", id, got, k)
+		}
+	}
+	// A declared-other model must not be resolvable for chat.
+	if got, _ := e.res.Resolve(ctx, e.org, "gpt-5-pro"); len(got) != 0 {
+		t.Fatalf("declared-other model must not resolve: %+v", got)
+	}
+}

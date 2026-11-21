@@ -25,6 +25,8 @@ type fakeProv struct {
 	block  chan struct{}
 	// methods: model id -> Extra["methods"] (Gemini supportedGenerationMethods)
 	methods map[string][]string
+	// declared: model id -> Extra["kind"] (a provider that states each model's type itself, e.g. Mesh model_type)
+	declared map[string]string
 }
 
 func (f *fakeProv) Name() string { return f.name }
@@ -48,6 +50,12 @@ func (f *fakeProv) ListModels(ctx context.Context, apiKey string) ([]providers.M
 		mi := providers.ModelInfo{ID: id, ContextWindow: 8192}
 		if m, ok := f.methods[id]; ok {
 			mi.Extra = map[string]any{"methods": m}
+		}
+		if k, ok := f.declared[id]; ok {
+			if mi.Extra == nil {
+				mi.Extra = map[string]any{}
+			}
+			mi.Extra["kind"] = k
 		}
 		out = append(out, mi)
 	}

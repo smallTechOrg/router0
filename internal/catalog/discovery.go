@@ -136,6 +136,11 @@ func (d *Discovery) refresh(ctx context.Context, orgID, provider, source string)
 				methods = v
 			}
 			kind := ClassifyKind(provider, mi.ID, methods)
+			// A provider that declares each model's type itself (e.g. Mesh API's
+			// model_type) is authoritative over name-pattern rules.
+			if k, ok := mi.Extra["kind"].(string); ok && ValidKind(k) {
+				kind = k
+			}
 			models = append(models, Model{
 				ProviderModelID:   mi.ID,
 				Kind:              kind,

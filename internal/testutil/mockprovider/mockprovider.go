@@ -262,6 +262,32 @@ func (m *Mock) listModels(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	ids := append([]string(nil), m.models...)
 	m.mu.Unlock()
+	if m.flavour == MeshAPI {
+		// Real Mesh returns a BARE JSON ARRAY of model objects (not OpenAI's
+		// {"data":[...]} wrapper), each with its own model_type; mirror that so
+		// adapter bugs in parsing it cannot hide behind a friendlier mock.
+		arr := make([]map[string]any, 0, len(ids))
+		for _, id := range ids {
+			mt, completions := "text", true
+			switch {
+			case strings.Contains(id, "dall-e") || strings.Contains(id, "image"):
+				mt, completions = "image", false
+			case strings.Contains(id, "embed"):
+				mt, completions = "embedding", false
+			case strings.Contains(id, "whisper") || strings.Contains(id, "tts"):
+				mt, completions = "audio", false
+			}
+			arr = append(arr, map[string]any{
+				"id": id, "name": id, "context_length": 131072, "is_free": false,
+				"model_type": mt, "supports_completions_api": completions, "supports_responses_api": completions,
+				"supports_tools": completions, "supports_thinking": false,
+				"input_modalities": []string{"text"}, "output_modalities": []string{mt},
+				"pricing": map[string]any{},
+			})
+		}
+		writeJSON(w, http.StatusOK, arr)
+		return
+	}
 	data := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
 		item := map[string]any{"id": id, "object": "model", "created": 1763640000}
