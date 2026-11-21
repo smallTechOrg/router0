@@ -131,12 +131,10 @@ jobs:
             --set-env-vars "ROUTER_BASE_URL=${GATEWAY_URL},NEXTAUTH_URL=${DASH_URL}" \
             --set-secrets "NEXTAUTH_SECRET=router0-nextauth-secret:latest" \
             --quiet
-          URL=$(gcloud run services describe "${DASHBOARD_SERVICE}" --region "${REGION}" --format='value(status.url)')
-          echo "DASHBOARD_URL=${URL}" >> "$GITHUB_ENV"
-          if [ "${URL}" != "${DASH_URL}" ]; then
-            echo "::warning::Dashboard URL ${URL} differs from the assumed NEXTAUTH_URL ${DASH_URL}; updating."
-            gcloud run services update "${DASHBOARD_SERVICE}" --region "${REGION}" --update-env-vars "NEXTAUTH_URL=${URL}" --quiet
-          fi
+          # DASH_URL (project-number form) is the canonical, stable URL; the service's other
+          # run.app URL form serves the same app. The deploy SA is scoped to these two
+          # services and cannot list namespace revisions, so no follow-up `services update`.
+          echo "DASHBOARD_URL=${DASH_URL}" >> "$GITHUB_ENV"
 
       - name: Dashboard smoke test
         run: |
