@@ -39,7 +39,7 @@ the workflow reads. Existing secrets are never overwritten: **do not rotate
 
 Merge to `main` (or run **Actions → Deploy → Run workflow**). The workflow builds
 both images, deploys the gateway (migrations run on startup), smoke-tests
-`/healthz`, then builds the dashboard with the gateway URL baked in (Next bakes
+`/health`, then builds the dashboard with the gateway URL baked in (Next bakes
 proxy rewrites at build time), deploys it, smoke-tests `/auth/login`, and prints
 both URLs in the run summary.
 
