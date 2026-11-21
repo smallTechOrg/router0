@@ -95,8 +95,9 @@ jobs:
 
       - name: Gateway smoke test
         run: |
+          # /health, not /healthz: Cloud Run's front end reserves /healthz on run.app URLs.
           for i in $(seq 1 15); do
-            if curl -fsS "${GATEWAY_URL}/healthz" | tee /dev/stderr | grep -q '"status":"ok"'; then exit 0; fi
+            if curl -fsS "${GATEWAY_URL}/health" | tee /dev/stderr | grep -q '"status":"ok"'; then exit 0; fi
             sleep 4
           done
           echo "gateway did not become healthy" >&2; exit 1

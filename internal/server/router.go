@@ -124,6 +124,9 @@ func Build(d Deps) *App {
 	r.Use(middleware.Recoverer)
 
 	r.Get("/healthz", healthz(pool))
+	// Cloud Run's front end reserves /healthz on *.run.app and answers it with its own
+	// 404 page, so the same handler is also served at /health for platform smoke tests.
+	r.Get("/health", healthz(pool))
 	r.Get("/metrics", promhttp.Handler().ServeHTTP)
 
 	// Auth (humans)
