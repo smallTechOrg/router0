@@ -12,6 +12,7 @@ const nextConfig = {
       { source: '/api/keys/:path*', destination: `${go}/api/keys/:path*` },
       { source: '/api/routing/:path*', destination: `${go}/api/routing/:path*` },
       { source: '/api/catalog/:path*', destination: `${go}/api/catalog/:path*` },
+      { source: '/api/aliases/:path*', destination: `${go}/api/aliases/:path*` },
       { source: '/api/requests/:path*', destination: `${go}/api/requests/:path*` },
       { source: '/api/costs', destination: `${go}/api/costs` },
       { source: '/api/me', destination: `${go}/auth/me` },
