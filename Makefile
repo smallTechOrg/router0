@@ -44,6 +44,7 @@ gate-phase1:
 	go build ./... && \
 	go vet ./... && \
 	go vet -tags 'integration smoke' ./internal/integration/... && \
+	go run ./cmd/migrate && \
 	go test ./internal/... -count=1 && \
 	go test -tags integration ./internal/integration/... -run 'TestPhase1' -count=1 -v && \
 	! grep -q 'go-redis' go.mod && \
@@ -61,6 +62,7 @@ gate-phase2:
 	go build ./... && \
 	go vet ./... && \
 	go vet -tags 'integration smoke' ./internal/integration/... && \
+	go run ./cmd/migrate && \
 	go test ./internal/... -count=1 && \
 	go test -tags integration ./internal/integration/... -run 'TestPhase1|TestPhase2' -count=1 -v && \
 	! grep -q 'go-redis' go.mod && \
