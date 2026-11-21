@@ -4,7 +4,7 @@
 
 router0 is infrastructure that LLM-powered backend services (many of them agents) call. The AI-native questions are therefore:
 
-1. Should any decision inside router0 be made by a model (an LLM, embeddings, or a learned policy)?
+1. Should any decision inside router0 be made by a model (an LLM, a vector-similarity lookup, or a learned policy)?
 2. What does router0 have to do so that AI callers — agents, tool-using workers, SDKs — work well through it?
 
 Short answer: **no model reasoning happens inside router0. Routing, name resolution, and error classification are deterministic.** The AI-native work goes into being a faithful substrate for AI callers: exact OpenAI wire compatibility, correct tool-calling translation, streaming, and machine-actionable errors.
@@ -15,11 +15,11 @@ Short answer: **no model reasoning happens inside router0. Routing, name resolut
 
 **Considered:** pick the provider or even the model per request from prompt content (semantic routing), learned quality, or cost/latency scoring (the old weighted scorer and planned Thompson-sampling bandit).
 
-**Decision:** Fixed priority only. The user-approved brief requires one global provider order per org, key order within each provider, and a per-request header override. Operators need to predict which key is billed and why. A learned or semantic policy would make the billing key unpredictable, add latency on the hot path, and could substitute a model the caller did not ask for. The old `ScoreFunc`/bandit hook from the Zer0 spec is retired; the legacy scorer and pool code are taken off the request path in Phase 1 and deleted in Phase 3.
+**Decision:** Fixed priority only. The user-approved brief requires one global provider order per org, key order within each provider, and a per-request header override. Operators need to predict which key is billed and why. A learned or semantic policy would make the billing key unpredictable, add latency on the hot path, and could substitute a model the caller did not ask for. The old `ScoreFunc`/bandit hook from the Zer0 spec is retired; the legacy scorer and pool code are deleted in Phase 1; the legacy tables are dropped in Phase 3.
 
-### 2. Model-name normalisation with an LLM or embeddings — Rejected
+### 2. Model-name normalisation with an LLM or vector similarity — Rejected
 
-**Considered:** when a caller sends a name router0 does not know (`llama3.3-70B`, `sonnet latest`), ask an LLM or nearest-neighbour embeddings to guess the closest catalog entry.
+**Considered:** when a caller sends a name router0 does not know (`llama3.3-70B`, `sonnet latest`), ask an LLM or a nearest-neighbour vector lookup to guess the closest catalog entry.
 
 **Decision:** Deterministic rules plus explicit aliases. A fuzzy match that is wrong sends traffic to a different model without anyone noticing. That is a correctness and cost hazard, and it cannot be reproduced when debugging. The deterministic path is:
 - `catalog.Canonicalize`: lowercase, strip vendor prefix, strip known suffixes and date stamps, family-specific rules, and a static override table (capabilities/model-catalog.md);
@@ -64,4 +64,4 @@ These are requirements, written as success criteria in the capability files:
 
 ## Conclusion
 
-router0 contains **no LLM, embedding, or learned-policy component** in any phase. Every routing decision is deterministic: canonical name → org catalog → fixed provider priority (or header override) → key order → skip keys in cooldown → fail over on any error → fixed error precedence. This matches the user's explicit choice of fixed priority, keeps billing predictable, keeps the hot path sub-millisecond apart from I/O, and makes every outcome reproducible from the request log trail. The AI-native investment is in fidelity for AI callers: wire compatibility, tool-calling translation, streaming behaviour, and actionable error codes.
+router0 contains **no LLM, vector-similarity, or learned-policy component** in any phase. Every routing decision is deterministic: canonical name → org catalog → fixed provider priority (or header override) → key order → skip keys in cooldown → fail over on any error → fixed error precedence. This matches the user's explicit choice of fixed priority, keeps billing predictable, keeps the hot path sub-millisecond apart from I/O, and makes every outcome reproducible from the request log trail. The AI-native investment is in fidelity for AI callers: wire compatibility, tool-calling translation, streaming behaviour, and actionable error codes.

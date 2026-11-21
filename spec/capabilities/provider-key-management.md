@@ -37,7 +37,8 @@ Org owners/admins add their own provider API keys (BYOK, several per provider), 
 
 - All queries are scoped by `org_id` from the JWT context. The existing `user_id` column is kept as "created by".
 - Encryption is unchanged: AES-256-GCM, `AES_KEY` = 64 hex chars, unique 12-byte nonce per row, and the process refuses to start without a valid key.
-- `key_hint` = first 8 chars + `…`, stored at write time. Raw keys are never returned.
+- `key_hint` = first 8 chars + `…`, stored at write time (`gsk_ab12…`, `sk-or-v1…`, `rsk_ab12…` for Mesh API). Raw keys are never returned. Provider key formats are not validated beyond being non-empty; the dashboard shows a placeholder per provider (`gsk_…`, `sk-or-…`, `rsk_…`). Assumed: Mesh API keys start with `rsk_` as in Mesh's docs sample; a key without that prefix is still accepted, since the format may vary by key type.
+- The provider field accepts aliases (`gemini` → `google`, `aifiesta` / `mesh` → `meshapi`); the stored id is the canonical one. Assumed.
 - **Key order:** `provider_keys.position` (0 = first) within (org, provider). A new key goes last. Disabled keys keep their position but are excluded from plans and from priority views.
 - **Provider priority:** `org_provider_priority.position` (0 = first). Adding the first key of a new provider appends that provider. Providers with keys but no row are appended alphabetically when building plans.
 - `PUT /api/routing/priority` validates that it got full permutations, then replaces priority and updates key positions in one transaction. Plans are built per request from the DB, so changes apply to the next request. Assumed: no caching of priority. It is one indexed query per request; a 5-second in-process cache may be added if load requires it.

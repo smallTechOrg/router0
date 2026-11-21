@@ -56,7 +56,7 @@ Table (newest first, 50 per page, "Load older" uses `before`): time, token, cano
 
 ### Catalog (`/dashboard/catalog`) — Phase 2
 
-Search box; a table of canonical models → provider chips (`groq · llama-3.3-70b-versatile`), with unavailable ones struck through, plus kind and last seen. A "Refresh now" button (`POST /api/catalog/refresh`) shows the per-provider refresh status and time. Aliases section: list, add (alias → canonical, with autocomplete from the catalog), delete.
+Search box (`?q=`) and a **kind filter** (`all | chat | image | audio | embedding | other`, default `chat`; calls `GET /api/catalog?kind=`). A table of canonical model → provider chips (`groq · llama-3.3-70b-versatile`, `meshapi · mistral/mistral-7b-instruct-v0`), with unavailable ones struck through, plus kind and last seen. Non-chat kinds are shown for visibility only and carry a note "not served by router0". A "Refresh now" button (`POST /api/catalog/refresh`) shows the per-provider refresh status and time. Aliases section: list, add (alias → canonical, with autocomplete from the catalog), delete.
 
 ### Costs (`/dashboard/costs`) — existing, org-scoped; P3 adds per-key month-to-date spend vs budget bars.
 
@@ -75,4 +75,4 @@ Tailwind, the existing dark neutral palette and `StatusBadge` component. All wri
 - [ ] Manual: Routing page reorder + Save → the next request tries the new first provider.
 - [ ] Manual: after a failover request, Requests shows attempts = 2 and the expanded trail names both keys with outcome and class.
 - [ ] Manual: a `member` user sees no Create / Revoke / Add / Remove / Save controls.
-- [ ] (P2) Catalog page lists `llama-3.3-70b` with both providers; adding alias `fast` shows it in the list and in `/v1/models`.
+- [ ] (P2) Catalog page: kind filter `image`/`audio` lists the Gemini image/TTS/music mock models and the default `chat` view does not; "Refresh now" updates the per-provider status; it lists `llama-3.3-70b` with both providers; adding alias `fast` shows it in the list and in `/v1/models`.

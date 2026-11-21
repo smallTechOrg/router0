@@ -1,6 +1,6 @@
 # Capability: Provider Adapters
 
-Phase 1: Groq and OpenRouter (OpenAI-compatible) hardened, with classification, usage in streams, and configurable base URLs. Phase 2: Anthropic (native Messages API), Gemini (tool-calling conformance), Mesh API by Fiesta Labs. Existing NVIDIA, Together, and Baseten adapters stay registered but are not priorities.
+Phase 1: Groq and OpenRouter (OpenAI-compatible) hardened, with classification, usage in streams, and configurable base URLs. Phase 2: Anthropic (native Messages API), Gemini (tool-calling conformance), Mesh API by Fiesta Labs ("AI Fiesta Agent Mesh"; portal app.meshapi.ai). Existing NVIDIA, Together, and Baseten adapters stay registered but are not priorities.
 
 ## What It Does
 
@@ -31,13 +31,13 @@ Translates router0's internal `ChatRequest` into each provider's wire format, pe
 | OpenRouter | `openrouter` | `OPENROUTER_BASE_URL` = `https://openrouter.ai/api/v1` | Bearer + `HTTP-Referer: https://router0.local`, `X-Title: router0` | `POST /chat/completions` | `GET /models` |
 | Anthropic (P2) | `anthropic` | `ANTHROPIC_BASE_URL` = `https://api.anthropic.com/v1` | `x-api-key`, `anthropic-version: 2023-06-01` | `POST /messages` | `GET /models?limit=1000` (paginate `after_id`) |
 | Gemini (P2) | `google` (alias `gemini`) | `GOOGLE_BASE_URL` = `https://generativelanguage.googleapis.com` | Bearer on `/v1beta/openai/*`; `?key=` on native list | `POST /v1beta/openai/chat/completions` | `GET /v1beta/models` |
-| Mesh API (P2) | `meshapi` | `MESHAPI_BASE_URL` = `https://api.meshapi.ai/v1` | `Authorization: Bearer` | `POST /chat/completions` | `GET /models` |
+| Mesh API (P2) | `meshapi` (aliases `aifiesta`, `mesh`) | `MESHAPI_BASE_URL` = `https://api.meshapi.ai/v1` | `Authorization: Bearer rsk_…` | `POST /chat/completions` | `GET /models` |
 
 All calls: on failure → `Classify` (error-classification.md). Response bodies of failed calls are read up to 64 KiB.
 
 Assumed: Gemini keeps the provider id `google` so existing key rows need no data migration; the UI labels it "Gemini" and the header override accepts `gemini`.
 
-Assumed: Mesh API (portal app.meshapi.ai) is fully OpenAI-compatible for chat, streaming, tools, and `/models`, with Bearer auth, as stated in the brief. Model ids may be vendor-prefixed (`anthropic/…`), which canonicalisation handles.
+Mesh API facts taken from the user's copy of Mesh's docs: base URL `https://api.meshapi.ai/v1`, `POST /v1/chat/completions` with `Authorization: Bearer rsk_…`, `Content-Type: application/json`, an OpenAI-style body, and vendor-prefixed model ids, e.g. `{"model":"mistral/mistral-7b-instruct-v0","messages":[{"role":"user","content":"Hello!"}]}`. Everything else below is Assumed and covered by fixtures so a wrong guess is a one-line fix.
 
 ## Business Rules
 
@@ -53,7 +53,6 @@ type Provider interface {
     ListModels(ctx context.Context, apiKey string) ([]ModelInfo, error)
 }
 type Classifier interface { Classify(status int, h http.Header, body []byte) *ProviderError }  // optional
-type Embedder interface { Embed(ctx context.Context, req *EmbedRequest, apiKey string) (*EmbedResponse, error) } // P3, optional
 ```
 
 `ChatRequest` gains `TopP *float64`, `ResponseFormat any`, `Seed *int`, `User string`. `Temperature` becomes `*float64`, so that `0` is forwarded and not dropped by `omitempty` (a current bug). `ChatChunk` gains `Usage *Usage`, `Err *ProviderError`, and tool-call deltas carry `Index`. `ToolCall` gains `Index *int` for streaming.
@@ -93,11 +92,19 @@ Streaming translation: `message_start` → first chunk with `role: assistant` (a
 
 ### Phase 2 — Gemini (`google.go`)
 
-Kept on Google's OpenAI-compatible endpoint (extend, not rewrite). Phase 2 adds a conformance test suite against mock and optional real keys: tools, `tool_choice`, multiple tool calls in one response, tool-result round trip, and streaming tool calls. It also adds fixes that normalise compat-layer quirks (missing tool-call ids → generate `call_<n>`; array-wrapped error bodies; `content: null`). `ListModels` uses native `GET /v1beta/models` (`supportedGenerationMethods` → `generateContent` = chat, `embedContent` = embedding). Assumed: Google's OpenAI-compatible endpoint supports function calling well enough; if the conformance suite finds an unfixable gap, the slice switches only the failing path to native `generateContent` translation, inside `google.go`.
+Kept on Google's OpenAI-compatible endpoint (extend, not rewrite). Phase 2 adds a conformance test suite against mock and optional real keys: tools, `tool_choice`, multiple tool calls in one response, tool-result round trip, and streaming tool calls. It also adds fixes that normalise compat-layer quirks (missing tool-call ids → generate `call_<n>`; array-wrapped error bodies; `content: null`). `ListModels` uses native `GET /v1beta/models` and returns every listed model with its `supportedGenerationMethods`; the catalog decides the kind (model-catalog.md › Model kinds), so image, TTS, music, computer-use, and robotics models do not reach `/v1/models`. Assumed: Google's OpenAI-compatible endpoint supports function calling well enough; if the conformance suite finds an unfixable gap, the slice switches only the failing path to native `generateContent` translation, inside `google.go`.
 
 ### Phase 2 — Mesh API (`meshapi.go`)
 
-Thin adapter over `openai_compat.go` with the base URL above. Uses generic classification until its docs say otherwise.
+Thin adapter over `openai_compat.go` in `internal/providers/meshapi.go`, self-registered under id `meshapi`; `registry.go` maps the aliases `aifiesta` and `mesh` to it (so `X-Router0-Providers: aifiesta`, `POST /api/keys {"provider":"mesh"}` work; the stored and returned id is always `meshapi`). Assumed: the aliases are a convenience; the user calls the product "AI Fiesta Agent Mesh".
+
+- Base URL read per call from `MESHAPI_BASE_URL` (default `https://api.meshapi.ai/v1`), mirroring `GROQ_BASE_URL` / `OPENROUTER_BASE_URL`; tests point it at the `:9905` mock or an `httptest` server. Chat URL `{base}/chat/completions`; model list URL `{base}/models`.
+- Auth: `Authorization: Bearer <key>`. Keys look like `rsk_…` (key hint `rsk_xxxx…`). No other required headers. Assumed: optional attribution headers are not needed; router0 sends none.
+- Model ids are sent exactly as discovered (vendor-prefixed, e.g. `mistral/mistral-7b-instruct-v0`); the catalog stores that string as `provider_model_id` and the canonical name is derived by stripping the prefix and normalising (model-catalog.md fixture rows).
+- `ListModels`: `GET {base}/models`, parsed as the OpenAI list shape `{"data":[{"id":…}]}`. Assumed: Mesh returns that shape; pricing/context fields are read when present and left NULL otherwise.
+- Streaming, tool calls, `tool_choice`, and `stream_options.include_usage` are passed through unchanged. Assumed: Mesh forwards them to the underlying vendor like OpenRouter does. If a model behind Mesh rejects `stream_options` with a 400, the adapter retries that one attempt once without it (a `meshapi.go`-local fallback; usage is then estimated as unknown and logged `NULL`). Assumed.
+- Mesh may front non-chat models; the catalog's kind classification filters them from `/v1/models`.
+- Classification: generic rules, no `Classifier` override until Mesh's error shapes are verified (error-classification.md).
 
 ## Success Criteria
 
@@ -107,5 +114,6 @@ Thin adapter over `openai_compat.go` with the base URL above. Uses generic class
 - [ ] Phase 1 unit: a 16 KB single SSE line (large tool arguments) is parsed.
 - [ ] Phase 2 unit: Anthropic translation golden tests: (a) system + user; (b) assistant with 2 tool_calls + 2 tool results → one assistant message with 2 `tool_use` blocks and one user message with 2 `tool_result` blocks; (c) every `tool_choice` mapping; (d) response with text + tool_use → OpenAI message with `content` and `tool_calls`, `finish_reason: tool_calls`.
 - [ ] Phase 2 unit: recorded Anthropic SSE fixture with text then a tool_use whose JSON arrives in 3 `input_json_delta`s → OpenAI chunks whose concatenated `arguments` parse to the original object.
-- [ ] Phase 2 integration: an OpenAI-format tool-calling conversation (call → tool result → final answer) through router0 to the mock Anthropic and mock Gemini servers gives the same final OpenAI-shaped output as through mock Groq.
-- [ ] Phase 2 smoke (optional, real keys): the same tool-calling conversation succeeds against real Anthropic, Gemini, and Mesh API when `TEST_ANTHROPIC_KEY` / `TEST_GEMINI_KEY` / `TEST_MESHAPI_KEY` are set.
+- [ ] Phase 2 unit (Mesh): request goes to `POST {MESHAPI_BASE_URL}/chat/completions` with `Authorization: Bearer rsk_…` and the vendor-prefixed `model` unchanged; `ListModels` parses a fixture listing containing `mistral/mistral-7b-instruct-v0`; a streamed tool-call fixture yields indexed deltas and a final usage chunk; alias `aifiesta` resolves to `meshapi` in `providers.CanonicalName`.
+- [ ] Phase 2 integration (tool calling, the user's priority): an OpenAI-SDK-style agent loop (tools → `tool_calls` → `tool` message → final answer; parallel calls; two rounds; non-stream and stream) through router0 to the mock Groq, OpenRouter, Anthropic, Gemini, and Mesh servers gives the same final OpenAI-shaped output on every flavour (`TestPhase2_AgentLoopToolCalling`, `TestPhase2_AgentLoopToolCallingStream`).
+- [ ] Phase 2 smoke (optional, real keys; Gemini is the priority): the same tool-calling conversation, non-stream and stream, succeeds against real Gemini, Anthropic, and Mesh API when `TEST_ANTHROPIC_KEY` / `TEST_GEMINI_KEY` / `TEST_MESHAPI_KEY` are set.

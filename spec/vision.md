@@ -21,7 +21,7 @@ router0 fixes all four: services hold only a revocable router0 token, ask for a 
 
 ## Who It Is For
 
-- **Primary:** Engineering teams running multiple backend services (APIs, workers, agents) that call LLMs, who already hold keys on two or more providers (Anthropic, OpenRouter, Groq, Gemini, Mesh API by Fiesta Labs) and want one internal endpoint with predictable failover.
+- **Primary:** Engineering teams running multiple backend services (APIs, workers, agents) that call LLMs, who already hold keys on two or more providers (Anthropic, OpenRouter, Groq, Gemini, Mesh API by Fiesta Labs ("AI Fiesta Agent Mesh")) and want one internal endpoint with predictable failover.
 - **Secondary:** Platform engineers who need to self-host the gateway (no prompt data leaves their infrastructure except to the providers they chose).
 
 ## What Success Looks Like
@@ -43,6 +43,7 @@ An org owner:
 - Not a managed SaaS: it ships as a self-hosted Go binary plus a Next.js dashboard backed by PostgreSQL only, runnable bare-local on a developer machine.
 - Not an evaluation, fine-tuning, or model-hosting tool.
 - Not a conversation history store: callers own their message history; every request is stateless.
+- Out of scope (all phases): an embeddings API. There is no `/v1/embeddings` in any phase (no provider consensus on a standard; Claude has no embeddings API). `/v1/models` lists chat models only.
 
 ## Scale Target
 

@@ -123,7 +123,7 @@ CREATE TABLE org_model_catalog (
   canonical_model      TEXT NOT NULL,
   provider             TEXT NOT NULL,
   provider_model_id    TEXT NOT NULL,
-  kind                 TEXT NOT NULL DEFAULT 'chat' CHECK (kind IN ('chat','embedding')),
+  kind                 TEXT NOT NULL DEFAULT 'chat' CHECK (kind IN ('chat','embedding','image','audio','other')),  -- Phase 1 created it with ('chat','embedding'); P2 000020 widens it. Only 'chat' rows are served; others exist for the catalog page filter
   source               TEXT NOT NULL DEFAULT 'discovered' CHECK (source IN ('discovered','on_demand','manual')),
   context_window       INT,
   input_cost_per_mtok  NUMERIC(20,8),
@@ -226,7 +226,19 @@ CREATE TABLE org_model_aliases (
 );
 ```
 
-Phase 2 also rewrites nothing in existing data; Gemini keeps provider id `google` (see provider-adapters.md).
+The same migration widens the kind constraint so non-chat models can be stored and filtered:
+
+```sql
+DO $$ DECLARE c TEXT; BEGIN
+  SELECT conname INTO c FROM pg_constraint
+   WHERE conrelid = 'org_model_catalog'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%kind%';
+  IF c IS NOT NULL THEN EXECUTE format('ALTER TABLE org_model_catalog DROP CONSTRAINT %I', c); END IF;
+END $$;
+ALTER TABLE org_model_catalog ADD CONSTRAINT org_model_catalog_kind_check
+  CHECK (kind IN ('chat','embedding','image','audio','other'));
+```
+
+The down migration deletes rows whose kind is not `chat`/`embedding` and restores the original constraint. Existing rows are unchanged (they are `chat` or `embedding`); the next refresh re-classifies and fills in the new kinds. Gemini keeps provider id `google` and Mesh API uses the new provider id `meshapi` (plain text column, no migration needed; see provider-adapters.md).
 
 ## Phase 3 Migrations
 
@@ -250,7 +262,6 @@ CREATE TABLE provider_key_spend (
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (provider_key_id, month)
 );
-ALTER TABLE request_metadata ADD COLUMN endpoint TEXT NOT NULL DEFAULT 'chat' CHECK (endpoint IN ('chat','embeddings'));
 ```
 
 ### 000022_drop_legacy_pool

@@ -121,7 +121,7 @@ router0/
 │   ├── orgs/                          # new: repository.go (orgs, org_members)
 │   ├── tokens/                        # new: repository.go, hash.go (sha256 + legacy bcrypt verify)
 │   ├── catalog/                       # new: canonical.go, repository.go, discovery.go, resolver.go
-│   │                                  #      (P2) aliases.go, ondemand.go  (P3) embedding_discovery.go
+│   │                                  #      (P2) aliases.go, ondemand.go, kind.go (chat/image/audio/other classification)
 │   ├── keystate/                      # new: provider_key_state (Postgres) + 2 s in-memory cache  (P3) budget.go
 │   ├── cache/                         # new: tiny generic TTL+LRU cache (sync.Map-based), no deps
 │   ├── routing/
@@ -138,8 +138,7 @@ router0/
 │   │   ├── groq.go openrouter.go      # Phase 1 priority adapters (+ per-provider classify overrides)
 │   │   ├── google.go                  # Gemini (P2: tool-calling conformance, classify)
 │   │   ├── anthropic.go anthropic_translate.go anthropic_stream.go   # (P2) native Messages API
-│   │   ├── meshapi.go                 # (P2) Mesh API by Fiesta Labs, OpenAI-compatible
-│   │   ├── embed_*.go                 # (P3) Embedder implementations
+│   │   ├── meshapi.go                 # (P2) Mesh API by Fiesta Labs (api.meshapi.ai/v1), OpenAI-compatible, Bearer rsk_… keys, vendor-prefixed model ids; registry.go aliases aifiesta/mesh
 │   │   ├── openrouter_balance.go      # (P3) /key + /credits polling client
 │   │   └── nvidia.go together.go baseten.go discovery.go model_metadata.go   # existing, not priorities
 │   ├── handlers/
@@ -150,8 +149,7 @@ router0/
 │   │   ├── keys.go                    # /api/keys (org-scoped, state, position)
 │   │   ├── pool.go                    # /api/requests, /api/requests/{id}, /api/costs (org-scoped); /api/pool removed
 │   │   ├── auth.go admin.go helpers.go
-│   │   ├── aliases.go                 # (P2)
-│   │   └── embeddings.go              # (P3)
+│   │   └── aliases.go                 # (P2)
 │   ├── balance/                       # (P3) poller goroutine
 │   ├── metadata/recorder.go           # request + attempt records (org, token, key label, trail)
 │   ├── metrics/prometheus.go          # router0_* metrics
@@ -159,7 +157,7 @@ router0/
 │   ├── models/                        # legacy global admin discovery (pool/cache deps stripped in Phase 1)
 │   ├── health/                        # legacy probes: DELETED in Phase 1
 │   ├── db/                            # pgx pool, migration runner (cache client file deleted in Phase 1)
-│   ├── testutil/mockprovider/         # new: scripted OpenAI-compatible mock provider (P2: anthropic, gemini wire)
+│   ├── testutil/mockprovider/         # new: scripted OpenAI-compatible mock provider (P2: anthropic, gemini, meshapi flavours; scripted tool-calling conversations)
 │   └── integration/                   # phase1_test.go, smoke_test.go (new); gateway_test.go legacy (deleted Phase 1)
 ├── migrations/                        # 000001–000013 existing; 000014–000019 Phase 1; 000020 P2; 000021–000022 P3
 ├── dashboard/
@@ -275,7 +273,7 @@ Dashboard/admin routes (`/api/*`, `/auth/*`, `/admin/*`) keep the existing shape
 | `ROUTER0_TOKEN_CACHE_TTL_SECONDS` | `30` | In-process service-token cache TTL (max revocation lag on other instances) |
 | `ROUTER0_KEYSTATE_CACHE_MS` | `2000` | In-process key-state read cache TTL |
 | `ANTHROPIC_BASE_URL` (P2) | `https://api.anthropic.com/v1` | |
-| `MESHAPI_BASE_URL` (P2) | `https://api.meshapi.ai/v1` | |
+| `MESHAPI_BASE_URL` (P2) | `https://api.meshapi.ai/v1` | Mesh API (AI Fiesta); also listed in `.env.example` (commented, pointing at the `:9905` mock) |
 
 Existing `GROQ_BASE_URL`, `OPENROUTER_BASE_URL`, `GOOGLE_BASE_URL`, etc. remain and are read at call time, which is how tests point adapters at `httptest` servers. Every adapter call (including `ListModels`) must use its base URL; the hard-coded `https://openrouter.ai/api/v1/models` in `openrouter.go` is a Phase 1 fix.
 

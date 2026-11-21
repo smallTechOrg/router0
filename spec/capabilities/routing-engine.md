@@ -40,7 +40,7 @@ For each request: turn the requested model into an ordered list of candidates (p
 
 1. `entries := catalog.Resolve(org, model)`. Empty → plan is empty → `404 model_not_found`.
 2. Provider order:
-   - Header present: parse the comma list, lowercase, trim, map `gemini` → `google`, de-duplicate keeping the first occurrence. An unknown provider id → `400 invalid_provider_override` before any upstream call. The order is exactly the header list; providers not in it are excluded.
+   - Header present: parse the comma list, lowercase, trim, map provider aliases via `providers.CanonicalName` (`gemini` → `google`; Assumed: `aifiesta`, `mesh` → `meshapi`), de-duplicate keeping the first occurrence. An unknown provider id → `400 invalid_provider_override` before any upstream call. The order is exactly the header list; providers not in it are excluded.
    - No header: `org_provider_priority` order, then any remaining providers alphabetically.
 3. For each provider in order that has an entry: for each active key (`status='active'`) in `position` order → `Candidate{provider, entry.ProviderModelID, key.ID, key.Label}`.
 4. Keys whose keystate is `transient_cooldown` are moved to the end of the plan, keeping their relative order. They are not skipped, so a single-key org is not locked out by one blip.

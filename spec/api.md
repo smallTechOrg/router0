@@ -23,11 +23,11 @@ Request headers:
 | Header | Required | Meaning |
 |--------|----------|---------|
 | `Authorization: Bearer r0-sk-…` | yes | Service token |
-| `X-Router0-Providers: groq,openrouter` | no | Restricts AND orders providers for this request, overriding org priority. Case-insensitive; whitespace ignored; `gemini` is accepted as an alias of `google`. Unknown provider name → `400 invalid_provider_override`. Providers listed but without keys in the org are ignored. |
+| `X-Router0-Providers: groq,openrouter` | no | Restricts AND orders providers for this request, overriding org priority. Case-insensitive; whitespace ignored; Provider aliases are accepted: `gemini` → `google`, and (Assumed) `aifiesta` / `mesh` → `meshapi` (Mesh API by Fiesta Labs, "AI Fiesta Agent Mesh"). Canonical provider ids are `groq`, `openrouter`, `anthropic`, `google`, `meshapi`, `nvidia`, `together`, `baseten`. Unknown provider name → `400 invalid_provider_override`. Providers listed but without keys in the org are ignored. |
 
 Body: standard OpenAI chat completion request. Fields forwarded: `model` (required, canonical or any provider-specific name), `messages`, `max_tokens`, `temperature`, `top_p`, `stop`, `stream`, `stream_options`, `tools`, `tool_choice`, `response_format`, `seed`, `user`. Unknown fields are ignored. Message `content` may be a string or an array of `{"type":"text","text":…}` parts (flattened to a string); any non-text part returns `400 unsupported_content`. Assumed: image/audio inputs are out of scope for Phases 1–3.
 
-Phase 1 forwards `tools`/`tool_choice`/`tool_calls`/`tool` messages unchanged to OpenAI-compatible providers (Groq, OpenRouter). Phase 2 translates them for Anthropic (native Messages API) and verifies them for Gemini.
+Phase 1 forwards `tools`/`tool_choice`/`tool_calls`/`tool` messages unchanged to OpenAI-compatible providers (Groq, OpenRouter). Phase 2 translates them for Anthropic (native Messages API) and verifies them for Gemini and Mesh API, non-stream and stream (an OpenAI-SDK-style agent loop is a Phase 2 gate test).
 
 **Success (non-streaming) — 200**
 
@@ -93,7 +93,7 @@ X-Router0-Request-Id: r0-3f9c…
 
 ### `GET /v1/models` — Phase 1
 
-Lists the caller org's catalog, one entry per canonical model that is available on at least one provider the org has an active key for.
+Lists the caller org's catalog, one entry per canonical **chat** model that is available on at least one provider the org has an active key for. Models of other kinds (image, audio/TTS/music/transcription, embedding, computer-use/robotics/guard and similar) are never listed (Phase 2 classification: model-catalog.md › Model kinds; Phase 1 already skips Groq whisper/tts/guard and `embed` ids). Every entry has `"kind":"chat"`.
 
 ```json
 {"object":"list","data":[
@@ -105,9 +105,7 @@ Lists the caller org's catalog, one entry per canonical model that is available 
 
 Phase 2 adds org aliases as extra entries with `"router0":{"alias_of":"claude-sonnet-5-5"}`.
 
-### `POST /v1/embeddings` — Phase 3
-
-OpenAI embeddings request (`model`, `input` string or string array, `encoding_format`, `dimensions`). Same token auth, header override, catalog resolution (rows with `kind='embedding'`), failover, error codes, and headers as chat. Response is the OpenAI `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[…]}],"model":…,"usage":{…}}` shape. A canonical model that exists only as `kind='chat'` returns `404 model_not_found`.
+`/v1/embeddings` is not served in any phase (out of scope; roadmap.md). A request to it returns the router's standard `404`.
 
 ---
 
@@ -164,7 +162,7 @@ Revokes (sets `revoked_at`, evicts the token from the in-process cache; other in
 
 ### `GET /api/providers`
 
-Registered adapters, for the add-key form: `{"providers":[{"id":"groq","label":"Groq"},{"id":"openrouter","label":"OpenRouter"},{"id":"google","label":"Gemini"},…]}`. Labels come from a static map in `handlers/keys.go`. An unknown id falls back to the id itself.
+Registered adapters, for the add-key form: `{"providers":[{"id":"groq","label":"Groq"},{"id":"openrouter","label":"OpenRouter"},{"id":"google","label":"Gemini"},{"id":"meshapi","label":"Mesh API"},…]}`. Labels come from a static map in `handlers/keys.go`. An unknown id falls back to the id itself.
 
 ### `GET /api/keys`
 
@@ -178,7 +176,7 @@ Registered adapters, for the add-key form: `{"providers":[{"id":"groq","label":"
 
 ### `POST /api/keys` (owner/admin)
 
-Body `{"provider":"groq","key":"gsk_…","label":"groq-a"}` (`model_id` still accepted for baseten). Valid providers: every registered adapter (`groq`, `openrouter`, `google`, `nvidia`, `together`, `baseten`; Phase 2 adds `anthropic`, `meshapi`). 201 returns the key record (no secret). Side effects: appended at the end of the provider's key order; provider appended to the org priority if new; catalog discovery for (org, provider) is triggered asynchronously. 409 duplicate label; 422 missing fields / invalid provider.
+Body `{"provider":"groq","key":"gsk_…","label":"groq-a"}` (`model_id` still accepted for baseten). Valid providers: every registered adapter (`groq`, `openrouter`, `google`, `nvidia`, `together`, `baseten`; Phase 2 adds `anthropic`, `meshapi`; aliases `gemini`, `aifiesta`, `mesh` are accepted and normalised to `google` / `meshapi` (Assumed)). 201 returns the key record (no secret). Side effects: appended at the end of the provider's key order; provider appended to the org priority if new; catalog discovery for (org, provider) is triggered asynchronously. 409 duplicate label; 422 missing fields / invalid provider.
 
 ### `DELETE /api/keys/{id}` (owner/admin) — 204, sets `status='disabled'`.
 
@@ -230,7 +228,7 @@ Body:
  "refreshes":[{"provider":"groq","last_refreshed_at":"…","last_status":"ok","model_count":21}],
  "aliases":[]}
 ```
-Query `?q=llama` filters canonical names by substring.
+Query `?q=llama` filters canonical names by substring; (P2) `?kind=chat|image|audio|embedding|other` filters by model kind (default: all kinds, so the dashboard can show and filter them; `/v1/models` is always chat-only). `kind` is one of those five values; `embedding` exists only as a filtered-out kind.
 
 ### `POST /api/catalog/refresh` (owner/admin) — Phase 1
 

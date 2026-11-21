@@ -6,7 +6,7 @@ Turn the existing Zer0 Router (Go 1.22 + Next.js 14 + Postgres + Redis) into **r
 
 **Already exists (Scaffold done, commit db85a19):** the Go binary with chi routes, JWT + invite auth, AES-GCM provider keys, six OpenAI-compatible adapters, a pool/scorer router that ignores the requested model, `request_metadata` + `request_attempts`, and a dashboard with login/keys/requests/costs/admin pages. `internal/integration/gateway_test.go` does not compile (`NewAdminHandler` arity) and is replaced in Phase 1.
 
-**Out of scope (all phases):** storing prompt/response content; smart/semantic/learned routing; billing or markup; email delivery (invites stay on-screen); OAuth/SSO; multi-org membership per user; image/audio inputs; fine-tuning/hosting; conversation storage.
+**Out of scope (all phases):** storing prompt/response content; smart/semantic/learned routing; billing or markup; email delivery (invites stay on-screen); OAuth/SSO; multi-org membership per user; image/audio inputs; fine-tuning/hosting; conversation storage; **embeddings API (`/v1/embeddings`; no provider consensus on a standard, and Claude has no embeddings API)**; image/TTS/music/transcription endpoints (such models are discovered only so they can be filtered out of `/v1/models`).
 
 ### Common environment for every gate
 
@@ -122,38 +122,48 @@ With real keys: same flow without steps 2–3's base-URL overrides, using real G
 
 ---
 
-## Phase 2: Anthropic, Gemini, Mesh API, tool calling, catalog page, aliases, on-demand discovery
+## Phase 2: Anthropic, Gemini, Mesh API, tool calling, chat-only catalog, catalog page, aliases, on-demand discovery
 
-**Goal:** Org adds Anthropic, Gemini, and Mesh API keys. `claude-sonnet-5-5` (or any discovered Claude model) is served via Anthropic's native Messages API, and via OpenRouter/Mesh API on failover. OpenAI-format tool calling works identically across Groq, OpenRouter, Anthropic, Gemini, and Mesh API, streaming included. The Catalog page shows canonical model → providers. Org aliases work. A model that a provider started offering after the last refresh is found on demand at request time.
+**Goal:** Org adds Anthropic, Gemini, and Mesh API keys. `claude-sonnet-5-5` (or any discovered Claude model) is served via Anthropic's native Messages API, and via OpenRouter/Mesh API on failover. **OpenAI-format tool calling (the user's priority) works identically across Groq, OpenRouter, Anthropic, Gemini, and Mesh API, streaming included**, verified by mock round-trip tests driven by an OpenAI-SDK-style agent loop and by an optional real-Gemini smoke. `/v1/models` returns only chat models (image, TTS, music, transcription, computer-use, and similar models are discovered but filtered out). The Catalog page shows canonical model → providers with a kind filter and a refresh button. Org aliases work. A model that a provider started offering after the last refresh is found on demand at request time.
 
-Capabilities: provider-adapters (Anthropic, Gemini, Mesh API), error-classification (their rules), model-catalog (aliases, on-demand), dashboard (catalog page).
+Capabilities: provider-adapters (Anthropic, Gemini, Mesh API), error-classification (their rules), model-catalog (kind classification, aliases, on-demand), dashboard (catalog page), provider-key-management (`rsk_` hint).
 
 ### Slices
 
 | Slice | Owns | Depends on |
 |-------|------|------------|
-| **2A Schema** | `migrations/000020_org_model_aliases.{up,down}.sql` | Phase 1 |
+| **2A Schema** | `migrations/000020_org_model_aliases.{up,down}.sql` (aliases table and widening of the `org_model_catalog.kind` CHECK; data.md) | Phase 1 |
 | **2B Anthropic adapter** | `internal/providers/anthropic.go`, `internal/providers/anthropic_translate.go`, `internal/providers/anthropic_stream.go`, `internal/providers/anthropic_test.go`, `internal/providers/anthropic_translate_test.go`, `internal/providers/anthropic_stream_test.go`, `internal/providers/testdata/anthropic/` | Phase 1 provider types |
 | **2C Gemini conformance** | `internal/providers/google.go`, `internal/providers/google_test.go`, `internal/providers/testdata/gemini/` | Phase 1 |
-| **2D Mesh API adapter** | `internal/providers/meshapi.go`, `internal/providers/meshapi_test.go` | Phase 1 |
-| **2E Aliases & on-demand discovery** | `internal/catalog/` (adds `aliases.go`, `ondemand.go`; edits `resolver.go`, `overrides.go`), `internal/handlers/catalog.go`, `internal/handlers/aliases.go` | 2A |
+| **2D Mesh API adapter** | `internal/providers/meshapi.go`, `internal/providers/meshapi_test.go`, `internal/providers/testdata/meshapi/`, `internal/providers/registry.go` (alias map entries only: `aifiesta`, `mesh` → `meshapi`) | Phase 1 |
+| **2E Kinds, aliases & on-demand discovery** | `internal/catalog/` (adds `kind.go`, `kind_test.go`, `aliases.go`, `ondemand.go`; edits `discovery.go`, `canonical.go`, `canonical_test.go`, `resolver.go`, `overrides.go`), `internal/handlers/catalog.go`, `internal/handlers/aliases.go` | 2A |
 | **2F Dashboard catalog** | `dashboard/` | 2E API (api.md) |
 | **2G Wiring, mocks & gate** | `internal/server/`, `cmd/router/main.go`, `cmd/mockprovider/`, `internal/testutil/`, `internal/integration/phase2_test.go`, `internal/integration/smoke_phase2_test.go`, `Makefile`, `.env.example`, `README.md` | all |
 
-Order: 2A → 2B, 2C, 2D, 2E, 2F in parallel → 2G.
+Order: 2A → 2B, 2C, 2D, 2E, 2F in parallel → 2G. Paths are disjoint: `providers/` files are split per adapter (`registry.go` only in 2D), `catalog/` only in 2E.
 
 ### Key files
 
+- **2A:** `000020_org_model_aliases`: `org_model_aliases` plus `ALTER TABLE org_model_catalog DROP CONSTRAINT org_model_catalog_kind_check, ADD CONSTRAINT … CHECK (kind IN ('chat','embedding','image','audio','other'))`. Assumed: the auto-generated constraint name is `org_model_catalog_kind_check` (the migration looks it up in `pg_constraint` instead of hard-coding it, so it is safe either way).
 - **2B:** translation tables and streaming event mapping exactly as in provider-adapters.md; `Classify` per error-classification.md; `ListModels` with `after_id` pagination; golden fixtures in `testdata/anthropic/*.json|*.sse`.
-- **2C:** tool-calling conformance tests (mock fixtures of Google's OpenAI-compat responses incl. array-wrapped errors, missing tool-call ids), native `GET /v1beta/models` listing with chat/embedding kind, Gemini `Classify`.
-- **2D:** `MeshAPIProvider` on `openai_compat.go`, base URL `MESHAPI_BASE_URL`, self-registration.
-- **2E:** `aliases.go` (CRUD + shadowing check), `ondemand.go` (miss debounce key, parallel refresh with 10 s cap), resolver alias step, overrides for Claude/Gemini ids; `GET/POST/DELETE /api/aliases`; `/v1/models` includes aliases.
-- **2F:** `dashboard/app/dashboard/catalog/page.tsx`, `components/ProviderChip.tsx`, `lib/api.ts` (catalog, refresh, aliases), keys page provider labels for Anthropic / Mesh API.
-- **2G:** `mockprovider` gains Anthropic wire format (`/v1/messages`, SSE events, `x-api-key`) and a Gemini-flavoured OpenAI-compat mock, scripted tool-calling conversations, and a mutable `/models` list (for on-demand tests); `cmd/mockprovider` adds `:9903` (anthropic), `:9904` (gemini), `:9905` (meshapi).
+- **2C:** tool-calling conformance tests (mock fixtures of Google's OpenAI-compat responses incl. array-wrapped errors, missing tool-call ids, multiple tool calls, tool-result round trip, streaming tool-call deltas), native `GET /v1beta/models` listing (returns every model with `supportedGenerationMethods`; the kind is decided by `catalog.ClassifyKind`), Gemini `Classify`.
+- **2D:** `MeshAPIProvider` on `openai_compat.go`, base URL `MESHAPI_BASE_URL` (default `https://api.meshapi.ai/v1`), Bearer auth, self-registration under id `meshapi`, alias entries `aifiesta`/`mesh` in `registry.go`, `Classify` = generic (no override). Unit tests with fixtures in `testdata/meshapi/`: chat response, SSE stream with a tool-call delta and final usage, `/models` listing with vendor-prefixed ids (`mistral/mistral-7b-instruct-v0`), a 401, a 429 with `Retry-After`, a 402-shaped body. Test that the request sent upstream is `POST {base}/chat/completions` with `Authorization: Bearer rsk_…` and `model` equal to the vendor-prefixed provider id unchanged.
+- **2E:**
+  - `kind.go`: `ClassifyKind(provider, id string, methods []string) string` per model-catalog.md (rules table); `discovery.go` stores every listed model with its kind (no more per-provider skipping) and the resolver and `/v1/models` only use `kind='chat'`; `kind_test.go` fixture table.
+  - `canonical.go`: rule 7 gains the `-v<N>` suffix; fixture row for `mistral/mistral-7b-instruct-v0` (model-catalog.md).
+  - `aliases.go` (CRUD + shadowing check), `ondemand.go` (miss debounce key, parallel refresh with 10 s cap), resolver alias step, overrides for Claude/Gemini ids; `GET/POST/DELETE /api/aliases`; `/v1/models` includes aliases; `GET /api/catalog?kind=&q=` (api.md).
+- **2F:** `dashboard/app/dashboard/catalog/page.tsx` (canonical model → provider chips, search, kind filter `all | chat | image | audio | embedding | other`, "Refresh now" button, per-provider refresh status, aliases), `components/ProviderChip.tsx`, `lib/api.ts` (catalog with `kind`, refresh, aliases), keys page provider labels for Anthropic / Mesh API with the `rsk_…` placeholder hint.
+- **2G:** `mockprovider` gains: Anthropic wire format (`/v1/messages`, SSE events, `x-api-key`); a Gemini-flavoured OpenAI-compat mock whose `/v1beta/models` listing deliberately includes non-chat models (`models/gemini-2.5-flash-image`, `models/gemini-2.5-flash-preview-tts`, `models/lyria-realtime-exp`, `models/gemini-2.5-computer-use-preview`, `models/gemini-robotics-er-1.5-preview`, `models/text-embedding-004`) as observed live against real Gemini; a Mesh API flavour (Bearer auth, vendor-prefixed ids in `/models`: `mistral/mistral-7b-instruct-v0`, `meta-llama/llama-3.3-70b-instruct`, `anthropic/claude-sonnet-5.5`, plus a non-chat `openai/dall-e-3`; same scripted behaviours as other mocks, keyed by substrings of the bearer such as `rsk_mock-429-15-a`); scripted tool-calling conversations (single call, parallel calls, multi-round) in non-stream and SSE form for every flavour; a mutable `/models` list (for on-demand tests). `cmd/mockprovider` adds `:9903` (anthropic), `:9904` (gemini), `:9905` (meshapi). `.env.example` and `README.md` document `ANTHROPIC_BASE_URL`, `GOOGLE_BASE_URL`, `MESHAPI_BASE_URL`; `Makefile` `mock` target starts all five mocks.
 
 ### Integration tests required in `internal/integration/phase2_test.go`
 
-`TestPhase2_AnthropicChat`, `TestPhase2_AnthropicStream`, `TestPhase2_AnthropicToolCalling`, `TestPhase2_AnthropicStreamToolCalls`, `TestPhase2_AnthropicCreditsIs402`, `TestPhase2_GeminiToolCalling`, `TestPhase2_MeshAPIChat`, `TestPhase2_CrossProviderToolParity`, `TestPhase2_ClaudeFailoverToOpenRouter` (Anthropic 529 → OpenRouter `anthropic/claude-sonnet-5.5` serves canonical `claude-sonnet-5-5`), `TestPhase2_Aliases`, `TestPhase2_AliasCannotShadow`, `TestPhase2_OnDemandDiscovery`, `TestPhase2_OnDemandDebounce`.
+Tool calling (priority; each runs the loop below against the named flavour):
+`TestPhase2_AgentLoopToolCalling` (table over groq, openrouter, anthropic, gemini, meshapi flavours; non-stream), `TestPhase2_AgentLoopToolCallingStream` (same table; stream), `TestPhase2_AnthropicToolCalling`, `TestPhase2_AnthropicStreamToolCalls`, `TestPhase2_GeminiToolCalling`, `TestPhase2_GeminiStreamToolCalls`, `TestPhase2_MeshAPIToolCalling`, `TestPhase2_CrossProviderToolParity`.
+
+The **OpenAI-SDK-style agent loop** helper (in `internal/testutil/`, same file set as the mocks) mimics what the OpenAI SDK does: send `tools=[get_weather]` and `tool_choice:"auto"`; assert `finish_reason == "tool_calls"` with a non-empty `tool_calls[0].id`, `type:"function"`, and `function.arguments` that parses as JSON; append the assistant message (with `content: null`, `tool_calls` intact) and a `{"role":"tool","tool_call_id":…,"content":…}` message; resend; assert a final `finish_reason == "stop"` text answer. Streaming variant: accumulate `tool_calls[index]` deltas (id and name on the first delta, `arguments` concatenated) and assert the accumulated arguments parse to the same object as the non-stream run, then run the same second round. The loop also covers two parallel tool calls in one assistant turn and a two-round chain (second tool call after the first result).
+
+Other:
+`TestPhase2_AnthropicChat`, `TestPhase2_AnthropicStream`, `TestPhase2_AnthropicCreditsIs402`, `TestPhase2_MeshAPIChat`, `TestPhase2_MeshAPIStream`, `TestPhase2_MeshAPIFailover` (Groq key 429 → Mesh mock serves `llama-3.3-70b` via `meta-llama/llama-3.3-70b-instruct`; headers `X-Router0-Provider: meshapi`, attempts 2; and a Mesh 429 → OpenRouter leg), `TestPhase2_MeshAPIProviderAlias` (`X-Router0-Providers: aifiesta` and `mesh` both route to `meshapi`), `TestPhase2_ClaudeFailoverToOpenRouter` (Anthropic 529 → OpenRouter `anthropic/claude-sonnet-5.5` serves canonical `claude-sonnet-5-5`), `TestPhase2_ModelsChatOnly` (after discovery against the Gemini and Mesh mocks, `GET /v1/models` contains `gemini-2.5-flash` and `mistral-7b` and contains no id with `image`, `tts`, `lyria`, `computer-use`, `robotics`, `embed`, or `dall-e`; `GET /api/catalog?kind=image` and `?kind=audio` do list them), `TestPhase2_NonChatModelNotServed` (a chat request for `gemini-2.5-flash-image` → 404 `model_not_found`), `TestPhase2_Aliases`, `TestPhase2_AliasCannotShadow`, `TestPhase2_OnDemandDiscovery`, `TestPhase2_OnDemandDebounce`.
 
 ### Gate (exact command)
 
@@ -174,48 +184,51 @@ go test -tags integration ./internal/integration/... -run 'TestPhase1|TestPhase2
 (cd dashboard && pnpm install --frozen-lockfile && pnpm run build)
 ```
 
-Optional smoke: the Phase 1 smoke command with `-run 'TestSmoke'` plus `TEST_ANTHROPIC_KEY`, `TEST_GEMINI_KEY`, `TEST_MESHAPI_KEY`. `TestSmokeAnthropicTools`, `TestSmokeGeminiTools`, and `TestSmokeMeshAPI` each skip when their key is unset.
+The gate needs no real keys, no Docker, and no Redis. It passes only if every `TestPhase2_*` above runs (none skipped), including both agent-loop tests for all five flavours.
+
+Optional smoke (real keys, not part of the gate): the Phase 1 smoke command with `-run 'TestSmoke'` plus `TEST_ANTHROPIC_KEY`, `TEST_GEMINI_KEY`, `TEST_MESHAPI_KEY`. `TestSmokeGeminiTools` (the user's priority; skips when `TEST_GEMINI_KEY` is unset) runs the agent loop above, non-stream and stream, against real Gemini and also asserts `GET /v1/models` contains no image/TTS/music models after discovery. `TestSmokeAnthropicTools` and `TestSmokeMeshAPI` (key `rsk_…`, model `mistral/mistral-7b-instruct-v0` or the first chat model its `/models` lists) each skip when their key is unset.
 
 ### How the user tests it
 
 1. `make mock` (now also Anthropic `:9903`, Gemini `:9904`, Mesh API `:9905`), then `make dev` with `ANTHROPIC_BASE_URL=http://127.0.0.1:9903/v1 GOOGLE_BASE_URL=http://127.0.0.1:9904 MESHAPI_BASE_URL=http://127.0.0.1:9905/v1` (or real keys and no overrides).
-2. Add Anthropic `mock-ok-anth`, Gemini `mock-ok-gem`, Mesh API `mock-ok-mesh` keys. Open **Catalog**: `claude-sonnet-5-5` lists anthropic, openrouter, and meshapi chips.
-3. Using the OpenAI Python SDK against `http://localhost:8080/v1` with the service token, run a weather-tool conversation (`tools=[get_weather]`, then send the tool result back) with `model="claude-sonnet-5-5"`. You get `tool_calls`, then a final answer. Repeat with `stream=True`; `tool_calls[0].function.arguments` deltas concatenate to valid JSON. Repeat with `X-Router0-Providers: google` and a Gemini model.
-4. Catalog page: add alias `smart → claude-sonnet-5-5`; `model="smart"` works and the response `model` is `claude-sonnet-5-5`.
-5. On-demand: `curl -X POST localhost:9902/_models -d '["acme/new-model-x"]'` (mock admin endpoint), then call `model="new-model-x"` → 200 on first try; Catalog shows it with source `on_demand`.
+2. Add Anthropic `mock-ok-anth`, Gemini `mock-ok-gem`, Mesh API `rsk_mock-ok-mesh` keys. Open **Catalog**: `claude-sonnet-5-5` lists anthropic, openrouter, and meshapi chips. Set the kind filter to `image` and `audio`: the Gemini image/TTS/music models appear there only. `curl -s localhost:8080/v1/models -H "Authorization: Bearer $T"` lists none of them. Click "Refresh now" and watch the per-provider status update.
+3. Using the OpenAI Python SDK against `http://localhost:8080/v1` with the service token, run a weather-tool conversation (`tools=[get_weather]`, then send the tool result back) with `model="claude-sonnet-5-5"`. You get `tool_calls`, then a final answer. Repeat with `stream=True`; `tool_calls[0].function.arguments` deltas concatenate to valid JSON. Repeat with `X-Router0-Providers: google` and a Gemini model, and with `X-Router0-Providers: meshapi` (alias `aifiesta` works too).
+4. Real Gemini (optional): add a real Gemini key, run `TEST_GEMINI_KEY=… make smoke` or the same SDK script with `model="gemini-2.5-flash"`; confirm tool calls round-trip in both modes.
+5. Catalog page: add alias `smart → claude-sonnet-5-5`; `model="smart"` works and the response `model` is `claude-sonnet-5-5`.
+6. On-demand: `curl -X POST localhost:9902/_models -d '["acme/new-model-x"]'` (mock admin endpoint), then call `model="new-model-x"` → 200 on first try; Catalog shows it with source `on_demand`.
 
 ---
 
-## Phase 3: Embeddings, balance polling, monthly budgets, priority UI polish, legacy cleanup
+## Phase 3: Balance polling, monthly budgets, priority UI polish, legacy cleanup
 
-**Goal:** `/v1/embeddings` works with the same routing and errors. OpenRouter keys with zero balance are skipped before they fail. Per-key monthly USD budgets stop a key at its limit (402 when nothing else can serve). The priority and key UI gets drag-and-drop, budgets, balances, and "reset state". The legacy pool tables are dropped (their code was already deleted in Phase 1).
+**Goal:** OpenRouter keys with zero balance are skipped before they fail. Per-key monthly USD budgets stop a key at its limit (402 when nothing else can serve). The priority and key UI gets drag-and-drop, budgets, balances, and "reset state". The legacy pool tables are dropped (their code was already deleted in Phase 1).
 
-Capabilities: embeddings, credit-tracking, provider-key-management (P3 parts), dashboard (P3 parts).
+Capabilities: credit-tracking, provider-key-management (P3 parts), dashboard (P3 parts).
 
 ### Slices
 
 | Slice | Owns | Depends on |
 |-------|------|------------|
 | **3A Schema** | `migrations/000021_key_budgets_balances.{up,down}.sql`, `migrations/000022_drop_legacy_pool.{up,down}.sql` | Phase 2 |
-| **3B Embeddings** | `internal/handlers/embeddings.go`, `internal/handlers/embeddings_test.go`, `internal/providers/embed_*.go`, `internal/catalog/embedding_discovery.go` | 3A; `metadata.Record.Endpoint` from 3D |
-| **3C Balance polling** | `internal/balance/`, `internal/providers/openrouter_balance.go`, `internal/providers/openrouter_balance_test.go` | 3A; `keystate` credits set/clear from 3D |
-| **3D Budgets, spend & key state** | `internal/keystate/`, `internal/metadata/` | 3A |
-| **3E Keys & priority polish** | `internal/keys/`, `internal/handlers/keys.go`, `internal/handlers/priority.go`, `dashboard/` | 3A, 3D |
-| **3F Wiring & gate** | `internal/server/`, `cmd/router/main.go`, `cmd/mockprovider/`, `internal/testutil/`, `internal/integration/phase3_test.go`, `Makefile`, `.env.example`, `README.md` | all |
+| **3B Balance polling** | `internal/balance/`, `internal/providers/openrouter_balance.go`, `internal/providers/openrouter_balance_test.go` | 3A; `keystate` credits set/clear from 3C |
+| **3C Budgets, spend & key state** | `internal/keystate/`, `internal/metadata/` | 3A |
+| **3D Keys & priority polish** | `internal/keys/`, `internal/handlers/keys.go`, `internal/handlers/priority.go`, `dashboard/` | 3A, 3C |
+| **3E Wiring & gate** | `internal/server/`, `cmd/router/main.go`, `cmd/mockprovider/`, `internal/testutil/`, `internal/integration/phase3_test.go`, `Makefile`, `.env.example`, `README.md` | all |
 
-Contracts added by 3D for 3B/3C/3E (signatures fixed at slice start): `metadata.Record.Endpoint string`; `keystate.Store.SetCredits(ctx, keyID, reason string, ttl time.Duration) error`; `keystate.Store.ClearCredits(ctx, keyID, onlyReason string) error`; `keystate.Store.Reset(ctx, keyID) error`; `keystate.Store.AddSpend(ctx, keyID string, microUSD int64) error` (upsert into `provider_key_spend`); `keystate.Store.MonthSpend(ctx, keyID string) (microUSD int64, err error)` (5 s in-memory cache).
+Order: 3A → 3B, 3C, 3D in parallel (3B and 3D code against the 3C contracts) → 3E.
+
+Contracts added by 3C for 3B/3D (signatures fixed at slice start): `keystate.Store.SetCredits(ctx, keyID, reason string, ttl time.Duration) error`; `keystate.Store.ClearCredits(ctx, keyID, onlyReason string) error`; `keystate.Store.Reset(ctx, keyID) error`; `keystate.Store.AddSpend(ctx, keyID string, microUSD int64) error` (upsert into `provider_key_spend`); `keystate.Store.MonthSpend(ctx, keyID string) (microUSD int64, err error)` (5 s in-memory cache).
 
 ### Key files
 
-- **3B:** `embeddings.go` (handler reusing `routing.BuildPlan`/`Executor.Run`), `embed_openai_compat.go` (Gemini, Mesh API, OpenRouter, NVIDIA, Together implement `Embedder`), `embedding_discovery.go`.
-- **3C:** `balance/poller.go` (10-min loop over active OpenRouter keys, test hook `PollNow`), `openrouter_balance.go` (`/key`, `/credits` client).
-- **3D:** `keystate/budget.go`, `keystate/spend.go` (Postgres `provider_key_spend`), `keystate/store.go` (budget in `Check`/`CheckMany`), `metadata/recorder.go` (endpoint, spend upsert), `metadata/reconcile.go` (hourly reconcile from `request_metadata`).
-- **3E:** `PATCH /api/keys/{id}`, `POST /api/keys/{id}/reset-state`, balances/spend in `GET /api/keys`; `dashboard/app/dashboard/routing/page.tsx` drag-and-drop (native HTML5 DnD, arrows kept), keys page budget editor, spend bar, balance, and reset button.
-- **3F:** `server.New` gains `/v1/embeddings` and the balance poller, mock embeddings + OpenRouter `/key` endpoints in `mockprovider`.
+- **3B:** `balance/poller.go` (10-min loop over active OpenRouter keys, test hook `PollNow`), `openrouter_balance.go` (`/key`, `/credits` client).
+- **3C:** `keystate/budget.go`, `keystate/spend.go` (Postgres `provider_key_spend`), `keystate/store.go` (budget in `Check`/`CheckMany`), `metadata/recorder.go` (spend upsert), `metadata/reconcile.go` (hourly reconcile from `request_metadata`).
+- **3D:** `PATCH /api/keys/{id}`, `POST /api/keys/{id}/reset-state`, balances/spend in `GET /api/keys`; `dashboard/app/dashboard/routing/page.tsx` drag-and-drop (native HTML5 DnD, arrows kept), keys page budget editor, spend bar, balance, and reset button.
+- **3E:** `server.New` gains the balance poller; mock OpenRouter `/key` and `/credits` endpoints (with a `/_balance` admin endpoint) in `mockprovider`.
 
 ### Integration tests required in `internal/integration/phase3_test.go`
 
-`TestPhase3_Embeddings`, `TestPhase3_EmbeddingsFailover`, `TestPhase3_EmbeddingsWrongKind`, `TestPhase3_EmbeddingsBase64`, `TestPhase3_BalancePollMarksExhausted`, `TestPhase3_BalancePollClears`, `TestPhase3_MonthlyBudget`, `TestPhase3_BudgetCleared`, `TestPhase3_SpendReconcile`, `TestPhase3_ResetKeyState`.
+`TestPhase3_BalancePollMarksExhausted`, `TestPhase3_BalancePollClears`, `TestPhase3_MonthlyBudget`, `TestPhase3_BudgetCleared`, `TestPhase3_SpendReconcile`, `TestPhase3_ResetKeyState`, `TestPhase3_LegacyTablesDropped` (after migrations the legacy pool tables do not exist and chat still works).
 
 ### Gate (exact command)
 
@@ -240,10 +253,9 @@ Optional smoke: `TestSmokeOpenRouterBalance` (needs `TEST_OPENROUTER_KEY`): the 
 
 ### How the user tests it
 
-1. With the mocks running: `curl localhost:8080/v1/embeddings -H "Authorization: Bearer $T" -H 'Content-Type: application/json' -d '{"model":"text-embedding-004","input":"hello"}'` → a vector. The Requests page shows `endpoint: embeddings`.
-2. Provider Keys: set `groq-b` budget to `$0.001`. Send requests until it shows "budget reached". The next request skips it (trail `skipped: budget_exhausted`). With no other key → 402.
-3. Set mock OpenRouter balance to 0 (`curl -X POST localhost:9902/_balance -d 0`). Within 10 min, or after clicking "Poll balances", `or-main` shows "out of credits" and is skipped.
-4. Routing page: drag OpenRouter above Groq and Save; the next request's trail starts with OpenRouter. "Reset state" on a rate-limited key clears its badge immediately (its `provider_key_state` rows are deleted).
+1. Provider Keys: set `groq-b` budget to `$0.001`. Send requests until it shows "budget reached". The next request skips it (trail `skipped: budget_exhausted`). With no other key → 402.
+2. Set mock OpenRouter balance to 0 (`curl -X POST localhost:9902/_balance -d 0`). Within 10 min, or after clicking "Poll balances", `or-main` shows "out of credits" and is skipped.
+3. Routing page: drag OpenRouter above Groq and Save; the next request's trail starts with OpenRouter. "Reset state" on a rate-limited key clears its badge immediately (its `provider_key_state` rows are deleted).
 
 ---
 
@@ -253,7 +265,8 @@ Optional smoke: `TestSmokeOpenRouterBalance` (needs `TEST_OPENROUTER_KEY`): the 
 - [x] No Redis anywhere: key state is in `provider_key_state` (Postgres) + in-memory cache, tokens use an in-process TTL cache, catalog locks and debounce are in-process; go-redis removal is checked by the gates. Docker appears only as the deployment-example note for `docker-compose.yml`.
 - [x] Migrations 000001–000022 use only PG ≤ 14 features (data.md › PostgreSQL Compatibility); none flagged.
 - [x] Phase 1 slices own disjoint paths: 1A migrations 14–19 · 1B `auth/ orgs/ tokens/ handlers/{auth,tokens,admin}.go` · 1C `catalog/ handlers/catalog.go` · 1D `keys/ handlers/{keys,priority}.go` · 1E `providers/ keystate/ cache/` · 1F `routing/ handlers/{inference,helpers}.go metadata/ metrics/ config/alerts.yaml` · 1G `handlers/pool.go` · 1H `dashboard/` · 1I `server/ cmd/router cmd/mockprovider testutil/ integration/ db/redis.go health/ models/ go.mod go.sum docker-compose.yml Makefile .env.example README.md`. No path appears twice.
-- [x] Phase 2 slices are disjoint: provider files are split per adapter (2B `anthropic*`, 2C `google*`, 2D `meshapi*`); catalog/aliases in 2E; dashboard in 2F; wiring in 2G.
-- [x] Phase 3 slices are disjoint: 3B new files only (`handlers/embeddings*.go`, `providers/embed_*.go`, `catalog/embedding_discovery.go`); 3C `balance/`, `providers/openrouter_balance*.go`; 3D `keystate/ metadata/`; 3E `keys/ handlers/{keys,priority}.go dashboard/`; 3F wiring only (legacy code already gone in Phase 1).
+- [x] Phase 2 slices are disjoint: 2A migration 20 · 2B `providers/anthropic*` · 2C `providers/google*` · 2D `providers/meshapi*` + `providers/registry.go` · 2E `catalog/ handlers/{catalog,aliases}.go` · 2F `dashboard/` · 2G `server/ cmd/ testutil/ integration/phase2_test.go smoke_phase2_test.go Makefile .env.example README.md`.
+- [x] Phase 3 slices are disjoint: 3A migrations 21–22 · 3B `balance/`, `providers/openrouter_balance*.go` · 3C `keystate/ metadata/` · 3D `keys/ handlers/{keys,priority}.go dashboard/` · 3E wiring only (legacy code already gone in Phase 1). Slices are lettered A–E consecutively and no removed piece (embeddings) is referenced.
+- [x] Embeddings appear only as an out-of-scope item and as the `embedding` catalog kind that is filtered out of `/v1/models`.
 - [x] agent.md is complete: each AI pattern is evaluated with a decision, and the conclusion is deterministic routing with no LLM inside router0.
 - [x] No placeholders remain; every assumption is marked `Assumed:` inline.

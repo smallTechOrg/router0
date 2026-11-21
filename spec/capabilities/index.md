@@ -11,8 +11,7 @@
 | 7 | Provider Adapters | [provider-adapters.md](./provider-adapters.md) | 1 (Groq, OpenRouter) / 2 (Anthropic, Gemini, Mesh API) |
 | 8 | Dashboard | [dashboard.md](./dashboard.md) | 1 / 2 (catalog page) / 3 (polish) |
 | 9 | Observability (request log, metrics, logs) | [observability.md](./observability.md) | 1 |
-| 10 | Embeddings | [embeddings.md](./embeddings.md) | 3 |
-| 11 | Credit Tracking (balance polling, monthly budgets) | [credit-tracking.md](./credit-tracking.md) | 3 |
+| 10 | Credit Tracking (balance polling, monthly budgets) | [credit-tracking.md](./credit-tracking.md) | 3 |
 
 ## Dependency Map
 
@@ -25,7 +24,6 @@ Orgs, Auth & Onboarding
          └───────┴──► Routing Engine ◄── Error Classification & Key State ◄── Provider Adapters
                             │
                             ├──► Observability (request log + trail)
-                            ├──► Embeddings (P3, reuses executor)
                             └──► Credit Tracking (P3, feeds key state)
 Dashboard: UI over Auth, Tokens, Keys/Priority, Catalog, Request Log
 ```
@@ -36,8 +34,8 @@ Admin invites user → user registers (org created) → adds two Groq keys and o
 
 ## Phase 2 Expansion
 
-Anthropic native adapter with full tool-calling translation, Gemini tool-calling conformance, Mesh API adapter, catalog page, org aliases, and on-demand discovery for unknown models.
+Anthropic native adapter with full tool-calling translation (user priority; non-stream and stream, tested with an OpenAI-SDK-style agent loop), Gemini tool-calling conformance, Mesh API adapter (`meshapi`, `rsk_` keys, vendor-prefixed model ids), chat-only `/v1/models` via model-kind classification, catalog page (canonical model → providers, kind filter, refresh), org aliases, and on-demand discovery for unknown models.
 
 ## Phase 3 Expansion
 
-`/v1/embeddings`, balance polling (OpenRouter), per-key monthly USD budgets, priority/key UI polish (drag-and-drop, reset key state), and deletion of the legacy pool/scorer code.
+Balance polling (OpenRouter), per-key monthly USD budgets, priority/key UI polish (drag-and-drop, reset key state), and deletion of the legacy pool/scorer code.

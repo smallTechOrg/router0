@@ -84,9 +84,10 @@ First available, clamped to [1 s, 3600 s]:
 | Gemini (P2) | 400 `FAILED_PRECONDITION` whose message mentions billing | `insufficient_credits` |
 | Gemini (P2) | 404 `NOT_FOUND` | `model_unavailable` |
 | Gemini (P2) | body is a JSON array `[{"error":…}]` (OpenAI-compat endpoint quirk) | unwrap the first element, then apply the rules |
-| Mesh API (P2) | generic rules | — |
+| Mesh API (P2) | Assumed: generic rules only (OpenAI-style bodies `{"error":{"message","type","code"}}`; 401/403 → `auth`, 402 → `insufficient_credits`, 404 → `model_unavailable`, 429 → `rate_limit` using `Retry-After`, 5xx → `transient`) | — |
+| Mesh API (P2) | Assumed: an upstream-vendor failure surfaced by Mesh as 502/503/504 is `transient`; a body whose `error.code`/`error.type` is one of the generic credit codes (rule 2 above) is `insufficient_credits` whatever the status | — |
 
-Assumed: the OpenRouter 403-moderation, Groq 498/413, Gemini billing, and Mesh API behaviours come from public docs as understood at spec time; each rule has a fixture-based unit test, so a wrong rule is a one-line fix. Mesh API rules stay generic until its docs (app.meshapi.ai) are checked during the Phase 2 slice.
+Assumed: the OpenRouter 403-moderation, Groq 498/413, Gemini billing, and Mesh API behaviours come from public docs as understood at spec time; each rule has a fixture-based unit test, so a wrong rule is a one-line fix. Mesh API rules are `Assumed:` generic until its error shapes are verified against real responses (app.meshapi.ai); the Phase 2 slice 2D adds a fixture for each assumed shape, and the optional `TestSmokeMeshAPI` with a deliberately invalid key `rsk_invalid_router0_smoke` records the real 401 body for review.
 
 ### Key-state checks (`keystate.Check(key, model)`)
 
