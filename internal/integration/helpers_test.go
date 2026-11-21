@@ -178,6 +178,9 @@ type env struct {
 	secret string
 	groq   *mockprovider.Server
 	or     *mockprovider.Server
+	anth   *mockprovider.Server // Anthropic Messages API flavour
+	gem    *mockprovider.Server // Gemini (Google OpenAI-compat + native listing)
+	mesh   *mockprovider.Server // Mesh API
 	app    *server.App
 	ts     *httptest.Server
 	admin  string // platform-admin JWT
@@ -189,10 +192,17 @@ func newEnv(t *testing.T) *env {
 	e := &env{t: t, pool: pool, secret: mustEnv(t, "JWT_SECRET")}
 	e.groq = mockprovider.New(mockprovider.Options{Flavour: mockprovider.Groq})
 	e.or = mockprovider.New(mockprovider.Options{Flavour: mockprovider.OpenRouter})
+	e.anth = mockprovider.New(mockprovider.Options{Flavour: mockprovider.Anthropic})
+	e.gem = mockprovider.New(mockprovider.Options{Flavour: mockprovider.Gemini})
+	e.mesh = mockprovider.New(mockprovider.Options{Flavour: mockprovider.MeshAPI})
 	t.Setenv("GROQ_BASE_URL", e.groq.BaseURL())
 	t.Setenv("OPENROUTER_BASE_URL", e.or.BaseURL())
-	t.Cleanup(e.groq.Close)
-	t.Cleanup(e.or.Close)
+	t.Setenv("ANTHROPIC_BASE_URL", e.anth.BaseURL())
+	t.Setenv("GOOGLE_BASE_URL", e.gem.BaseURL())
+	t.Setenv("MESHAPI_BASE_URL", e.mesh.BaseURL())
+	for _, m := range []*mockprovider.Server{e.groq, e.or, e.anth, e.gem, e.mesh} {
+		t.Cleanup(m.Close)
+	}
 	e.app, e.ts = e.startServer()
 	e.admin = e.makeAdmin()
 	return e
@@ -206,6 +216,9 @@ func newRealEnv(t *testing.T) *env {
 	e := &env{t: t, pool: pool, secret: mustEnv(t, "JWT_SECRET")}
 	t.Setenv("GROQ_BASE_URL", "")
 	t.Setenv("OPENROUTER_BASE_URL", "")
+	t.Setenv("ANTHROPIC_BASE_URL", "")
+	t.Setenv("GOOGLE_BASE_URL", "")
+	t.Setenv("MESHAPI_BASE_URL", "")
 	e.app, e.ts = e.startServer()
 	e.admin = e.makeAdmin()
 	return e

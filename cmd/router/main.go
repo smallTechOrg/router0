@@ -18,6 +18,7 @@ import (
 
 	"github.com/zer0-router/zer0/internal/db"
 	"github.com/zer0-router/zer0/internal/orgs"
+	"github.com/zer0-router/zer0/internal/providers"
 	"github.com/zer0-router/zer0/internal/server"
 )
 
@@ -58,6 +59,7 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("migrations: up to date")
+	slog.Info("providers: registered", "providers", providers.ValidProviders())
 
 	bootstrapAdmin(ctx, pool)
 

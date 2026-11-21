@@ -27,11 +27,13 @@ Use `127.0.0.1`, not `localhost` (IPv6 `::1` is refused). Set `GO111MODULE=on` f
 ### Try it without real provider keys
 
 ```bash
-# terminal 1: mock providers (Groq flavour on :9901, OpenRouter flavour on :9902)
+# terminal 1: mock providers (Groq :9901, OpenRouter :9902, Anthropic :9903, Gemini :9904, Mesh API :9905)
 make mock
 
 # terminal 2: the gateway, pointed at the mocks (migrations run on start)
-source .env && GROQ_BASE_URL=http://127.0.0.1:9901 OPENROUTER_BASE_URL=http://127.0.0.1:9902 make dev
+source .env && GROQ_BASE_URL=http://127.0.0.1:9901/v1 OPENROUTER_BASE_URL=http://127.0.0.1:9902/v1 \
+  ANTHROPIC_BASE_URL=http://127.0.0.1:9903/v1 GOOGLE_BASE_URL=http://127.0.0.1:9904 \
+  MESHAPI_BASE_URL=http://127.0.0.1:9905/v1 make dev
 
 # terminal 3: the dashboard
 cd dashboard && pnpm install && pnpm dev     # http://localhost:3000
@@ -70,6 +72,38 @@ Mock key behaviours: `mock-ok*` (200, JSON and SSE), `mock-429-<secs>*` (429 + `
 
 Same flow without the `*_BASE_URL` overrides: add real Groq / OpenRouter keys and call with `"model":"llama-3.3-70b"` (any provider-specific id such as `meta-llama/llama-3.3-70b-instruct` also resolves).
 
+## Anthropic, Gemini, Mesh API, tool calling, catalog and aliases
+
+**Providers.** Add keys on the Provider Keys page (or `POST /api/keys`):
+
+| Provider id | Key looks like | Base URL env (default) | Notes |
+|-------------|----------------|------------------------|-------|
+| `anthropic` | `sk-ant-...` | `ANTHROPIC_BASE_URL` (`https://api.anthropic.com/v1`) | native Messages API; OpenAI requests are translated, streaming included |
+| `google` (alias `gemini`) | `AIza...` | `GOOGLE_BASE_URL` (`https://generativelanguage.googleapis.com`) | OpenAI-compatible chat endpoint plus native model listing |
+| `meshapi` (aliases `aifiesta`, `mesh`) | `rsk_...` | `MESHAPI_BASE_URL` (`https://api.meshapi.ai/v1`) | OpenAI-compatible; vendor-prefixed ids such as `mistral/mistral-7b-instruct-v0` |
+
+**Tool calling** is OpenAI-format and works the same on Groq, OpenRouter, Anthropic, Gemini and Mesh API, streaming included: send `tools` and `tool_choice`, get `finish_reason: "tool_calls"` with `tool_calls[].id`, send back the assistant turn and `role: "tool"` messages with `tool_call_id`. Gemini quirks (missing ids, repeated indexes, `stop` finish reason) and Anthropic's `tool_use`/`tool_result` blocks are normalised by the adapters.
+
+**Using router0 from an OpenAI-compatible agent:** base URL `http://localhost:8080/v1`, API key = a service token (`r0-sk-...`), model = a canonical name from `GET /v1/models` (for example `claude-sonnet-5-5`, `gemini-2.5-flash`, `llama-3.3-70b`, `mistral-7b`). Pin a provider with `X-Router0-Providers: google` (or `anthropic`, `meshapi`/`aifiesta`/`mesh`).
+
+```python
+from openai import OpenAI
+c = OpenAI(base_url="http://localhost:8080/v1", api_key="r0-sk-...")
+tools = [{"type": "function", "function": {"name": "get_weather", "parameters": {
+    "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+msgs = [{"role": "user", "content": "Weather in Paris?"}]
+r = c.chat.completions.create(model="claude-sonnet-5-5", messages=msgs, tools=tools)
+call = r.choices[0].message.tool_calls[0]
+msgs += [r.choices[0].message, {"role": "tool", "tool_call_id": call.id, "content": '{"temp_c":18}'}]
+print(c.chat.completions.create(model="claude-sonnet-5-5", messages=msgs, tools=tools).choices[0].message.content)
+```
+
+**Catalog.** `/v1/models` lists chat models only. Image, audio, embedding and other models are discovered and kept (dashboard **Catalog** page, kind filter; `GET /api/catalog?kind=image`), but a chat request for one returns `404 model_not_found`. "Refresh now" (`POST /api/catalog/refresh`) re-lists every provider. A model a provider added after the last refresh is found on demand at request time (60 s per-model debounce).
+
+**Aliases.** `POST /api/aliases {"alias":"smart","canonical_model":"claude-sonnet-5-5"}` (owner/admin; `GET` for any member, `DELETE /api/aliases/smart`). `model="smart"` then works and the response `model` is the canonical name. An alias that equals an existing model is rejected with `422 alias_shadows_model`; a duplicate with `409 alias_conflict`.
+
+**Mock keys** (Phase 2 mocks): Anthropic `mock-ok-anth`, `mock-credits-*` (400 "credit balance is too low" -> router0 402), `mock-529-*` (overloaded -> failover); Mesh keys may carry the prefix, e.g. `rsk_mock-429-15-a`. Select a scripted tool conversation by adding `[scenario:single]`, `[scenario:parallel]` or `[scenario:chain]` to the user message together with a `tools` list. `curl -X POST localhost:9902/_models -d '["acme/new-model-x"]'` changes a mock's model list (on-demand discovery demo).
+
 ## How the gateway behaves
 
 - **Model resolution:** the requested name is canonicalised (`llama-3.3-70b-versatile`, `meta-llama/llama-3.3-70b-instruct` and `Llama-3.3-70B` are the same model) and matched against the org's catalog, which is discovered from each provider's model list.
@@ -96,16 +130,17 @@ Precedence when several apply: 429 > 402 > 404 > 400 > 503. Every error body car
 make test         # unit tests (creates router0_test if needed)
 make build        # bin/router
 make gate-phase1  # the full Phase 1 gate (see below)
-make smoke        # optional real-key smoke tests (TEST_GROQ_KEY / TEST_OPENROUTER_KEY)
+make gate-phase2  # the full Phase 2 gate: Phase 1 + Anthropic/Gemini/Mesh/tool-calling/catalog tests
+make smoke        # optional real-key smoke tests (TEST_GROQ_KEY, TEST_OPENROUTER_KEY, TEST_ANTHROPIC_KEY, TEST_GEMINI_KEY, TEST_MESHAPI_KEY)
 ```
 
 The **Phase 1 gate** (`make gate-phase1`) builds, vets, runs unit tests, runs every `TestPhase1_*` integration test against the real Postgres database `router0_test` with mock providers, checks that go-redis is gone from `go.mod` and no legacy branding is left in the dashboard, and builds the dashboard. It needs only local Postgres.
 
-Integration tests (`internal/integration`) drive `server.New`, the same route table `cmd/router` uses, over HTTP; providers are scripted mock servers from `internal/testutil/mockprovider`, selected through `GROQ_BASE_URL` / `OPENROUTER_BASE_URL`. Each test creates its own org and never truncates tables.
+Integration tests (`internal/integration`) drive `server.New`, the same route table `cmd/router` uses, over HTTP; providers are scripted mock servers from `internal/testutil/mockprovider`, selected through `GROQ_BASE_URL` / `OPENROUTER_BASE_URL` / `ANTHROPIC_BASE_URL` / `GOOGLE_BASE_URL` / `MESHAPI_BASE_URL`. The OpenAI-SDK-style agent loop used by the tool-calling tests is `internal/testutil/agentloop`. Each test creates its own org and never truncates tables.
 
 ### Troubleshooting
 
-- **`pnpm` fails on Node 22 on this machine** (broken asdf shim): prefix dashboard commands with `ASDF_NODEJS_VERSION=23.11.0`, e.g. `ASDF_NODEJS_VERSION=23.11.0 pnpm run build`. `make gate-phase1` already does.
+- **`pnpm` fails on Node 22 on this machine** (broken asdf shim): prefix dashboard commands with `ASDF_NODEJS_VERSION=23.11.0`, e.g. `ASDF_NODEJS_VERSION=23.11.0 pnpm run build`. `make gate-phase1` / `gate-phase2` already do.
 - **Go builds ignore modules:** asdf may set `GO111MODULE=off` globally; use `GO111MODULE=on` (the Makefile exports it).
 - **Connection refused on `localhost:5432`:** use `127.0.0.1` in `DATABASE_URL`.
 

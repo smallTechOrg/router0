@@ -94,6 +94,11 @@ func Build(d Deps) *App {
 	apiCatalog := handlers.NewCatalogHandler(catalogRepo, discovery, func(r *http.Request) string {
 		return auth.OrgIDFromCtx(r.Context())
 	})
+	aliasesHandler := handlers.NewAliasesHandler(catalogRepo, func(r *http.Request) string {
+		return auth.OrgIDFromCtx(r.Context())
+	}, func(r *http.Request) string {
+		return auth.UserIDFromCtx(r.Context())
+	})
 	requestLog := handlers.NewRequestLogHandler(pool)
 
 	recorder := metadata.NewRecorder(pool)
@@ -154,6 +159,10 @@ func Build(d Deps) *App {
 
 		r.Get("/api/catalog", apiCatalog.GetCatalog)
 		r.With(orgWrite).Post("/api/catalog/refresh", apiCatalog.RefreshCatalog)
+
+		r.Get("/api/aliases", aliasesHandler.List)
+		r.With(orgWrite).Post("/api/aliases", aliasesHandler.Create)
+		r.With(orgWrite).Delete("/api/aliases/{alias}", aliasesHandler.Delete)
 
 		r.Get("/api/requests", requestLog.ListRequests)
 		r.Get("/api/requests/{id}", requestLog.GetRequest)
