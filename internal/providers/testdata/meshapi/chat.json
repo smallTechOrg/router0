@@ -1,0 +1,1 @@
+{"id":"chatcmpl-mesh1","model":"mistral/mistral-7b-instruct-v0","choices":[{"message":{"role":"assistant","content":"Hello from Mesh"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}

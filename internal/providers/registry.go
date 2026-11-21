@@ -14,7 +14,9 @@ var (
 
 // aliases map accepted alternative provider ids to the canonical one.
 var aliases = map[string]string{
-	"gemini": "google",
+	"gemini":   "google",
+	"aifiesta": "meshapi",
+	"mesh":     "meshapi",
 }
 
 // Register adds a provider under its Name(). Each adapter calls this from its

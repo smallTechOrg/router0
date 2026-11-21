@@ -1,0 +1,8 @@
+data: {"id":"s1","model":"mistral/mistral-7b-instruct-v0","choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]}}]}
+
+data: {"id":"s1","model":"mistral/mistral-7b-instruct-v0","choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"s1","model":"mistral/mistral-7b-instruct-v0","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}
+
+data: [DONE]
+
