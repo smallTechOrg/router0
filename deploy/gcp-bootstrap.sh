@@ -14,7 +14,8 @@
 #   CLOUDSQL_INSTANCE=my-proj:us-central1:my-instance ./deploy/gcp-bootstrap.sh
 #
 # Optional: REGION (us-central1), GITHUB_REPO (smallTechOrg/router0),
-#           ADMIN_PASSWORD (generated + printed once if unset), DB_NAME (router0).
+#           ADMIN_PASSWORD (generated + printed once if unset), DB_NAME (router0),
+#           DB_MAX_CONNS (1: gateway connection-pool cap, for small shared instances).
 set -euo pipefail
 
 : "${PROJECT_ID:?set PROJECT_ID}"
@@ -60,13 +61,25 @@ for sa in "$DEPLOY_SA_NAME" "$RUNTIME_SA_NAME"; do
     g iam service-accounts create "$sa" --display-name "$sa"
 done
 
-say "IAM: deployer (Cloud Run admin, push images, act as runtime SA)"
-g projects add-iam-policy-binding "$PROJECT_ID" --member "serviceAccount:${DEPLOY_SA}" \
-  --role roles/run.admin --condition=None >/dev/null
+say "IAM: deployer (push images, act as runtime SA)"
 g artifacts repositories add-iam-policy-binding "$AR_REPO" --location "$REGION" \
   --member "serviceAccount:${DEPLOY_SA}" --role roles/artifactregistry.writer >/dev/null
 g iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
   --member "serviceAccount:${DEPLOY_SA}" --role roles/iam.serviceAccountUser >/dev/null
+
+# Least privilege for a SHARED project: the deploy SA gets Cloud Run admin on the two
+# router0 services only (not project-wide). The services are created here once, from a
+# public placeholder image, so a per-service IAM binding can exist; the Deploy workflow
+# then rolls real images onto them.
+say "Cloud Run services (placeholder) + per-service deployer binding"
+for svc in router0-gateway router0-dashboard; do
+  if ! g run services describe "$svc" --region "$REGION" >/dev/null 2>&1; then
+    g run deploy "$svc" --region "$REGION" --image us-docker.pkg.dev/cloudrun/container/hello \
+      --service-account "$RUNTIME_SA" --max-instances 1 --allow-unauthenticated --quiet
+  fi
+  g run services add-iam-policy-binding "$svc" --region "$REGION" \
+    --member "serviceAccount:${DEPLOY_SA}" --role roles/run.admin >/dev/null
+done
 
 # ---- Secrets (created once; NEVER overwritten: rotating AES_KEY would make every
 # stored provider key undecryptable) ----------------------------------------------
@@ -93,7 +106,9 @@ if [ -n "${CLOUDSQL_INSTANCE:-}" ]; then
   g sql databases describe "$DB_NAME" --instance "$INSTANCE_NAME" >/dev/null 2>&1 || \
     g sql databases create "$DB_NAME" --instance "$INSTANCE_NAME"
   if ! secret_exists router0-database-url; then
-    DB_PASS="$(openssl rand -hex 24)"
+    # Cloud SQL password policy wants upper+lower+digit+symbol; "Zq9-" supplies the classes and
+    # every character stays URL-safe (no percent-encoding needed in the DSN).
+    DB_PASS="$(openssl rand -hex 20)Zq9-"
     if g sql users list --instance "$INSTANCE_NAME" --format='value(name)' | grep -qx router0; then
       g sql users set-password router0 --instance "$INSTANCE_NAME" --password "$DB_PASS"
     else
@@ -105,7 +120,8 @@ if [ -n "${CLOUDSQL_INSTANCE:-}" ]; then
     echo "  secret router0-database-url exists (kept)"
   fi
   g projects add-iam-policy-binding "$PROJECT_ID" --member "serviceAccount:${RUNTIME_SA}" \
-    --role roles/cloudsql.client --condition=None >/dev/null
+    --role roles/cloudsql.client \
+    --condition="expression=resource.type == \"sqladmin.googleapis.com/Instance\" && resource.name == \"projects/${PROJECT_ID}/instances/${INSTANCE_NAME}\",title=router0-cloudsql-only" >/dev/null
 else
   say "Database URL secret"
   create_secret router0-database-url "$DATABASE_URL"
@@ -125,7 +141,7 @@ g iam workload-identity-pools providers describe "$PROVIDER" --location global \
   g iam workload-identity-pools providers create-oidc "$PROVIDER" --location global \
     --workload-identity-pool "$POOL" --issuer-uri "https://token.actions.githubusercontent.com" \
     --attribute-mapping "google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref" \
-    --attribute-condition "assertion.repository=='${GITHUB_REPO}'"
+    --attribute-condition "assertion.repository=='${GITHUB_REPO}' && (assertion.event_name=='push' || assertion.event_name=='workflow_dispatch') && assertion.ref=='refs/heads/main'"
 WIF_PROVIDER="projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL}/providers/${PROVIDER}"
 g iam service-accounts add-iam-policy-binding "$DEPLOY_SA" \
   --member "principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL}/attribute.repository/${GITHUB_REPO}" \
@@ -141,6 +157,7 @@ setvar GCP_DEPLOY_SA "$DEPLOY_SA"
 setvar GCP_WIF_PROVIDER "$WIF_PROVIDER"
 setvar GCP_CLOUDSQL_INSTANCE "${CLOUDSQL_INSTANCE:-}"
 setvar ROUTER0_ADMIN_EMAIL "$ADMIN_EMAIL"
+setvar ROUTER0_DB_MAX_CONNS "${DB_MAX_CONNS:-1}"
 
 say "Done"
 if [ -n "$GENERATED_ADMIN_PASSWORD" ]; then
