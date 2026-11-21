@@ -14,7 +14,7 @@ type Entry struct{ Canonical, Provider, ProviderModelID, Kind string }
 // Model is a discovered model ready to be stored.
 type Model struct {
 	ProviderModelID   string
-	Kind              string // chat | embedding
+	Kind              string // chat | embedding | image | audio | other
 	ContextWindow     int
 	InputCostPerMTok  float64
 	OutputCostPerMTok float64
@@ -145,19 +145,19 @@ WHERE org_id=$1 AND canonical_model=$2 AND is_available AND kind=$3`+activeKeyCl
 ORDER BY provider, provider_model_id`, orgID, canonical, kind)
 }
 
-// List returns catalog rows ordered by canonical model. availableOnly restricts
-// to available rows on providers with an active key. q filters canonical names
-// by case-insensitive substring.
-func (r *Repository) List(ctx context.Context, orgID, q string, availableOnly bool) ([]Row, error) {
+// List returns catalog rows ordered by canonical model. kind "" means all
+// kinds. availableOnly restricts to available rows on providers with an active
+// key. q filters canonical names by case-insensitive substring.
+func (r *Repository) List(ctx context.Context, orgID, q, kind string, availableOnly bool) ([]Row, error) {
 	sql := `
 SELECT canonical_model, provider, provider_model_id, kind, source, is_available, last_seen_at
 FROM org_model_catalog c
-WHERE org_id=$1 AND ($2='' OR position(lower($2) in canonical_model) > 0)`
+WHERE org_id=$1 AND ($2='' OR position(lower($2) in canonical_model) > 0) AND ($3='' OR kind=$3)`
 	if availableOnly {
 		sql += ` AND is_available` + activeKeyClause
 	}
 	sql += ` ORDER BY canonical_model, provider, provider_model_id`
-	return r.query(ctx, sql, orgID, q)
+	return r.query(ctx, sql, orgID, q, kind)
 }
 
 func (r *Repository) query(ctx context.Context, sql string, args ...any) ([]Row, error) {
@@ -249,4 +249,14 @@ func (r *Repository) LastRefreshed(ctx context.Context, orgID, provider string) 
 		return time.Time{}, nil
 	}
 	return t, err
+}
+
+// HasOtherKind reports whether the org has an available row for the canonical
+// model whose kind is not the given one (e.g. a non-chat model asked for as chat).
+func (r *Repository) HasOtherKind(ctx context.Context, orgID, canonical, kind string) (bool, error) {
+	var ok bool
+	err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM org_model_catalog WHERE org_id=$1 AND canonical_model=$2 AND is_available AND kind<>$3)`,
+		orgID, canonical, kind).Scan(&ok)
+	return ok, err
 }

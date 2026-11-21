@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -132,10 +131,11 @@ func (d *Discovery) refresh(ctx context.Context, orgID, provider, source string)
 		}
 		models := make([]Model, 0, len(infos))
 		for _, mi := range infos {
-			kind, skip := classifyModel(provider, mi.ID)
-			if skip {
-				continue
+			var methods []string
+			if v, ok := mi.Extra["methods"].([]string); ok {
+				methods = v
 			}
+			kind := ClassifyKind(provider, mi.ID, methods)
 			models = append(models, Model{
 				ProviderModelID:   mi.ID,
 				Kind:              kind,
@@ -155,18 +155,4 @@ func (d *Discovery) refresh(ctx context.Context, orgID, provider, source string)
 		slog.Warn("catalog: record refresh error failed", "org_id", orgID, "provider", provider)
 	}
 	return 0, lastErr
-}
-
-// classifyModel returns the model kind and whether it should be skipped.
-func classifyModel(provider, id string) (kind string, skip bool) {
-	l := strings.ToLower(id)
-	if provider == "groq" {
-		if strings.Contains(l, "whisper") || strings.Contains(l, "tts") || strings.Contains(l, "guard") {
-			return "", true
-		}
-	}
-	if strings.Contains(l, "embed") {
-		return "embedding", false
-	}
-	return "chat", false
 }

@@ -31,14 +31,20 @@ type provModel struct {
 	ProviderModelID string `json:"provider_model_id"`
 }
 
-// ListModels handles GET /v1/models.
+// ListModels handles GET /v1/models: available chat canonical models plus the
+// org's aliases (router0.alias_of), alphabetical.
 func (h *CatalogHandler) ListModels(w http.ResponseWriter, r *http.Request) {
 	org := h.orgID(r)
 	if org == "" {
 		writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_token", "authentication required")
 		return
 	}
-	rows, err := h.repo.List(r.Context(), org, "", true)
+	rows, err := h.repo.List(r.Context(), org, "", catalog.KindChat, true)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "internal_error", "failed to list models")
+		return
+	}
+	aliases, err := h.repo.ListAliases(r.Context(), org)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "internal_error", "failed to list models")
 		return
@@ -58,24 +64,42 @@ func (h *CatalogHandler) ListModels(w http.ResponseWriter, r *http.Request) {
 		if _, ok := idx[key]; !ok {
 			idx[key] = len(data)
 			data = append(data, item{ID: row.Canonical, Object: "model", Created: row.LastSeenAt.Unix(), OwnedBy: "router0",
-				Router0: map[string]any{"kind": row.Kind}})
+				Router0: map[string]any{"kind": catalog.KindChat}})
 		}
 		provs[key] = append(provs[key], provModel{row.Provider, row.ProviderModelID})
 	}
 	for i := range data {
 		data[i].Router0["providers"] = provs[data[i].ID]
 	}
+	// Aliases whose target is currently servable; the real model wins on a name clash.
+	for _, a := range aliases {
+		ti, ok := idx[a.CanonicalModel]
+		if !ok {
+			continue
+		}
+		if _, clash := idx[a.Alias]; clash {
+			continue
+		}
+		data = append(data, item{ID: a.Alias, Object: "model", Created: a.CreatedAt.Unix(), OwnedBy: "router0",
+			Router0: map[string]any{"kind": catalog.KindChat, "alias_of": data[ti].ID}})
+	}
+	sort.SliceStable(data, func(i, j int) bool { return data[i].ID < data[j].ID })
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
-// GetCatalog handles GET /api/catalog[?q=].
+// GetCatalog handles GET /api/catalog[?q=][&kind=]. All kinds unless kind is given.
 func (h *CatalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 	org := h.orgID(r)
 	if org == "" {
 		writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_token", "authentication required")
 		return
 	}
-	rows, err := h.repo.List(r.Context(), org, r.URL.Query().Get("q"), false)
+	kind := r.URL.Query().Get("kind")
+	if kind != "" && !catalog.ValidKind(kind) {
+		writeError(w, http.StatusUnprocessableEntity, "invalid_request_error", "invalid_kind", "kind must be one of chat, image, audio, embedding, other")
+		return
+	}
+	rows, err := h.repo.List(r.Context(), org, r.URL.Query().Get("q"), kind, false)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "internal_error", "failed to load catalog")
 		return
@@ -83,6 +107,7 @@ func (h *CatalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 	type provRow struct {
 		Provider        string    `json:"provider"`
 		ProviderModelID string    `json:"provider_model_id"`
+		Kind            string    `json:"kind"`
 		Source          string    `json:"source"`
 		Available       bool      `json:"available"`
 		LastSeenAt      time.Time `json:"last_seen_at"`
@@ -93,22 +118,28 @@ func (h *CatalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 		Providers []provRow `json:"providers"`
 	}
 	models := []model{}
-	idx := map[string]int{}
+	idx := map[[2]string]int{} // (canonical, kind): a canonical name can carry different kinds on different providers
 	for _, row := range rows {
-		i, ok := idx[row.Canonical]
+		k := [2]string{row.Canonical, row.Kind}
+		i, ok := idx[k]
 		if !ok {
 			i = len(models)
-			idx[row.Canonical] = i
+			idx[k] = i
 			models = append(models, model{Canonical: row.Canonical, Kind: row.Kind, Providers: []provRow{}})
 		}
-		models[i].Providers = append(models[i].Providers, provRow{row.Provider, row.ProviderModelID, row.Source, row.Available, row.LastSeenAt})
+		models[i].Providers = append(models[i].Providers, provRow{row.Provider, row.ProviderModelID, row.Kind, row.Source, row.Available, row.LastSeenAt})
 	}
 	refs, err := h.repo.Refreshes(r.Context(), org)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "server_error", "internal_error", "failed to load catalog")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": models, "refreshes": refreshJSON(refs, nil), "aliases": []any{}})
+	aliases, err := h.repo.ListAliases(r.Context(), org)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "internal_error", "failed to load catalog")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"models": models, "refreshes": refreshJSON(refs, nil), "aliases": aliasJSON(aliases)})
 }
 
 // RefreshCatalog handles POST /api/catalog/refresh (owner/admin; gated by the router).

@@ -11,6 +11,7 @@ var (
 	dateDashRe   = regexp.MustCompile(`-\d{4}-\d{2}-\d{2}$`)
 	dateCompact  = regexp.MustCompile(`-\d{8}$`)
 	digitsSegRe  = regexp.MustCompile(`-\d{3,5}$`)
+	bareVersion  = regexp.MustCompile(`-v\d+$`) // "-v0", "-v2"; "-v0.1" does not match
 	multiDashRe  = regexp.MustCompile(`-{2,}`)
 	trailingSufs = []string{"-latest", "-versatile", "-instruct", "-instant", "-chat", "-it", "-hf"}
 )
@@ -20,11 +21,10 @@ var (
 // spec/capabilities/model-catalog.md.
 func Canonicalize(provider, modelID string) string {
 	s := strings.ToLower(strings.TrimSpace(modelID))
-	if v, ok := overrides[[2]string{strings.ToLower(provider), s}]; ok {
-		return v
-	}
-	if v, ok := overrides[[2]string{"", s}]; ok {
-		return v
+	for _, k := range [][2]string{{strings.ToLower(provider), s}, {"", s}} {
+		if v, ok := overrides[k]; ok && !strings.HasPrefix(v, "kind:") {
+			return v
+		}
 	}
 	s = strings.TrimPrefix(s, "models/")
 
@@ -46,6 +46,7 @@ func Canonicalize(provider, modelID string) string {
 		s = dateDashRe.ReplaceAllString(s, "")
 		s = dateCompact.ReplaceAllString(s, "")
 		s = digitsSegRe.ReplaceAllString(s, "")
+		s = bareVersion.ReplaceAllString(s, "")
 		for _, suf := range trailingSufs {
 			if strings.HasSuffix(s, suf) {
 				s = strings.TrimSuffix(s, suf)

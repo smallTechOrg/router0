@@ -23,6 +23,8 @@ type fakeProv struct {
 	// perKey: apiKey -> error to return
 	keyErr map[string]error
 	block  chan struct{}
+	// methods: model id -> Extra["methods"] (Gemini supportedGenerationMethods)
+	methods map[string][]string
 }
 
 func (f *fakeProv) Name() string { return f.name }
@@ -43,7 +45,11 @@ func (f *fakeProv) ListModels(ctx context.Context, apiKey string) ([]providers.M
 	defer f.mu.Unlock()
 	var out []providers.ModelInfo
 	for _, id := range f.models {
-		out = append(out, providers.ModelInfo{ID: id, ContextWindow: 8192})
+		mi := providers.ModelInfo{ID: id, ContextWindow: 8192}
+		if m, ok := f.methods[id]; ok {
+			mi.Extra = map[string]any{"methods": m}
+		}
+		out = append(out, mi)
 	}
 	return out, nil
 }
@@ -149,8 +155,8 @@ func TestDiscoverAndResolve(t *testing.T) {
 	e.provs["groq"].set("llama-3.3-70b-versatile", "whisper-large-v3", "llama-guard-3-8b", "llama-3.1-8b-instant")
 	e.provs["openrouter"].set("meta-llama/llama-3.3-70b-instruct", "meta-llama/llama-3.3-70b-instruct:free", "openai/text-embedding-3-small")
 
-	if n, err := e.disc.RefreshProvider(ctx, e.org, "groq"); err != nil || n != 2 {
-		t.Fatalf("groq refresh n=%d err=%v (whisper/guard must be skipped)", n, err)
+	if n, err := e.disc.RefreshProvider(ctx, e.org, "groq"); err != nil || n != 4 {
+		t.Fatalf("groq refresh n=%d err=%v (all kinds stored)", n, err)
 	}
 	if n, err := e.disc.RefreshProvider(ctx, e.org, "openrouter"); err != nil || n != 3 {
 		t.Fatalf("openrouter refresh n=%d err=%v", n, err)
@@ -180,7 +186,7 @@ func TestDiscoverAndResolve(t *testing.T) {
 		t.Fatalf("embedding not resolved: %+v", r)
 	}
 
-	rows, err := e.repo.List(ctx, e.org, "llama-3.3", true)
+	rows, err := e.repo.List(ctx, e.org, "llama-3.3", "chat", true)
 	if err != nil || len(rows) != 3 {
 		t.Fatalf("list rows=%d err=%v", len(rows), err)
 	}
@@ -194,7 +200,7 @@ func TestDiscoverAndResolve(t *testing.T) {
 	if _, err := e.disc.RefreshProvider(ctx, e.org, "groq"); err != nil {
 		t.Fatal(err)
 	}
-	e.res.misses = map[string]time.Time{}
+	e.res.od.misses = map[string]*missEntry{}
 	e.pool.Exec(ctx, `UPDATE org_catalog_refreshes SET last_refreshed_at = NOW() - interval '1 hour' WHERE org_id=$1`, e.org)
 	got, _ = e.res.Resolve(ctx, e.org, "llama-3.3-70b")
 	if m := providersOf(got); len(m) != 1 || m["openrouter"] == "" {
@@ -265,7 +271,7 @@ func TestRefreshErrorKeepsRows(t *testing.T) {
 	if refs[0].LastStatus != "error" || refs[0].LastErrorClass != "transient" {
 		t.Fatalf("%+v", refs[0])
 	}
-	rows, _ := e.repo.List(ctx, e.org, "", true)
+	rows, _ := e.repo.List(ctx, e.org, "", "", true)
 	if len(rows) != 1 {
 		t.Fatalf("rows kept expected, got %d", len(rows))
 	}

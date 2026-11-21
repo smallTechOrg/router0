@@ -4,8 +4,6 @@ import (
 	"context"
 	"sort"
 	"strings"
-	"sync"
-	"time"
 )
 
 // Resolver maps a requested model name to the org's reachable provider models.
@@ -13,51 +11,48 @@ type Resolver interface {
 	Resolve(ctx context.Context, orgID, requested string) ([]Entry, error) // nil, nil = not found
 }
 
-const (
-	missDebounceTTL    = 60 * time.Second
-	refreshStaleAfter  = 60 * time.Second
-	onDemandTotalLimit = 10 * time.Second
-)
-
-// CatalogResolver implements Resolver on top of the repository, with on-demand
-// discovery (debounced) on a miss.
+// CatalogResolver implements Resolver on top of the repository: org alias
+// step, kind-filtered lookup, and debounced on-demand discovery on a miss.
 type CatalogResolver struct {
 	repo *Repository
-	disc *Discovery
-
-	mu     sync.Mutex
-	misses map[string]time.Time // "org|canonical" -> expiry
-	now    func() time.Time
+	od   *onDemand
 }
 
 func NewResolver(repo *Repository, disc *Discovery) *CatalogResolver {
-	return &CatalogResolver{repo: repo, disc: disc, misses: map[string]time.Time{}, now: time.Now}
+	return &CatalogResolver{repo: repo, od: newOnDemand(repo, disc)}
 }
 
 // Resolve returns one Entry per provider (chat kind) for the requested name.
+// Entry.Canonical is the canonical model (the alias target for an alias).
 func (r *CatalogResolver) Resolve(ctx context.Context, orgID, requested string) ([]Entry, error) {
-	return r.ResolveKind(ctx, orgID, requested, "chat")
+	return r.ResolveKind(ctx, orgID, requested, KindChat)
 }
 
-// ResolveKind is Resolve for an explicit endpoint kind ("chat" | "embedding").
+// ResolveKind is Resolve for an explicit kind (inference uses "chat").
 func (r *CatalogResolver) ResolveKind(ctx context.Context, orgID, requested, kind string) ([]Entry, error) {
-	canonical := Canonicalize("", requested)
 	exact := strings.ToLower(strings.TrimSpace(requested))
+	canonical := ""
+	if target, err := r.repo.AliasTarget(ctx, orgID, exact); err != nil {
+		return nil, err
+	} else if target != "" {
+		canonical, exact = target, "" // one level, no chains; exact id match does not apply
+	} else {
+		canonical = Canonicalize("", requested)
+	}
 
 	entries, err := r.lookup(ctx, orgID, canonical, exact, kind)
 	if err != nil || len(entries) > 0 {
 		return entries, err
 	}
-
-	if !r.claimMiss(orgID + "|" + canonical) {
-		return nil, nil // debounced
-	}
-	r.onDemandRefresh(ctx, orgID)
-	entries, err = r.lookup(ctx, orgID, canonical, exact, kind)
-	if err != nil || len(entries) == 0 {
+	// A model that exists only as another kind is a clear not-found; never
+	// re-list for it (and never resurrect it as chat).
+	if other, err := r.repo.HasOtherKind(ctx, orgID, canonical, kind); err != nil || other {
 		return nil, err
 	}
-	return entries, nil
+	if !r.od.discover(ctx, orgID, canonical) {
+		return nil, nil
+	}
+	return r.lookup(ctx, orgID, canonical, exact, kind)
 }
 
 func (r *CatalogResolver) lookup(ctx context.Context, orgID, canonical, exact, kind string) ([]Entry, error) {
@@ -90,44 +85,4 @@ func better(a, b Row, exact string) bool {
 		return len(a.ProviderModelID) < len(b.ProviderModelID)
 	}
 	return a.ProviderModelID < b.ProviderModelID
-}
-
-// claimMiss returns true if this caller may trigger on-demand discovery.
-func (r *CatalogResolver) claimMiss(key string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	now := r.now()
-	for k, exp := range r.misses {
-		if !exp.After(now) {
-			delete(r.misses, k)
-		}
-	}
-	if _, ok := r.misses[key]; ok {
-		return false
-	}
-	r.misses[key] = now.Add(missDebounceTTL)
-	return true
-}
-
-// onDemandRefresh re-lists the org's providers whose last refresh is stale, in parallel.
-func (r *CatalogResolver) onDemandRefresh(ctx context.Context, orgID string) {
-	ctx, cancel := context.WithTimeout(ctx, onDemandTotalLimit)
-	defer cancel()
-	provs, err := r.repo.OrgProviders(ctx, orgID)
-	if err != nil {
-		return
-	}
-	var wg sync.WaitGroup
-	for _, p := range provs {
-		last, err := r.repo.LastRefreshed(ctx, orgID, p)
-		if err != nil || (!last.IsZero() && r.now().Sub(last) < refreshStaleAfter) {
-			continue
-		}
-		wg.Add(1)
-		go func(p string) {
-			defer wg.Done()
-			_, _ = r.disc.refresh(ctx, orgID, p, "on_demand")
-		}(p)
-	}
-	wg.Wait()
 }

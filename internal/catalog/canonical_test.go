@@ -16,6 +16,13 @@ func TestCanonicalize(t *testing.T) {
 		{"google", "models/gemini-2.5-flash", "gemini-2.5-flash"},
 		{"google", "gemini-1.5-flash-001", "gemini-1.5-flash"},
 		{"", "Llama-3.3-70B-Versatile", "llama-3.3-70b"},
+		{"meshapi", "mistral/mistral-7b-instruct-v0", "mistral-7b"},
+		{"meshapi", "meta-llama/llama-3.3-70b-instruct", "llama-3.3-70b"},
+		{"meshapi", "anthropic/claude-sonnet-5.5", "claude-sonnet-5-5"},
+		{"openrouter", "mistralai/mistral-7b-instruct-v0.1", "mistral-7b-instruct-v0.1"},
+		{"", "foo-v2", "foo"},
+		{"anthropic", "claude-sonnet-5-5", "claude-sonnet-5-5"},
+		{"google", "gemini-3.1-pro-preview-customtools", "gemini-3.1-pro-preview-customtools"},
 		// extra rule coverage
 		{"", "  GPT-4o-2024-08-06 ", "gpt-4o"},
 		{"together", "meta-llama-3.1-8b-instruct", "llama-3.1-8b"},
