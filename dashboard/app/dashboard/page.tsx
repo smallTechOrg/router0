@@ -2,17 +2,17 @@
 import Link from 'next/link';
 import { useAuth, useLoader } from '@/lib/hooks';
 import { listKeys, listRequests, listTokens } from '@/lib/api';
+import { useApiBase } from '@/lib/useApiBase';
 import { Card, CopyButton, ErrorBanner, Loading, PageHeader } from '@/components/ui';
 
-const BASE_URL = process.env.NEXT_PUBLIC_ROUTER0_URL || 'http://localhost:8080';
-
-const snippet = `curl ${BASE_URL}/v1/chat/completions \\
+const snippetFor = (base: string) => `curl ${base}/chat/completions \\
   -H "Authorization: Bearer r0-sk-..." \\
   -H "Content-Type: application/json" \\
   -d '{"model":"llama-3.3-70b","messages":[{"role":"user","content":"hi"}]}'`;
 
 export default function OverviewPage() {
   const { token, me, meError } = useAuth();
+  const snippet = snippetFor(useApiBase());
   const tokens = useLoader((t) => listTokens(t), token);
   const keys = useLoader((t) => listKeys(t), token);
   const reqs = useLoader((t) => listRequests(t, { limit: 200 }), token);

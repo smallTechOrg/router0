@@ -1,10 +1,11 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { useAuth, useLoader } from '@/lib/hooks';
+import { useApiBase } from '@/lib/useApiBase';
 import { errorMessage, getPriority, putPriority } from '@/lib/api';
 import { btnGhost, btnPrimary, Card, CopyButton, EmptyState, ErrorBanner, Loading, Notice, PageHeader } from '@/components/ui';
 
-const EXAMPLE = `curl $ROUTER0_URL/v1/chat/completions \\
+const exampleFor = (base: string) => `curl ${base}/chat/completions \\
   -H "Authorization: Bearer r0-sk-..." \\
   -H "X-Router0-Providers: groq,openrouter" \\
   -H "Content-Type: application/json" \\
@@ -12,6 +13,7 @@ const EXAMPLE = `curl $ROUTER0_URL/v1/chat/completions \\
 
 export default function RoutingPage() {
   const { token, canWrite } = useAuth();
+  const EXAMPLE = exampleFor(useApiBase());
   const { data, error, loading, reload, setData } = useLoader((t) => getPriority(t), token);
   const [order, setOrder] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);

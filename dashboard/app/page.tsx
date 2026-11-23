@@ -1,27 +1,9 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { headers } from 'next/headers';
+import { apiBaseFor } from '@/lib/apiBase';
 
 const SITE = 'https://router0.smalltech.in';
-
-/**
- * The OpenAI-compatible base URL shown in the samples, derived from the host that
- * served this page so the snippets work wherever router0 is deployed:
- *   PUBLIC_API_BASE_URL (runtime env)   -> used as is
- *   localhost / 127.0.0.1               -> http://localhost:8080/v1 (local gateway)
- *   router0.<domain>                    -> https://api.router0.<domain>/v1
- *   anything else                       -> same host; the dashboard proxies /v1 to the gateway
- */
-function apiBaseFor(host: string, proto: string): string {
-  const override = process.env.PUBLIC_API_BASE_URL?.trim().replace(/\/+$/, '');
-  if (override) return override;
-  const hostname = host.split(':')[0].toLowerCase();
-  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname.endsWith('.localhost')) {
-    return 'http://localhost:8080/v1';
-  }
-  if (hostname.startsWith('router0.')) return `https://api.${hostname}/v1`;
-  return `${proto}://${host}/v1`;
-}
 
 export const metadata: Metadata = {
   title: 'router0 — One OpenAI-compatible endpoint. Your keys. Automatic failover.',
@@ -133,7 +115,7 @@ export default function LandingPage() {
   const h = headers();
   const host = h.get('x-forwarded-host') ?? h.get('host') ?? 'localhost';
   const proto = h.get('x-forwarded-proto')?.split(',')[0] ?? 'https';
-  const apiBase = apiBaseFor(host, proto);
+  const apiBase = apiBaseFor(host, proto, process.env.PUBLIC_API_BASE_URL);
   const curl = curlSample(apiBase);
   const python = pythonSample(apiBase);
 
