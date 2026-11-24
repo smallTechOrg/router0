@@ -60,9 +60,10 @@ type InferenceConfig struct {
 	TokenBudgets TokenBudgetChecker
 }
 
-// TokenBudgetChecker reports a service token's budget position this month.
+// TokenBudgetChecker returns a service token's policy: its budget position
+// this month and its model allowlist (tokens.BudgetGuard).
 type TokenBudgetChecker interface {
-	Check(ctx context.Context, tokenID string) tokens.BudgetStatus
+	Policy(ctx context.Context, tokenID string) tokens.Policy
 }
 
 // Pricer returns USD-per-million-token prices for an org's provider model.
@@ -355,8 +356,10 @@ func (h *InferenceHandler) ChatCompletions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	var policy tokens.Policy
 	if h.budgets != nil {
-		if b := h.budgets.Check(ctx, rs.tokenID); b.Exceeded() {
+		policy = h.budgets.Policy(ctx, rs.tokenID)
+		if b := policy.Budget; b.Exceeded() {
 			h.failEarly(w, rs, http.StatusPaymentRequired, "insufficient_credits", "token_budget_exceeded",
 				fmt.Sprintf("This service token reached its monthly budget of $%.4f (estimated spend $%.6f this month). "+
 					"It resets at 00:00 UTC on the 1st, or an org owner/admin can raise it on the Tokens page.", b.BudgetUSD, b.SpendUSD), "")
@@ -376,6 +379,11 @@ func (h *InferenceHandler) ChatCompletions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	rs.canonical = entries[0].Canonical
+	if !policy.Allows(rs.canonical, cr.Model) {
+		h.failEarly(w, rs, http.StatusForbidden, "invalid_request_error", "model_not_allowed",
+			fmt.Sprintf("This service token may not use model %q. An org owner/admin can change its allowed models on the Tokens page.", cr.Model), "model")
+		return
+	}
 
 	order, err := h.priority.ProviderOrder(ctx, rs.orgID)
 	if err != nil {

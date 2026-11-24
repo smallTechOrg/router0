@@ -99,6 +99,9 @@ func Build(d Deps) *App {
 	v1Catalog := handlers.NewCatalogHandler(catalogRepo, discovery, func(r *http.Request) string {
 		p, _ := auth.PrincipalFromCtx(r.Context())
 		return p.OrgID
+	}).WithModelFilter(func(r *http.Request) func(canonical, requested string) bool {
+		p, _ := auth.PrincipalFromCtx(r.Context())
+		return tokenBudgets.Policy(r.Context(), p.TokenID).Allows
 	})
 	apiCatalog := handlers.NewCatalogHandler(catalogRepo, discovery, func(r *http.Request) string {
 		return auth.OrgIDFromCtx(r.Context())

@@ -97,6 +97,8 @@ export interface ServiceToken {
   monthly_budget_usd?: number | null;
   /** Estimated spend this UTC month. */
   month_spend_usd?: number;
+  /** Models/aliases the token may call (canonical, lowercased); null = all. */
+  allowed_models?: string[] | null;
 }
 
 export interface CreatedToken {
@@ -272,7 +274,7 @@ export const listTokens = (token: string) =>
   request<{ tokens: ServiceToken[] }>('/api/tokens', { token });
 export const createToken = (token: string, name: string) =>
   request<CreatedToken>('/api/tokens', { method: 'POST', token, body: { name } });
-export const updateToken = (token: string, id: string, body: { monthly_budget_usd: number | null }) =>
+export const updateToken = (token: string, id: string, body: { monthly_budget_usd?: number | null; allowed_models?: string[] | null }) =>
   request<ServiceToken>(`/api/tokens/${encodeURIComponent(id)}`, { method: 'PATCH', token, body });
 export const revokeToken = (token: string, id: string) =>
   request<void>(`/api/tokens/${encodeURIComponent(id)}`, { method: 'DELETE', token });

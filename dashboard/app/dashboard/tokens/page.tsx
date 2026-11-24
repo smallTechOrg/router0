@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { useAuth, useLoader } from '@/lib/hooks';
 import { createToken, errorMessage, listTokens, revokeToken, updateToken, type CreatedToken, type ServiceToken } from '@/lib/api';
 import BudgetEditor from '@/components/BudgetEditor';
+import AllowedModelsEditor from '@/components/AllowedModelsEditor';
 import SpendBar, { usd } from '@/components/SpendBar';
 import TokenCreatedModal from '@/components/TokenCreatedModal';
 import { btnDanger, btnPrimary, Card, EmptyState, ErrorBanner, fmtTime, inputCls, Loading, Notice, PageHeader, tdCls, thCls } from '@/components/ui';
@@ -75,11 +76,25 @@ export default function TokensPage() {
     }
   }
 
+  async function onSaveModels(t: ServiceToken, models: string[] | null) {
+    if (!token) return false;
+    setFormError('');
+    try {
+      await updateToken(token, t.id, { allowed_models: models });
+      setNotice(models === null ? `"${t.name}" may use every model.` : `"${t.name}" may use only: ${models.join(', ')}.`);
+      reload(true);
+      return true;
+    } catch (err) {
+      setFormError(errorMessage(err));
+      return false;
+    }
+  }
+
   const tokens = data?.tokens ?? [];
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Service tokens" subtitle="Tokens your services use to call router0 at /v1. The full token is shown only once, at creation. An optional monthly budget caps a token's estimated spend; over it, requests get 402 token_budget_exceeded until the 1st (UTC)." />
+      <PageHeader title="Service tokens" subtitle="Tokens your services use to call router0 at /v1. The full token is shown only once, at creation. Optionally restrict a token to some models (others get 403 model_not_allowed) and cap its estimated monthly spend (over it, 402 token_budget_exceeded until the 1st, UTC)." />
       <ErrorBanner message={error} onRetry={() => reload()} />
       <ErrorBanner message={formError} />
       <Notice message={notice} />
@@ -105,8 +120,9 @@ export default function TokensPage() {
                 <th scope="col" className={thCls}>Name</th>
                 <th scope="col" className={thCls}>Prefix</th>
                 <th scope="col" className={`${thCls} hidden 2xl:table-cell`}>Created by</th>
-                <th scope="col" className={thCls}>Created</th>
+                <th scope="col" className={`${thCls} hidden xl:table-cell`}>Created</th>
                 <th scope="col" className={thCls}>Last used</th>
+                <th scope="col" className={thCls}>Models</th>
                 <th scope="col" className={thCls}>This month</th>
                 <th scope="col" className={thCls}>Status</th>
                 {canWrite && <th scope="col" className={thCls}><span className="sr-only">Actions</span></th>}
@@ -120,8 +136,13 @@ export default function TokensPage() {
                     <td className={`${tdCls} font-medium text-neutral-100`}>{t.name}</td>
                     <td className={`${tdCls} font-mono text-xs`}>{t.prefix}…</td>
                     <td className={`${tdCls} hidden 2xl:table-cell`}>{t.created_by || '—'}</td>
-                    <td className={`${tdCls} text-xs`}>{fmtTime(t.created_at)}</td>
+                    <td className={`${tdCls} hidden text-xs xl:table-cell`}>{fmtTime(t.created_at)}</td>
                     <td className={`${tdCls} text-xs`}>{fmtTime(t.last_used_at)}</td>
+                    <td className={tdCls}>
+                      {t.revoked_at ? <span className="text-xs text-neutral-600">—</span> : (
+                        <AllowedModelsEditor id={t.id} current={t.allowed_models ?? null} canWrite={canWrite} onSave={(m) => onSaveModels(t, m)} />
+                      )}
+                    </td>
                     <td className={tdCls}>
                       {t.revoked_at ? <span className="text-xs text-neutral-600">—</span> : (
                         <div className="space-y-1">

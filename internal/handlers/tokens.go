@@ -5,11 +5,13 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/zer0-router/zer0/internal/auth"
+	"github.com/zer0-router/zer0/internal/catalog"
 	"github.com/zer0-router/zer0/internal/tokens"
 )
 
@@ -29,32 +31,53 @@ func (h *TokensHandler) WithBudgetGuard(g *tokens.BudgetGuard) *TokensHandler {
 	return h
 }
 
-// Update: PATCH /api/tokens/{id} (owner/admin) {"monthly_budget_usd": 25 | null}.
-// Only live tokens can be updated (404 otherwise, including other orgs' tokens).
+// Update: PATCH /api/tokens/{id} (owner/admin)
+// {"monthly_budget_usd": 25 | null, "allowed_models": ["llama-3.3-70b", "fast"] | null}.
+// Either field may be sent alone. Only live tokens can be updated (404
+// otherwise, including other orgs' tokens).
 func (h *TokensHandler) Update(w http.ResponseWriter, r *http.Request) {
 	var raw map[string]json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 		writeError(w, http.StatusBadRequest, "validation_error", "invalid_json", "Invalid request body")
 		return
 	}
-	v, ok := raw["monthly_budget_usd"]
 	for field := range raw {
-		if field != "monthly_budget_usd" {
+		if field != "monthly_budget_usd" && field != "allowed_models" {
 			writeError(w, http.StatusUnprocessableEntity, "validation_error", "unknown_field", "Unknown field: "+field)
 			return
 		}
 	}
-	if !ok {
-		writeError(w, http.StatusUnprocessableEntity, "validation_error", "missing_fields", "Nothing to update: send monthly_budget_usd")
+	budgetRaw, setBudget := raw["monthly_budget_usd"]
+	modelsRaw, setModels := raw["allowed_models"]
+	if !setBudget && !setModels {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", "missing_fields", "Nothing to update: send monthly_budget_usd and/or allowed_models")
 		return
 	}
-	budget, msg := parseBudget(v)
-	if msg != "" {
-		writeError(w, http.StatusUnprocessableEntity, "validation_error", "invalid_budget", msg)
-		return
+	var budget *float64
+	if setBudget {
+		var msg string
+		if budget, msg = parseBudget(budgetRaw); msg != "" {
+			writeError(w, http.StatusUnprocessableEntity, "validation_error", "invalid_budget", msg)
+			return
+		}
+	}
+	var models []string
+	if setModels {
+		var msg string
+		if models, msg = parseAllowedModels(modelsRaw); msg != "" {
+			writeError(w, http.StatusUnprocessableEntity, "validation_error", "invalid_allowed_models", msg)
+			return
+		}
 	}
 	orgID, id := auth.OrgIDFromCtx(r.Context()), chi.URLParam(r, "id")
-	switch err := h.repo.SetBudget(r.Context(), orgID, id, budget); {
+	var err error
+	if setBudget {
+		err = h.repo.SetBudget(r.Context(), orgID, id, budget)
+	}
+	if err == nil && setModels {
+		err = h.repo.SetAllowedModels(r.Context(), orgID, id, models)
+	}
+	switch {
 	case errors.Is(err, tokens.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "token_not_found", "Token not found")
 		return
@@ -78,6 +101,43 @@ func (h *TokensHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeError(w, http.StatusNotFound, "not_found", "token_not_found", "Token not found")
+}
+
+// parseAllowedModels validates an allowed_models JSON value: null (every
+// model) or a non-empty array of up to 200 model or alias names. Names are
+// trimmed, canonicalised (so "llama-3.3-70b-versatile" allows "llama-3.3-70b"
+// on every provider) and de-duplicated. A non-empty msg is the 422 message.
+func parseAllowedModels(v json.RawMessage) (models []string, msg string) {
+	if string(v) == "null" {
+		return nil, ""
+	}
+	var in []string
+	if err := json.Unmarshal(v, &in); err != nil {
+		return nil, "allowed_models must be an array of model names, or null for every model"
+	}
+	if len(in) == 0 {
+		return nil, "allowed_models must not be empty; use null to allow every model, or revoke the token"
+	}
+	if len(in) > tokens.MaxAllowedModels {
+		return nil, "allowed_models may list at most 200 models"
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, m := range in {
+		m = strings.TrimSpace(m)
+		if m == "" || len(m) > 200 {
+			return nil, "each allowed model must be 1 to 200 characters"
+		}
+		c := catalog.Canonicalize("", m)
+		if c == "" {
+			c = strings.ToLower(m)
+		}
+		if !seen[c] {
+			seen[c] = true
+			out = append(out, c)
+		}
+	}
+	return out, ""
 }
 
 // List: GET /api/tokens. Never includes secrets.

@@ -25,6 +25,9 @@ type fakeRow struct {
 func (r fakeRow) Scan(dest ...any) error {
 	*(dest[0].(**float64)) = r.budget
 	*(dest[1].(*int64)) = r.spend
+	if len(dest) > 2 {
+		*(dest[2].(*[]string)) = nil // allowed_models: every model
+	}
 	return nil
 }
 
