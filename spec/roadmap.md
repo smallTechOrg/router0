@@ -259,6 +259,17 @@ Optional smoke: `TestSmokeOpenRouterBalance` (needs `TEST_OPENROUTER_KEY`): the 
 2. Set mock OpenRouter balance to 0 (`curl -X POST localhost:9902/_balance -d 0`). Within 10 min, or after clicking "Poll balances", `or-main` shows "out of credits" and is skipped.
 3. Routing page: drag OpenRouter above Groq and Save; the next request's trail starts with OpenRouter. "Reset state" on a rate-limited key clears its badge immediately (its `provider_key_state` rows are deleted).
 
+## Phase 4: Service-token budgets
+
+**Goal:** an org can cap what each service token (each calling app) spends per UTC month, independently of provider-key budgets, so one runaway service cannot drain every key.
+
+- **Data:** migration `000023_token_budgets` adds `service_tokens.monthly_budget_usd NUMERIC(12,4)` (NULL = none) and `service_token_spend (service_token_id, month, spend_micro_usd)`, mirroring `provider_key_spend`.
+- **Spend:** the metadata recorder adds each successful request's estimated cost to the token's month row in the same transaction and under the same shared advisory lock as key spend. The hourly/startup reconcile rebuilds token counters from `request_metadata.service_token_id`.
+- **Enforcement:** before routing, `tokens.BudgetGuard` (2 s cache, evicted after each token spend write and on budget change) refuses an over-budget token with `402 insufficient_credits` / `token_budget_exceeded`; no provider is called and the request is logged. A request that starts under budget can overshoot it by its own cost (same as key budgets).
+- **API:** `PATCH /api/tokens/{id} {"monthly_budget_usd": n | null}` (owner/admin, live tokens only); `GET /api/tokens` adds `monthly_budget_usd` and `month_spend_usd`.
+- **Dashboard:** Tokens page "This month" column (spend bar, budget editor) and a "budget reached" status.
+- **Tests:** `internal/integration/phase4_test.go` (`TestPhase4_TokenBudget`, `TestPhase4_TokenBudgetZeroAndRevoked`, `TestPhase4_TokenSpendReconcile`); CI runs every `TestPhase*` suite.
+
 ---
 
 ## Self-Review

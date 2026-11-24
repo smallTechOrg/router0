@@ -21,6 +21,7 @@ import (
 	"github.com/zer0-router/zer0/internal/metrics"
 	"github.com/zer0-router/zer0/internal/providers"
 	"github.com/zer0-router/zer0/internal/routing"
+	"github.com/zer0-router/zer0/internal/tokens"
 )
 
 const (
@@ -54,6 +55,14 @@ type InferenceConfig struct {
 	// Pricing is the catalog price fallback for cost estimates (catalog.Repository);
 	// optional. Used when the provider reports no cost and the static table has none.
 	Pricing Pricer
+	// TokenBudgets enforces per-service-token monthly budgets (tokens.BudgetGuard);
+	// optional (nil = no token budgets).
+	TokenBudgets TokenBudgetChecker
+}
+
+// TokenBudgetChecker reports a service token's budget position this month.
+type TokenBudgetChecker interface {
+	Check(ctx context.Context, tokenID string) tokens.BudgetStatus
 }
 
 // Pricer returns USD-per-million-token prices for an org's provider model.
@@ -72,6 +81,7 @@ type InferenceHandler struct {
 	firstB   time.Duration
 	decrypt  func(*keys.ProviderKey) (string, error)
 	pricing  Pricer
+	budgets  TokenBudgetChecker
 }
 
 // NewInferenceHandler wires the handler. The executor's per-attempt timeout
@@ -92,7 +102,7 @@ func NewInferenceHandler(cfg InferenceConfig) *InferenceHandler {
 	return &InferenceHandler{
 		resolver: cfg.Resolver, priority: cfg.Priority, keys: cfg.Keys,
 		exec: cfg.Executor, streamEx: cfg.Executor.WithAttemptTimeout(0),
-		recorder: cfg.Recorder, firstB: fb, decrypt: dec, pricing: cfg.Pricing,
+		recorder: cfg.Recorder, firstB: fb, decrypt: dec, pricing: cfg.Pricing, budgets: cfg.TokenBudgets,
 	}
 }
 
@@ -343,6 +353,15 @@ func (h *InferenceHandler) ChatCompletions(w http.ResponseWriter, r *http.Reques
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_provider_override",
 			fmt.Sprintf("Unknown provider %q in %s", unknown, providersHeader), "", nil)
 		return
+	}
+
+	if h.budgets != nil {
+		if b := h.budgets.Check(ctx, rs.tokenID); b.Exceeded() {
+			h.failEarly(w, rs, http.StatusPaymentRequired, "insufficient_credits", "token_budget_exceeded",
+				fmt.Sprintf("This service token reached its monthly budget of $%.4f (estimated spend $%.6f this month). "+
+					"It resets at 00:00 UTC on the 1st, or an org owner/admin can raise it on the Tokens page.", b.BudgetUSD, b.SpendUSD), "")
+			return
+		}
 	}
 
 	entries, err := h.resolver.Resolve(ctx, rs.orgID, cr.Model)

@@ -15,11 +15,69 @@ import (
 
 // TokensHandler serves /api/tokens (org-scoped service tokens).
 type TokensHandler struct {
-	repo *tokens.Repository
+	repo    *tokens.Repository
+	budgets *tokens.BudgetGuard // optional; evicted on budget changes
 }
 
 func NewTokensHandler(repo *tokens.Repository) *TokensHandler {
 	return &TokensHandler{repo: repo}
+}
+
+// WithBudgetGuard makes budget changes take effect immediately on this instance.
+func (h *TokensHandler) WithBudgetGuard(g *tokens.BudgetGuard) *TokensHandler {
+	h.budgets = g
+	return h
+}
+
+// Update: PATCH /api/tokens/{id} (owner/admin) {"monthly_budget_usd": 25 | null}.
+// Only live tokens can be updated (404 otherwise, including other orgs' tokens).
+func (h *TokensHandler) Update(w http.ResponseWriter, r *http.Request) {
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", "invalid_json", "Invalid request body")
+		return
+	}
+	v, ok := raw["monthly_budget_usd"]
+	for field := range raw {
+		if field != "monthly_budget_usd" {
+			writeError(w, http.StatusUnprocessableEntity, "validation_error", "unknown_field", "Unknown field: "+field)
+			return
+		}
+	}
+	if !ok {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", "missing_fields", "Nothing to update: send monthly_budget_usd")
+		return
+	}
+	budget, msg := parseBudget(v)
+	if msg != "" {
+		writeError(w, http.StatusUnprocessableEntity, "validation_error", "invalid_budget", msg)
+		return
+	}
+	orgID, id := auth.OrgIDFromCtx(r.Context()), chi.URLParam(r, "id")
+	switch err := h.repo.SetBudget(r.Context(), orgID, id, budget); {
+	case errors.Is(err, tokens.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "token_not_found", "Token not found")
+		return
+	case err != nil:
+		slog.Error("update token failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to update token")
+		return
+	}
+	if h.budgets != nil {
+		h.budgets.Evict(id)
+	}
+	list, err := h.repo.List(r.Context(), orgID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to load token")
+		return
+	}
+	for _, t := range list {
+		if t.ID == id {
+			writeJSON(w, http.StatusOK, t)
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "not_found", "token_not_found", "Token not found")
 }
 
 // List: GET /api/tokens. Never includes secrets.

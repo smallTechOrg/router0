@@ -44,6 +44,10 @@ type Token struct {
 	LastUsedAt *time.Time `json:"last_used_at"`
 	RevokedAt  *time.Time `json:"revoked_at"`
 	Legacy     bool       `json:"legacy"`
+	// MonthlyBudgetUSD caps the token's estimated spend per UTC month (nil = none).
+	MonthlyBudgetUSD *float64 `json:"monthly_budget_usd"`
+	// MonthSpendUSD is the token's estimated spend this UTC month.
+	MonthSpendUSD float64 `json:"month_spend_usd"`
 }
 
 // Record is what the verifier needs from storage.
@@ -110,8 +114,11 @@ func (r *Repository) Create(ctx context.Context, orgID, createdBy, name string) 
 // List returns the org's tokens, live first (newest first), then revoked.
 func (r *Repository) List(ctx context.Context, orgID string) ([]Token, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT t.id::text, t.name, t.token_prefix, t.hash_alg, t.created_at, u.email, t.last_used_at, t.revoked_at
+		`SELECT t.id::text, t.name, t.token_prefix, t.hash_alg, t.created_at, u.email, t.last_used_at, t.revoked_at,
+		        t.monthly_budget_usd::float8, COALESCE(sp.spend_micro_usd, 0)
 		   FROM service_tokens t LEFT JOIN users u ON u.id = t.created_by
+		   LEFT JOIN service_token_spend sp
+		     ON sp.service_token_id = t.id AND sp.month = (date_trunc('month', NOW() AT TIME ZONE 'UTC'))::date
 		  WHERE t.org_id = $1
 		  ORDER BY (t.revoked_at IS NOT NULL), t.created_at DESC, t.id`, orgID)
 	if err != nil {
@@ -122,9 +129,12 @@ func (r *Repository) List(ctx context.Context, orgID string) ([]Token, error) {
 	for rows.Next() {
 		var t Token
 		var prefix, alg string
-		if err := rows.Scan(&t.ID, &t.Name, &prefix, &alg, &t.CreatedAt, &t.CreatedBy, &t.LastUsedAt, &t.RevokedAt); err != nil {
+		var spendMicro int64
+		if err := rows.Scan(&t.ID, &t.Name, &prefix, &alg, &t.CreatedAt, &t.CreatedBy, &t.LastUsedAt, &t.RevokedAt,
+			&t.MonthlyBudgetUSD, &spendMicro); err != nil {
 			return nil, err
 		}
+		t.MonthSpendUSD = float64(spendMicro) / 1e6
 		t.Legacy = alg == "bcrypt"
 		if t.Legacy {
 			t.Prefix = auth.LegacyTokenScheme + prefix

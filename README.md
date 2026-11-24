@@ -110,6 +110,8 @@ print(c.chat.completions.create(model="claude-sonnet-5-5", messages=msgs, tools=
 
 **Balances (OpenRouter).** router0 reads each active OpenRouter key's remaining balance (`GET /key`, plus `/credits` for keys without their own limit) on startup and every `ROUTER0_BALANCE_POLL_SECONDS` (600). The keys page "Poll balances" button, or `POST /api/keys/poll-balances`, does it on demand. A key at $0 is marked out of credits and skipped before it fails. The mark lasts one poll interval plus a minute, and a later poll with a positive balance clears it. A 402 from a live request is never cleared by a poll. Other providers have no per-key balance API and show "not available". On Cloud Run with request-based CPU (`--min-instances 0`), the periodic loop only runs while the service is handling traffic. The startup poll and the button still work.
 
+**Service-token budgets.** `PATCH /api/tokens/{id} {"monthly_budget_usd": 25}` (Tokens page "Set monthly budget") caps what one calling app can spend per UTC month, whatever keys serve it. Over the cap, its requests get `402 token_budget_exceeded` before any provider is called; other tokens are unaffected. The counter is reconciled from the request log like key spend.
+
 **Reset state.** `POST /api/keys/{id}/reset-state` (the keys page "Reset state" button) deletes a key's cooldown and out-of-credits rows, so the next request tries it again. It does not lift a budget; raise or remove the budget instead.
 
 With the mocks: set a key's budget to `0.0001` and send requests until it shows "budget reached". To run the balance poll against the mock, run `curl -X POST localhost:9902/_balance -d 0`, then click "Poll balances": `or-main` shows "out of credits" and is skipped. Then run `-d 5` and poll again to clear it.

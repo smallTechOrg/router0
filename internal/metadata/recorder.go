@@ -76,21 +76,25 @@ type Options struct {
 	// month-to-date spend was written (server wiring evicts the key-state cache
 	// so a reached budget takes effect on the next request).
 	OnSpend func(keyID string)
+	// OnTokenSpend is the same for the service token's month-to-date spend
+	// (server wiring evicts the token-budget cache).
+	OnTokenSpend func(tokenID string)
 	// Now is the clock used to pick the spend month (default time.Now).
 	Now func() time.Time
 }
 
 // Recorder is a buffered async writer. Methods are safe on a nil *Recorder.
 type Recorder struct {
-	db      DB
-	ch      chan Request
-	wg      sync.WaitGroup
-	mu      sync.RWMutex
-	closed  bool
-	workers int
-	sync    bool
-	onSpend func(keyID string)
-	now     func() time.Time
+	db           DB
+	ch           chan Request
+	wg           sync.WaitGroup
+	mu           sync.RWMutex
+	closed       bool
+	workers      int
+	sync         bool
+	onSpend      func(keyID string)
+	onTokenSpend func(tokenID string)
+	now          func() time.Time
 }
 
 // NewRecorder starts the worker pool (4 workers, 10 000 buffered records).
@@ -113,6 +117,7 @@ func NewRecorder(db DB, opts ...Options) *Recorder {
 	r := &Recorder{db: db, ch: make(chan Request, o.Buffer), workers: o.Workers, sync: o.Sync, now: time.Now}
 	if len(opts) > 0 {
 		r.onSpend = opts[0].OnSpend
+		r.onTokenSpend = opts[0].OnTokenSpend
 		if opts[0].Now != nil {
 			r.now = opts[0].Now
 		}
@@ -224,10 +229,19 @@ func (r *Recorder) write(ctx context.Context, q Request) error {
 	// Month-to-date spend for budgets, in the same batch (one implicit
 	// transaction) as the request row, so the hourly reconcile from
 	// request_metadata and this counter agree.
-	spend := q.Status == "success" && q.KeyID != "" && keystate.MicroUSD(q.CostUSD) > 0
-	if spend {
+	micro := keystate.MicroUSD(q.CostUSD)
+	billable := q.Status == "success" && micro > 0
+	spend := billable && q.KeyID != ""
+	tokenSpend := billable && q.TokenID != ""
+	if spend || tokenSpend {
 		b.Queue(spendLockSharedSQL) // see reconcile.go
-		b.Queue(keystate.AddSpendSQL, q.KeyID, keystate.MonthStart(r.now()), keystate.MicroUSD(q.CostUSD))
+	}
+	month := keystate.MonthStart(r.now())
+	if spend {
+		b.Queue(keystate.AddSpendSQL, q.KeyID, month, micro)
+	}
+	if tokenSpend {
+		b.Queue(addTokenSpendSQL, q.TokenID, month, micro)
 	}
 	br := r.db.SendBatch(ctx, b)
 	n := b.Len()
@@ -243,8 +257,18 @@ func (r *Recorder) write(ctx context.Context, q Request) error {
 	if spend && r.onSpend != nil {
 		r.onSpend(q.KeyID)
 	}
+	if tokenSpend && r.onTokenSpend != nil {
+		r.onTokenSpend(q.TokenID)
+	}
 	return nil
 }
+
+// addTokenSpendSQL adds to a service token's month-to-date spend; $1 token id,
+// $2 month (date), $3 micro-USD.
+const addTokenSpendSQL = `INSERT INTO service_token_spend (service_token_id, month, spend_micro_usd)
+ VALUES ($1::uuid, $2::date, $3)
+ ON CONFLICT (service_token_id, month) DO UPDATE
+   SET spend_micro_usd = service_token_spend.spend_micro_usd + EXCLUDED.spend_micro_usd, updated_at = NOW()`
 
 func trunc(s string, n int) string {
 	if len(s) > n {

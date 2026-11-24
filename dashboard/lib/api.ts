@@ -93,6 +93,10 @@ export interface ServiceToken {
   last_used_at: string | null;
   revoked_at: string | null;
   legacy: boolean;
+  /** Monthly USD budget; null = none. Over budget, /v1 returns 402 token_budget_exceeded. */
+  monthly_budget_usd?: number | null;
+  /** Estimated spend this UTC month. */
+  month_spend_usd?: number;
 }
 
 export interface CreatedToken {
@@ -268,6 +272,8 @@ export const listTokens = (token: string) =>
   request<{ tokens: ServiceToken[] }>('/api/tokens', { token });
 export const createToken = (token: string, name: string) =>
   request<CreatedToken>('/api/tokens', { method: 'POST', token, body: { name } });
+export const updateToken = (token: string, id: string, body: { monthly_budget_usd: number | null }) =>
+  request<ServiceToken>(`/api/tokens/${encodeURIComponent(id)}`, { method: 'PATCH', token, body });
 export const revokeToken = (token: string, id: string) =>
   request<void>(`/api/tokens/${encodeURIComponent(id)}`, { method: 'DELETE', token });
 
