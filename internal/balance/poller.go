@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/zer0-router/zer0/internal/keys"
+	"github.com/zer0-router/zer0/internal/metrics"
 	"github.com/zer0-router/zer0/internal/providers"
 )
 
@@ -183,6 +184,7 @@ func (p *Poller) poll(ctx context.Context, orgID string) (int, error) {
 func (p *Poller) pollKey(ctx context.Context, k keyRow) {
 	plain, err := p.decrypt(k.ciphertext, k.nonce)
 	if err != nil {
+		metrics.BalancePollsTotal.WithLabelValues("openrouter", StatusError).Inc()
 		p.markError(ctx, k)
 		return
 	}
@@ -192,6 +194,7 @@ func (p *Poller) pollKey(ctx context.Context, k keyRow) {
 	if err != nil {
 		// Never log err text: provider messages could echo key material.
 		p.log.Warn("balance: fetch failed", "key_id", k.id)
+		metrics.BalancePollsTotal.WithLabelValues("openrouter", StatusError).Inc()
 		p.markError(ctx, k)
 		return
 	}
@@ -199,6 +202,7 @@ func (p *Poller) pollKey(ctx context.Context, k keyRow) {
 	if b.RemainingUSD != nil && *b.RemainingUSD <= 0 {
 		status = StatusExhausted
 	}
+	metrics.BalancePollsTotal.WithLabelValues("openrouter", status).Inc()
 	if _, err := p.db.Exec(ctx, upsertSQL, k.id, k.orgID, b.RemainingUSD, b.LimitUSD, b.UsageUSD, status); err != nil {
 		p.log.Warn("balance: store failed", "key_id", k.id, "error", err.Error())
 	}
