@@ -41,12 +41,37 @@ export default function KeysPage() {
     return m;
   }, [keys.data]);
 
-  // Groups in priority order; keys in position order. Disabled keys are not shown.
-  const groups = (prio.data?.providers ?? []).map((g) => ({
-    provider: g.provider,
-    keys: [...g.keys].sort((a, b) => a.position - b.position)
-      .map((k) => byId.get(k.id)).filter((k): k is ProviderKey => !!k),
-  }));
+  // A key being dragged within its provider: the live (unsaved) order of that provider.
+  const [drag, setDrag] = useState<{ provider: string; id: string; order: string[] } | null>(null);
+
+  // Groups in priority order; keys in position order (or the live drag order).
+  // Disabled keys are not shown.
+  const groups = (prio.data?.providers ?? []).map((g) => {
+    const ids = drag && drag.provider === g.provider
+      ? drag.order
+      : [...g.keys].sort((a, b) => a.position - b.position).map((k) => k.id);
+    return { provider: g.provider, keys: ids.map((id) => byId.get(id)).filter((k): k is ProviderKey => !!k) };
+  });
+
+  function dragOverKey(e: React.DragEvent, provider: string, overId: string) {
+    if (!drag || drag.provider !== provider) return; // keys move only within their provider
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (overId === drag.id) return;
+    const next = drag.order.filter((id) => id !== drag.id);
+    next.splice(drag.order.indexOf(overId), 0, drag.id);
+    setDrag({ ...drag, order: next });
+  }
+
+  async function endDrag() {
+    if (!drag) return;
+    const { provider, order } = drag;
+    setDrag(null);
+    const saved = groups.find((g) => g.provider === provider);
+    const before = (prio.data?.providers.find((p) => p.provider === provider)?.keys ?? [])
+      .slice().sort((a, b) => a.position - b.position).map((k) => k.id);
+    if (saved && order.join(',') !== before.join(',')) await saveKeyOrder(provider, order);
+  }
 
   const effectiveProvider = provider || providers.data?.providers[0]?.id || '';
 
@@ -82,6 +107,11 @@ export default function KeysPage() {
     const j = idx + dir;
     if (j < 0 || j >= ids.length) return;
     [ids[idx], ids[j]] = [ids[j], ids[idx]];
+    await saveKeyOrder(provider, ids);
+  }
+
+  async function saveKeyOrder(provider: string, ids: string[]) {
+    if (!token || !prio.data) return;
     setError('');
     try {
       const res = await putPriority(token, {
@@ -170,7 +200,7 @@ export default function KeysPage() {
     <div className="space-y-6">
       <PageHeader
         title="Provider keys"
-        subtitle="Bring your own keys. Within a provider, keys are tried top to bottom; use the arrows to change the order. Status refreshes every 10 s."
+        subtitle="Bring your own keys. Within a provider, keys are tried top to bottom; drag a key by its handle (or use the arrows) to change the order. Status refreshes every 10 s."
         actions={canWrite && anyBalanceKey ? (
           <button className={btnGhost} onClick={onPoll} disabled={polling}>{polling ? 'Polling…' : 'Poll balances'}</button>
         ) : undefined}
@@ -218,7 +248,27 @@ export default function KeysPage() {
           <Card key={g.provider} title={`${providerLabel(g.provider)}${gi === 0 ? ' (highest priority)' : ''}`}>
             <ul className="divide-y divide-neutral-800">
               {g.keys.map((k, i) => (
-                <li key={k.id} className="flex flex-wrap items-center gap-3 px-5 py-3">
+                <li
+                  key={k.id}
+                  onDragOver={(e) => dragOverKey(e, g.provider, k.id)}
+                  onDrop={(e) => e.preventDefault()}
+                  className={`flex flex-wrap items-center gap-3 px-5 py-3 ${drag?.id === k.id ? 'bg-neutral-800/60 opacity-70' : ''}`}
+                >
+                  {canWrite && g.keys.length > 1 && (
+                    <span
+                      draggable
+                      onDragStart={(e) => {
+                        const row = e.currentTarget.closest('li');
+                        if (row) e.dataTransfer.setDragImage(row, 16, 16);
+                        e.dataTransfer.effectAllowed = 'move';
+                        e.dataTransfer.setData('text/plain', k.id);
+                        setDrag({ provider: g.provider, id: k.id, order: g.keys.map((x) => x.id) });
+                      }}
+                      onDragEnd={endDrag}
+                      className="cursor-grab select-none text-neutral-600 active:cursor-grabbing"
+                      title="Drag to reorder" aria-hidden="true"
+                    >⋮⋮</span>
+                  )}
                   <span className="w-5 text-xs text-neutral-500" aria-label={`Position ${i + 1}`}>{i + 1}</span>
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-medium text-neutral-100">{k.label}</p>
