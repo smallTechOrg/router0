@@ -42,7 +42,7 @@ jobs:
         run: go run ./cmd/migrate
       - run: go test ./internal/... -count=1
       - name: Integration tests (mock providers, real Postgres)
-        run: go test -tags integration ./internal/integration/... -run 'TestPhase1|TestPhase2' -count=1 -v
+        run: go test -tags integration ./internal/integration/... -run 'TestPhase' -count=1 -v  # every phase's suite
       - name: Repo checks
         run: |
           ! grep -q 'go-redis' go.mod
