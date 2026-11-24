@@ -96,6 +96,24 @@ func TestSetClearCreditsRespectsReason(t *testing.T) {
 	if st, _ := s.Check(ctx, key, ""); st.Reason != ReasonCreditsExhausted {
 		t.Fatalf("poll clear removed a live-402 state: %+v", st)
 	}
+	// A poll that says "exhausted" while the live 402 is active only extends it:
+	// the row keeps its 402 reason, so a later "ok" poll still cannot clear it.
+	if err := s.SetCredits(ctx, key, "balance_poll", 3*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var reason string
+	if err := pool.QueryRow(ctx, `SELECT reason FROM provider_key_state WHERE provider_key_id=$1 AND kind='credits_exhausted'`, key).Scan(&reason); err != nil {
+		t.Fatal(err)
+	}
+	if reason != "provider_402" {
+		t.Fatalf("poll took over a live 402 row: reason=%q", reason)
+	}
+	if err := s.ClearCredits(ctx, key, "balance_poll"); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := s.Check(ctx, key, ""); st.Reason != ReasonCreditsExhausted || st.RetryAfter < 2*time.Hour {
+		t.Fatalf("live 402 (extended by the poll) should remain: %+v", st)
+	}
 	// Reset clears everything stored.
 	if err := s.Reset(ctx, key); err != nil {
 		t.Fatal(err)
@@ -110,5 +128,37 @@ func TestMicroUSD(t *testing.T) {
 		if got := MicroUSD(in); got != want {
 			t.Errorf("MicroUSD(%v) = %d, want %d", in, got, want)
 		}
+	}
+}
+
+func TestSpendChangedEvictsOnlyBudgetedKeys(t *testing.T) {
+	pool := testPool(t)
+	_, plain := seedKey(t, pool)
+	_, budgeted := seedKey(t, pool)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `UPDATE provider_keys SET monthly_budget_usd = 1 WHERE id = $1`, budgeted); err != nil {
+		t.Fatal(err)
+	}
+	s, cdb, _ := newTestStore(t, pool)
+	for _, k := range []string{plain, budgeted} {
+		if _, err := s.Check(ctx, k, "m"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := cdb.count()
+
+	s.SpendChanged(plain)
+	if _, err := s.Check(ctx, plain, "m"); err != nil {
+		t.Fatal(err)
+	}
+	if cdb.count() != base {
+		t.Fatal("a spend write evicted the cached state of a key without a budget")
+	}
+	s.SpendChanged(budgeted)
+	if _, err := s.Check(ctx, budgeted, "m"); err != nil {
+		t.Fatal(err)
+	}
+	if cdb.count() != base+1 {
+		t.Fatal("a spend write did not evict the cached state of a key with a budget")
 	}
 }

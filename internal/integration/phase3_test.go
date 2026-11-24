@@ -200,7 +200,7 @@ func TestPhase3_SpendReconcile(t *testing.T) {
 	if _, err := e.pool.Exec(ctx, `DELETE FROM provider_key_spend WHERE provider_key_id=$1`, id); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := metadata.Reconcile(ctx, e.pool, time.Now()); err != nil {
+	if _, err := metadata.Reconcile(ctx, e.pool, time.Now(), tn.orgID); err != nil {
 		t.Fatal(err)
 	}
 	if got := spend(); got < 1799 || got > 1801 {

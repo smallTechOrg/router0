@@ -44,6 +44,13 @@ func TestFetchOpenRouterBalance(t *testing.T) {
 		t.Fatalf("unlimited key, account credits: %+v %v", b, err)
 	}
 
+	// Free tier: never bought credits -> unknown, not exhausted.
+	creditsBody = `{"data":{"total_credits":0,"total_usage":0}}`
+	b, err = FetchOpenRouterBalance(ctx, "sk-or-test")
+	if err != nil || b.RemainingUSD != nil {
+		t.Fatalf("free-tier account must not be exhausted: %+v %v", b, err)
+	}
+
 	creditsStatus = 403
 	creditsBody = `{"error":{"code":403,"message":"forbidden"}}`
 	b, err = FetchOpenRouterBalance(ctx, "sk-or-test")

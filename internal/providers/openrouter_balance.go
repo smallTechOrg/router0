@@ -59,7 +59,10 @@ func FetchOpenRouterBalance(ctx context.Context, apiKey string) (*OpenRouterBala
 			TotalUsage   float64  `json:"total_usage"`
 		} `json:"data"`
 	}
-	if json.Unmarshal(cb, &cr) == nil && cr.Data.TotalCredits != nil {
+	// An account that never bought credits (total_credits 0) is on OpenRouter's
+	// free tier: its key still serves ":free" models, so its balance is unknown,
+	// not exhausted. Only an account whose purchased credits are used up is.
+	if json.Unmarshal(cb, &cr) == nil && cr.Data.TotalCredits != nil && *cr.Data.TotalCredits > 0 {
 		rem := *cr.Data.TotalCredits - cr.Data.TotalUsage
 		out.RemainingUSD = &rem
 	}

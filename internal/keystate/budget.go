@@ -6,9 +6,10 @@ import (
 	"time"
 )
 
-// fetchSQL returns every active state row for the keys plus one synthetic
-// budget_exhausted row per key whose month-to-date spend (provider_key_spend,
-// current UTC month) has reached its monthly_budget_usd. The synthetic row lasts
+// fetchSQL returns every active state row for the keys plus one synthetic row
+// per key with a monthly_budget_usd: budget_exhausted when its month-to-date
+// spend (provider_key_spend, current UTC month) has reached the budget, else
+// budget_set. The synthetic row lasts
 // until 00:00 UTC on the 1st of next month, when a new spend row starts at 0.
 // Keeping it one statement means a check is still a single query.
 const fetchSQL = `
@@ -16,14 +17,21 @@ SELECT provider_key_id::text, kind, scope_model, until_at
   FROM provider_key_state
  WHERE provider_key_id = ANY($1::uuid[]) AND until_at > NOW()
 UNION ALL
-SELECT k.id::text, 'budget_exhausted', '',
+SELECT k.id::text,
+       CASE WHEN COALESCE(sp.spend_micro_usd, 0) >= round(k.monthly_budget_usd * 1000000)
+            THEN 'budget_exhausted' ELSE 'budget_set' END,
+       '',
        (date_trunc('month', NOW() AT TIME ZONE 'UTC') + INTERVAL '1 month') AT TIME ZONE 'UTC'
   FROM provider_keys k
   LEFT JOIN provider_key_spend sp
     ON sp.provider_key_id = k.id AND sp.month = (date_trunc('month', NOW() AT TIME ZONE 'UTC'))::date
  WHERE k.id = ANY($1::uuid[])
-   AND k.monthly_budget_usd IS NOT NULL
-   AND COALESCE(sp.spend_micro_usd, 0) >= round(k.monthly_budget_usd * 1000000)`
+   AND k.monthly_budget_usd IS NOT NULL`
+
+// kindBudgetSet marks a key that has a budget it has not reached. It never
+// blocks (resolve ignores it); it tells SpendChanged that this key's cached
+// state depends on its spend.
+const kindBudgetSet = "budget_set"
 
 // MonthStart is the first instant of t's UTC month (the provider_key_spend.month key).
 func MonthStart(t time.Time) time.Time {
@@ -99,11 +107,25 @@ const AddSpendSQL = `INSERT INTO provider_key_spend (provider_key_id, month, spe
  ON CONFLICT (provider_key_id, month) DO UPDATE
    SET spend_micro_usd = provider_key_spend.spend_micro_usd + EXCLUDED.spend_micro_usd, updated_at = NOW()`
 
-// SpendChanged evicts the cached state and spend of a key after its spend was
-// written elsewhere (the metadata recorder calls it after each spend upsert).
+// SpendChanged is called after a key's spend was written elsewhere (the
+// metadata recorder calls it after each spend upsert). Only a cached key that
+// has a budget is evicted: other keys' state does not depend on spend, so the
+// hot path keeps its cache. A key not in the cache is read fresh anyway.
 func (s *PGStore) SpendChanged(keyID string) {
 	s.spend.drop(keyID)
-	s.Invalidate(keyID)
+	if e, ok := s.cache.Get(keyID); ok && e.hasBudget() {
+		s.Invalidate(keyID)
+	}
+}
+
+// hasBudget reports whether the entry came from a key with a monthly budget.
+func (e keyEntry) hasBudget() bool {
+	for _, r := range e.rows {
+		if r.kind == kindBudgetSet || r.kind == ReasonBudgetExhausted {
+			return true
+		}
+	}
+	return false
 }
 
 // MonthSpend returns the key's current-month spend in micro-USD (5 s cache).

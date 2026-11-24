@@ -6,10 +6,10 @@ package balance
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -63,8 +63,11 @@ type Poller struct {
 	fetch    Fetcher
 	decrypt  func(ciphertext, nonce []byte) (string, error)
 	log      *slog.Logger
-	mu       sync.Mutex // one poll pass at a time
+	running  chan struct{} // one poll pass at a time (cap 1)
 }
+
+// ErrBusy is returned by TryPollNow while another poll pass is running.
+var ErrBusy = errors.New("balance: a poll is already running")
 
 // New builds a poller.
 func New(db DB, states CreditsState, o Options) *Poller {
@@ -83,7 +86,8 @@ func New(db DB, states CreditsState, o Options) *Poller {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
-	return &Poller{db: db, states: states, interval: o.Interval, fetch: o.Fetch, decrypt: o.Decrypt, log: o.Logger}
+	return &Poller{db: db, states: states, interval: o.Interval, fetch: o.Fetch, decrypt: o.Decrypt, log: o.Logger,
+		running: make(chan struct{}, 1)}
 }
 
 // Interval is the polling period.
@@ -125,9 +129,32 @@ type keyRow struct {
 // PollNow polls every active OpenRouter key of orgID ("" = all orgs) and returns
 // how many keys were polled. Per-key failures are recorded as status "error"
 // (last values kept, key state untouched) and do not fail the pass.
+//
+// It waits for a running pass to finish, giving up when ctx ends.
 func (p *Poller) PollNow(ctx context.Context, orgID string) (int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	select {
+	case p.running <- struct{}{}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	defer func() { <-p.running }()
+	return p.poll(ctx, orgID)
+}
+
+// TryPollNow is PollNow without waiting: it returns ErrBusy at once if a pass
+// (for any org) is running. The on-demand HTTP endpoint uses it so a click
+// never queues behind a slow background pass.
+func (p *Poller) TryPollNow(ctx context.Context, orgID string) (int, error) {
+	select {
+	case p.running <- struct{}{}:
+	default:
+		return 0, ErrBusy
+	}
+	defer func() { <-p.running }()
+	return p.poll(ctx, orgID)
+}
+
+func (p *Poller) poll(ctx context.Context, orgID string) (int, error) {
 	rows, err := p.db.Query(ctx,
 		`SELECT id::text, org_id::text, ciphertext, nonce FROM provider_keys
 		  WHERE provider = 'openrouter' AND status = 'active' AND ($1 = '' OR org_id::text = $1)`, orgID)

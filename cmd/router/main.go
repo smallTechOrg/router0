@@ -217,7 +217,7 @@ func ensureAdminOrgs(ctx context.Context, pool *pgxpool.Pool) {
 
 // reconcileSpend rebuilds this month's per-key spend counters from the request log.
 func reconcileSpend(ctx context.Context, pool *pgxpool.Pool) {
-	if n, err := metadata.Reconcile(ctx, pool, time.Now()); err != nil {
+	if n, err := metadata.Reconcile(ctx, pool, time.Now(), ""); err != nil {
 		slog.Warn("spend: reconcile failed", "error", err)
 	} else if n > 0 {
 		slog.Info("spend: reconciled key counters", "count", n)

@@ -226,6 +226,7 @@ func (r *Recorder) write(ctx context.Context, q Request) error {
 	// request_metadata and this counter agree.
 	spend := q.Status == "success" && q.KeyID != "" && keystate.MicroUSD(q.CostUSD) > 0
 	if spend {
+		b.Queue(spendLockSharedSQL) // see reconcile.go
 		b.Queue(keystate.AddSpendSQL, q.KeyID, keystate.MonthStart(r.now()), keystate.MicroUSD(q.CostUSD))
 	}
 	br := r.db.SendBatch(ctx, b)

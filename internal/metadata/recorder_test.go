@@ -6,6 +6,7 @@ import (
 	"github.com/zer0-router/zer0/internal/testutil/testdb"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -258,7 +259,7 @@ func TestRecorderSpendAndReconcile(t *testing.T) {
 	if _, err := db.Exec(ctx, `DELETE FROM provider_key_spend WHERE provider_key_id=$1`, key); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Reconcile(ctx, db, time.Now()); err != nil {
+	if _, err := Reconcile(ctx, db, time.Now(), org); err != nil {
 		t.Fatal(err)
 	}
 	if got := spend(); got != 1200 {
@@ -268,10 +269,70 @@ func TestRecorderSpendAndReconcile(t *testing.T) {
 	if _, err := db.Exec(ctx, `UPDATE provider_key_spend SET spend_micro_usd = 99999 WHERE provider_key_id=$1`, key); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Reconcile(ctx, db, time.Now()); err != nil {
+	if _, err := Reconcile(ctx, db, time.Now(), org); err != nil {
 		t.Fatal(err)
 	}
 	if got := spend(); got != 1200 {
 		t.Fatalf("after second reconcile spend = %d µUSD, want 1200", got)
+	}
+}
+
+// TestReconcileDoesNotLoseConcurrentSpend runs reconciles while requests are
+// recorded concurrently; with the advisory lock no increment is overwritten,
+// so the counter ends equal to the request log.
+func TestReconcileDoesNotLoseConcurrentSpend(t *testing.T) {
+	db := testPool(t)
+	ctx := context.Background()
+	org, user := uuid.NewString(), uuid.NewString()
+	if _, err := db.Exec(ctx, `INSERT INTO orgs (id, name) VALUES ($1,$2)`, org, "race-"+org); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO users (id, email, password_hash) VALUES ($1,$2,'x')`, user, "race-"+user+"@example.test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(ctx, `DELETE FROM request_metadata WHERE org_id=$1`, org)
+		_, _ = db.Exec(ctx, `DELETE FROM orgs WHERE id=$1`, org)
+		_, _ = db.Exec(ctx, `DELETE FROM users WHERE id=$1`, user)
+	})
+	var key string
+	if err := db.QueryRow(ctx, `INSERT INTO provider_keys (user_id, org_id, provider, label, ciphertext, nonce)
+		VALUES ($1,$2,'groq','race','\x00','\x00') RETURNING id::text`, user, org).Scan(&key); err != nil {
+		t.Fatal(err)
+	}
+	rec := NewRecorder(db, Options{Sync: true})
+	const writers, each = 8, 15
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for w := 0; w < writers; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for i := 0; i < each; i++ {
+					rec.Record(Request{RequestID: fmt.Sprintf("r0-race-%s-%d-%d", key[:8], w, i), OrgID: org, CanonicalModel: "m",
+						Provider: "groq", Model: "m", KeyID: key, CostUSD: 0.0006, Status: "success", HTTPStatus: 200})
+				}
+			}(w)
+		}
+		wg.Wait()
+	}()
+	for running := true; running; {
+		select {
+		case <-done:
+			running = false
+		default:
+			if _, err := Reconcile(ctx, db, time.Now(), org); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var spend int64
+	if err := db.QueryRow(ctx, `SELECT COALESCE(SUM(spend_micro_usd),0) FROM provider_key_spend WHERE provider_key_id=$1`, key).Scan(&spend); err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(writers * each * 600); spend != want {
+		t.Fatalf("spend = %d µUSD after concurrent writes and reconciles, want %d", spend, want)
 	}
 }

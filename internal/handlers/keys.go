@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/zer0-router/zer0/internal/auth"
+	"github.com/zer0-router/zer0/internal/balance"
 	"github.com/zer0-router/zer0/internal/keys"
 	"github.com/zer0-router/zer0/internal/keystate"
 	"github.com/zer0-router/zer0/internal/providers"
@@ -56,9 +57,10 @@ type KeyStateAdmin interface {
 	Invalidate(keyID string)
 }
 
-// BalancePoller polls the balances of an org's keys now.
+// BalancePoller polls the balances of an org's keys now (balance.Poller).
+// TryPollNow returns balance.ErrBusy when a poll is already running.
 type BalancePoller interface {
-	PollNow(ctx context.Context, orgID string) (int, error)
+	TryPollNow(ctx context.Context, orgID string) (int, error)
 }
 
 type KeysHandler struct {
@@ -557,7 +559,11 @@ func (h *KeysHandler) PollBalances(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	n, err := h.deps.Balances.PollNow(ctx, auth.OrgIDFromCtx(r.Context()))
+	n, err := h.deps.Balances.TryPollNow(ctx, auth.OrgIDFromCtx(r.Context()))
+	if errors.Is(err, balance.ErrBusy) {
+		writeError(w, http.StatusConflict, "conflict", "poll_in_progress", "A balance poll is already running; try again in a minute")
+		return
+	}
 	if err != nil {
 		slog.Error("keys: poll balances failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "poll_failed", "Failed to poll balances")

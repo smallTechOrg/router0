@@ -20,11 +20,15 @@ func (s *PGStore) SetCredits(ctx context.Context, keyID, reason string, ttl time
 		`INSERT INTO provider_key_state (provider_key_id, org_id, kind, scope_model, until_at, reason, last_error_class)
 		 SELECT id, org_id, 'credits_exhausted', '', $2, $3, 'insufficient_credits' FROM provider_keys WHERE id = $1
 		 ON CONFLICT (provider_key_id, kind, scope_model) DO UPDATE SET
-		   until_at = CASE WHEN provider_key_state.reason = EXCLUDED.reason
+		   -- Our own (or an expired) row is replaced outright. A live row set by
+		   -- something else (a provider 402) keeps its reason, so a later
+		   -- ClearCredits(reason) cannot remove it; the poll may only extend it.
+		   until_at = CASE WHEN provider_key_state.reason IS NOT DISTINCT FROM EXCLUDED.reason
+		                     OR provider_key_state.until_at <= NOW()
 		                   THEN EXCLUDED.until_at
 		                   ELSE GREATEST(provider_key_state.until_at, EXCLUDED.until_at) END,
-		   reason = CASE WHEN provider_key_state.until_at > NOW() AND provider_key_state.reason <> EXCLUDED.reason
-		                 AND provider_key_state.until_at > EXCLUDED.until_at
+		   reason = CASE WHEN provider_key_state.until_at > NOW()
+		                   AND provider_key_state.reason IS DISTINCT FROM EXCLUDED.reason
 		                 THEN provider_key_state.reason ELSE EXCLUDED.reason END,
 		   updated_at = NOW()`,
 		keyID, until, reason)
