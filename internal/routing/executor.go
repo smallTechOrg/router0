@@ -121,6 +121,7 @@ func (e *Executor) Run(ctx context.Context, plan []Candidate, fn AttemptFunc) Re
 			}
 			res.Attempts = append(res.Attempts, rec)
 			metrics.AttemptsTotal.WithLabelValues(c.Provider, OutcomeSkipped, rec.Class).Inc()
+			metrics.KeySkipsTotal.WithLabelValues(c.Provider, st.Reason).Inc()
 			continue
 		}
 		if attempted >= e.cfg.MaxAttempts {

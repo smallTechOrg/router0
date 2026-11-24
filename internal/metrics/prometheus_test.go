@@ -15,6 +15,11 @@ func TestMetricNamesRenamed(t *testing.T) {
 	CatalogRefreshTotal.WithLabelValues("groq", "ok").Inc()
 	TokenAuthFailuresTotal.WithLabelValues("unknown").Inc()
 	MetadataDroppedTotal.Inc()
+	KeySkipsTotal.WithLabelValues("groq", "budget_exhausted").Inc()
+	SpendUSDTotal.WithLabelValues("groq").Add(0.001)
+	BalancePollsTotal.WithLabelValues("openrouter", "ok").Inc()
+	SpendReconcileTotal.WithLabelValues("ok").Inc()
+	SpendReconcileCorrectedKeys.Add(1)
 	fams, err := prometheus.DefaultGatherer.Gather()
 	if err != nil {
 		t.Fatal(err)
@@ -27,7 +32,9 @@ func TestMetricNamesRenamed(t *testing.T) {
 		seen[f.GetName()] = true
 	}
 	for _, n := range []string{"router0_requests_total", "router0_request_duration_seconds", "router0_attempts_total",
-		"router0_key_state_marks_total", "router0_catalog_refresh_total", "router0_token_auth_failures_total", "router0_metadata_dropped_total"} {
+		"router0_key_state_marks_total", "router0_catalog_refresh_total", "router0_token_auth_failures_total", "router0_metadata_dropped_total",
+		"router0_key_skips_total", "router0_spend_usd_total", "router0_balance_polls_total", "router0_spend_reconcile_total",
+		"router0_spend_reconcile_corrected_keys_total"} {
 		if !seen[n] {
 			t.Errorf("missing %s", n)
 		}

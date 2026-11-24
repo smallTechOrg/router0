@@ -45,4 +45,36 @@ var (
 		Name: "router0_metadata_dropped_total",
 		Help: "Request-log records dropped because the async buffer was full",
 	})
+
+	// KeySkipsTotal: candidates skipped without a call, by key-state reason
+	// (rate_limited | credits_exhausted | budget_exhausted).
+	KeySkipsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "router0_key_skips_total",
+		Help: "Candidates skipped without an upstream call, by provider and key-state reason",
+	}, []string{"provider", "reason"})
+
+	// SpendUSDTotal: estimated cost of successful requests (what budgets count).
+	SpendUSDTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "router0_spend_usd_total",
+		Help: "Estimated USD cost of successful requests, by winning provider",
+	}, []string{"provider"})
+
+	// BalancePollsTotal: per-key balance polls by provider and result
+	// (ok | exhausted | error).
+	BalancePollsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "router0_balance_polls_total",
+		Help: "Provider balance polls per key, by provider and result",
+	}, []string{"provider", "result"})
+
+	// SpendReconcileTotal: hourly spend reconciliations by status (ok | error).
+	SpendReconcileTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "router0_spend_reconcile_total",
+		Help: "Month-to-date spend reconciliations from the request log, by status",
+	}, []string{"status"})
+
+	// SpendReconcileCorrectedKeys: key counters inserted or corrected by reconciles.
+	SpendReconcileCorrectedKeys = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "router0_spend_reconcile_corrected_keys_total",
+		Help: "Per-key spend counters inserted or corrected by reconciliation",
+	})
 )

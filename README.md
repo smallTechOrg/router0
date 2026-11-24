@@ -156,7 +156,7 @@ Integration tests (`internal/integration`) drive `server.New`, the same route ta
 
 ### Metrics and logs
 
-`GET /metrics` (Prometheus, `router0_*` names; see `config/alerts.yaml`), `GET /healthz` (`{"status":"ok","db":"ok"}`). Logs are JSON on stdout with `service: router0`; one `request_completed` line per inference request.
+`GET /metrics` (Prometheus, `router0_*` names; see `config/alerts.yaml`). Budgets and balances: `router0_key_skips_total{provider,reason}` (`rate_limited`, `credits_exhausted`, `budget_exhausted`), `router0_spend_usd_total{provider}` (estimated), `router0_balance_polls_total{provider,result}`, `router0_spend_reconcile_total{status}`, `GET /healthz` (`{"status":"ok","db":"ok"}`). Logs are JSON on stdout with `service: router0`; one `request_completed` line per inference request.
 
 ## Layout
 

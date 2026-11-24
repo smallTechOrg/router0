@@ -6,6 +6,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/zer0-router/zer0/internal/keystate"
+	"github.com/zer0-router/zer0/internal/metrics"
 )
 
 // Beginner is the subset of *pgxpool.Pool Reconcile needs.
@@ -54,7 +55,14 @@ ON CONFLICT (provider_key_id, month) DO UPDATE
 // tests use the filter so parallel packages do not reset each other's keys).
 func Reconcile(ctx context.Context, db Beginner, now time.Time, orgID string) (int64, error) {
 	start := keystate.MonthStart(now)
-	return reconcileTx(ctx, db, start, orgID)
+	n, err := reconcileTx(ctx, db, start, orgID)
+	if err != nil {
+		metrics.SpendReconcileTotal.WithLabelValues("error").Inc()
+		return 0, err
+	}
+	metrics.SpendReconcileTotal.WithLabelValues("ok").Inc()
+	metrics.SpendReconcileCorrectedKeys.Add(float64(n))
+	return n, nil
 }
 
 func reconcileTx(ctx context.Context, db Beginner, start time.Time, orgID string) (int64, error) {

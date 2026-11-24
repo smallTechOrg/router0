@@ -38,3 +38,30 @@ groups:
         annotations:
           summary: "High p95 latency for {{ $labels.provider }}"
           description: "p95 latency is {{ $value }}s"
+
+      - alert: KeysSkippedForBudget
+        expr: increase(router0_key_skips_total{reason="budget_exhausted"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "Requests are skipping {{ $labels.provider }} keys that reached their monthly budget"
+          description: "{{ $value }} budget skips in the last 15m; raise the budget or add keys if this is unexpected"
+
+      - alert: BalancePollFailing
+        expr: increase(router0_balance_polls_total{result="error"}[30m]) > 0 and increase(router0_balance_polls_total{result!="error"}[30m]) == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Every {{ $labels.provider }} balance poll is failing"
+          description: "No successful balance poll in 30m; out-of-credit keys are only detected when a request fails"
+
+      - alert: SpendReconcileFailing
+        expr: increase(router0_spend_reconcile_total{status="error"}[3h]) > 1
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Month-to-date spend reconciliation keeps failing"
+          description: "Budget counters are not being repaired from the request log; check PostgreSQL"

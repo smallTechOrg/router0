@@ -276,6 +276,9 @@ func (h *InferenceHandler) finish(rs *reqState, o outcome) {
 		code = "ok"
 	}
 	metrics.RequestsTotal.WithLabelValues(provider, o.status, code).Inc()
+	if o.status == "success" && o.cost > 0 {
+		metrics.SpendUSDTotal.WithLabelValues(provider).Add(o.cost)
+	}
 	metrics.RequestDuration.WithLabelValues(provider, strconv.FormatBool(rs.stream)).Observe(lat.Seconds())
 	h.recorder.Record(metadata.Request{
 		RequestID: rs.id, OrgID: rs.orgID, TokenID: rs.tokenID, CanonicalModel: rs.canonical,

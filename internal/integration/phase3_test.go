@@ -5,6 +5,8 @@ package integration
 import (
 	"context"
 	"math"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -252,4 +254,65 @@ func TestPhase3_LegacyTablesDropped(t *testing.T) {
 	assertStatus(t, tn.chat(tok, chatOpts{}), 200)
 	// The platform admin model registry no longer depends on model_perf_stats.
 	assertStatus(t, tn.e.do("GET", "/admin/models", tn.e.admin, nil, nil), 200)
+}
+
+// metricValue returns the value of the first /metrics sample whose line starts
+// with prefix (metric name plus label set), or -1 when absent.
+func metricValue(t *testing.T, e *env, prefix string) float64 {
+	t.Helper()
+	m := e.do("GET", "/metrics", "", nil, nil)
+	assertStatus(t, m, 200)
+	for _, line := range strings.Split(string(m.body), "\n") {
+		if strings.HasPrefix(line, prefix+" ") {
+			v, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, prefix)), 64)
+			if err != nil {
+				t.Fatalf("metric line %q: %v", line, err)
+			}
+			return v
+		}
+	}
+	return -1
+}
+
+func TestPhase3_Metrics(t *testing.T) {
+	e, tn, tok := fixture(t, []string{"mock-ok-g"}, []string{"mock-ok-or"})
+	tn.orFirst()
+	tn.priceOpenRouterModel()
+	const (
+		budgetSkips = `router0_key_skips_total{provider="openrouter",reason="budget_exhausted"}`
+		creditSkips = `router0_key_skips_total{provider="openrouter",reason="credits_exhausted"}`
+		spend       = `router0_spend_usd_total{provider="openrouter"}`
+		polls       = `router0_balance_polls_total{provider="openrouter",result="exhausted"}`
+		reconciles  = `router0_spend_reconcile_total{status="ok"}`
+	)
+	base := map[string]float64{}
+	for _, m := range []string{budgetSkips, creditSkips, spend, polls, reconciles} {
+		base[m] = math.Max(0, metricValue(t, e, m))
+	}
+
+	// One paid request on OpenRouter, then a $0 budget makes it skip.
+	r := tn.chat(tok, chatOpts{})
+	assertStatus(t, r, 200)
+	tn.waitLog(r.header.Get("X-Router0-Request-Id"), 1)
+	id := str(tn.keyByLabel("or-main")["id"])
+	assertStatus(t, tn.api("PATCH", "/api/keys/"+id, J{"monthly_budget_usd": 0}), 200)
+	assertStatus(t, tn.chat(tok, chatOpts{}), 200) // groq serves
+	// Remove the budget; a $0 balance poll makes it skip for credits instead.
+	assertStatus(t, tn.api("PATCH", "/api/keys/"+id, J{"monthly_budget_usd": nil}), 200)
+	e.or.SetBalance(0)
+	assertStatus(t, tn.api("POST", "/api/keys/poll-balances", nil), 200)
+	assertStatus(t, tn.chat(tok, chatOpts{}), 200)
+	if _, err := metadata.Reconcile(context.Background(), e.pool, time.Now(), tn.orgID); err != nil {
+		t.Fatal(err)
+	}
+
+	for m, want := range map[string]float64{budgetSkips: 1, creditSkips: 1, polls: 1, reconciles: 1} {
+		if got := metricValue(t, e, m) - base[m]; got < want {
+			t.Errorf("%s increased by %v, want >= %v", m, got, want)
+		}
+	}
+	// Other tests in this binary may add OpenRouter spend too, so this is a lower bound.
+	if got := metricValue(t, e, spend) - base[spend]; got < 0.0006-1e-9 {
+		t.Errorf("%s increased by %v, want >= 0.0006", spend, got)
+	}
 }
