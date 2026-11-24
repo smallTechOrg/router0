@@ -345,6 +345,13 @@ func (h *InferenceHandler) ChatCompletions(w http.ResponseWriter, r *http.Reques
 	rs.requested, rs.stream = cr.Model, cr.Stream
 	rs.canonical = cr.Model
 
+	override, unknown := routing.ParseProviderOverride(r.Header.Get(providersHeader))
+	if unknown != "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_provider_override",
+			fmt.Sprintf("Unknown provider %q in %s", unknown, providersHeader), "", nil)
+		return
+	}
+
 	if h.budgets != nil {
 		if b := h.budgets.Check(ctx, rs.tokenID); b.Exceeded() {
 			h.failEarly(w, rs, http.StatusPaymentRequired, "insufficient_credits", "token_budget_exceeded",
@@ -352,13 +359,6 @@ func (h *InferenceHandler) ChatCompletions(w http.ResponseWriter, r *http.Reques
 					"It resets at 00:00 UTC on the 1st, or an org owner/admin can raise it on the Tokens page.", b.BudgetUSD, b.SpendUSD), "")
 			return
 		}
-	}
-
-	override, unknown := routing.ParseProviderOverride(r.Header.Get(providersHeader))
-	if unknown != "" {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_provider_override",
-			fmt.Sprintf("Unknown provider %q in %s", unknown, providersHeader), "", nil)
-		return
 	}
 
 	entries, err := h.resolver.Resolve(ctx, rs.orgID, cr.Model)

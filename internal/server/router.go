@@ -112,7 +112,7 @@ func Build(d Deps) *App {
 
 	// Each spend write evicts the key's cached state so a reached budget blocks
 	// the very next request.
-	recorder := metadata.NewRecorder(pool, metadata.Options{OnSpend: keyStates.SpendChanged, OnTokenSpend: tokenBudgets.Evict})
+	recorder := metadata.NewRecorder(pool, metadata.Options{OnSpend: keyStates.SpendChanged, OnTokenSpend: tokenBudgets.SpendChanged})
 	execCfg := d.ExecutorConfig
 	execCfg.States = keyStates
 	execCfg.Auth = keyRepo

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -48,6 +49,7 @@ func (b BudgetStatus) Exceeded() bool { return b.HasBudget && b.spendMicro >= b.
 type BudgetGuard struct {
 	db    budgetDB
 	cache *cache.TTL[string, BudgetStatus]
+	gen   atomic.Uint64 // bumped by every eviction; a read that raced one is not cached
 }
 
 type budgetDB interface {
@@ -71,6 +73,7 @@ func (g *BudgetGuard) Check(ctx context.Context, tokenID string) BudgetStatus {
 	if st, ok := g.cache.Get(tokenID); ok {
 		return st
 	}
+	gen := g.gen.Load()
 	var budget *float64
 	var spendMicro int64
 	err := g.db.QueryRow(ctx,
@@ -89,9 +92,25 @@ func (g *BudgetGuard) Check(ctx context.Context, tokenID string) BudgetStatus {
 	if budget != nil {
 		st.HasBudget, st.BudgetUSD, st.budgetMicro = true, *budget, int64(*budget*1e6+0.5)
 	}
-	g.cache.Set(tokenID, st)
+	if g.gen.Load() == gen {
+		g.cache.Set(tokenID, st)
+	}
 	return st
 }
 
-// Evict drops the cached status (after a spend write or a budget change).
-func (g *BudgetGuard) Evict(tokenID string) { g.cache.Delete(tokenID) }
+// Evict drops the cached status (after a budget change). Reads that were in
+// flight are not cached, so the change applies to the next request.
+func (g *BudgetGuard) Evict(tokenID string) {
+	g.gen.Add(1)
+	g.cache.Delete(tokenID)
+}
+
+// SpendChanged is called after the token's spend was written (metadata
+// recorder). Only a token with a budget depends on spend; others keep their
+// cached status so steady traffic does not re-query on every request.
+func (g *BudgetGuard) SpendChanged(tokenID string) {
+	if st, ok := g.cache.Get(tokenID); ok && !st.HasBudget {
+		return
+	}
+	g.Evict(tokenID)
+}
