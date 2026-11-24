@@ -36,6 +36,19 @@ export default function RoutingPage() {
     setOrder(next);
   }
 
+  // Native HTML5 drag-and-drop: the dragged row moves live as it passes over
+  // others; Save persists. The ▲ ▼ buttons stay for keyboard users.
+  const [dragging, setDragging] = useState<string | null>(null);
+  function dragOver(e: React.DragEvent, over: string) {
+    if (!dragging) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (over === dragging) return;
+    const next = order.filter((p) => p !== dragging);
+    next.splice(order.indexOf(over), 0, dragging);
+    setOrder(next);
+  }
+
   async function save() {
     if (!token) return;
     setSaving(true); setSaveError('');
@@ -51,7 +64,7 @@ export default function RoutingPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Routing" subtitle="Provider priority for your org. router0 tries providers top to bottom and, within each, the keys in their order." />
+      <PageHeader title="Routing" subtitle="Provider priority for your org. router0 tries providers top to bottom and, within each, the keys in their order. Drag rows (or use the arrows), then Save." />
       <ErrorBanner message={error} onRetry={() => reload()} />
       <ErrorBanner message={saveError} />
       <Notice message={notice} />
@@ -64,7 +77,16 @@ export default function RoutingPage() {
         ) : (
           <ol className="divide-y divide-neutral-800">
             {order.map((p, i) => (
-              <li key={p} className="flex items-center gap-3 px-5 py-3">
+              <li
+                key={p}
+                draggable={canWrite}
+                onDragStart={(e) => { setDragging(p); e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', p); }}
+                onDragOver={(e) => dragOver(e, p)}
+                onDrop={(e) => { e.preventDefault(); setDragging(null); }}
+                onDragEnd={() => setDragging(null)}
+                className={`flex items-center gap-3 px-5 py-3 ${canWrite ? 'cursor-grab active:cursor-grabbing' : ''} ${dragging === p ? 'bg-neutral-800/60 opacity-70' : ''}`}
+              >
+                {canWrite && <span className="select-none text-neutral-600" aria-hidden="true" title="Drag to reorder">⋮⋮</span>}
                 <span className="w-5 text-xs text-neutral-500">{i + 1}</span>
                 <span className="flex-1 text-sm font-medium text-neutral-100">{p}</span>
                 <span className="text-xs text-neutral-500">{keyCount(p)} key{keyCount(p) === 1 ? '' : 's'}</span>

@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"fmt"
+	"github.com/zer0-router/zer0/internal/testutil/testdb"
 	"os"
 	"strings"
 	"testing"
@@ -22,6 +23,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	if dsn == "" {
 		t.Skip("DATABASE_URL not set")
 	}
+	testdb.Migrate(t, dsn)
 	p, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -213,5 +215,63 @@ func TestRecorderSyncViaEnv(t *testing.T) {
 	rec := NewRecorder(&blockingDB{release: make(chan struct{})})
 	if !rec.sync {
 		t.Fatal("ROUTER0_RECORDER_SYNC=true must enable sync mode")
+	}
+}
+
+func TestRecorderSpendAndReconcile(t *testing.T) {
+	db := testPool(t)
+	ctx := context.Background()
+	org, user := uuid.NewString(), uuid.NewString()
+	if _, err := db.Exec(ctx, `INSERT INTO orgs (id, name) VALUES ($1,$2)`, org, "spend-"+org); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `INSERT INTO users (id, email, password_hash) VALUES ($1,$2,'x')`, user, "spend-"+user+"@example.test"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(ctx, `DELETE FROM request_metadata WHERE org_id=$1`, org)
+		_, _ = db.Exec(ctx, `DELETE FROM orgs WHERE id=$1`, org)
+		_, _ = db.Exec(ctx, `DELETE FROM users WHERE id=$1`, user)
+	})
+	var key string
+	if err := db.QueryRow(ctx, `INSERT INTO provider_keys (user_id, org_id, provider, label, ciphertext, nonce)
+		VALUES ($1,$2,'groq','spend','\x00','\x00') RETURNING id::text`, user, org).Scan(&key); err != nil {
+		t.Fatal(err)
+	}
+	var notified []string
+	rec := NewRecorder(db, Options{Sync: true, OnSpend: func(k string) { notified = append(notified, k) }})
+	for i, st := range []string{"success", "success", "error"} {
+		rec.Record(Request{RequestID: fmt.Sprintf("r0-spend-%s-%d", key[:8], i), OrgID: org, CanonicalModel: "m", Provider: "groq",
+			Model: "m", KeyID: key, CostUSD: 0.0006, Status: st, HTTPStatus: 200})
+	}
+	spend := func() int64 {
+		var v int64
+		_ = db.QueryRow(ctx, `SELECT COALESCE(SUM(spend_micro_usd),0) FROM provider_key_spend WHERE provider_key_id=$1`, key).Scan(&v)
+		return v
+	}
+	if got := spend(); got != 1200 {
+		t.Fatalf("spend = %d µUSD, want 1200 (errors are not billed)", got)
+	}
+	if len(notified) != 2 || notified[0] != key {
+		t.Fatalf("OnSpend calls = %v", notified)
+	}
+	if _, err := db.Exec(ctx, `DELETE FROM provider_key_spend WHERE provider_key_id=$1`, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Reconcile(ctx, db, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got := spend(); got != 1200 {
+		t.Fatalf("after reconcile spend = %d µUSD, want 1200", got)
+	}
+	// A drifted counter is corrected back to the request log.
+	if _, err := db.Exec(ctx, `UPDATE provider_key_spend SET spend_micro_usd = 99999 WHERE provider_key_id=$1`, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Reconcile(ctx, db, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got := spend(); got != 1200 {
+		t.Fatalf("after second reconcile spend = %d µUSD, want 1200", got)
 	}
 }

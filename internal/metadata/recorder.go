@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/zer0-router/zer0/internal/keystate"
 	"github.com/zer0-router/zer0/internal/metrics"
 )
 
@@ -71,6 +72,12 @@ type Options struct {
 	// request-based billing), where async writers would be starved between
 	// requests. Also enabled by ROUTER0_RECORDER_SYNC=true.
 	Sync bool
+	// OnSpend is called with the provider key id after a successful request's
+	// month-to-date spend was written (server wiring evicts the key-state cache
+	// so a reached budget takes effect on the next request).
+	OnSpend func(keyID string)
+	// Now is the clock used to pick the spend month (default time.Now).
+	Now func() time.Time
 }
 
 // Recorder is a buffered async writer. Methods are safe on a nil *Recorder.
@@ -82,6 +89,8 @@ type Recorder struct {
 	closed  bool
 	workers int
 	sync    bool
+	onSpend func(keyID string)
+	now     func() time.Time
 }
 
 // NewRecorder starts the worker pool (4 workers, 10 000 buffered records).
@@ -101,7 +110,13 @@ func NewRecorder(db DB, opts ...Options) *Recorder {
 	if os.Getenv("ROUTER0_RECORDER_SYNC") == "true" {
 		o.Sync = true
 	}
-	r := &Recorder{db: db, ch: make(chan Request, o.Buffer), workers: o.Workers, sync: o.Sync}
+	r := &Recorder{db: db, ch: make(chan Request, o.Buffer), workers: o.Workers, sync: o.Sync, now: time.Now}
+	if len(opts) > 0 {
+		r.onSpend = opts[0].OnSpend
+		if opts[0].Now != nil {
+			r.now = opts[0].Now
+		}
+	}
 	if o.Sync {
 		return r // no workers: Record writes inline
 	}
@@ -206,12 +221,26 @@ func (r *Recorder) write(ctx context.Context, q Request) error {
 		b.Queue(insertAttempt, q.RequestID, q.OrgID, a.Provider, a.Model, a.KeyID, a.KeyLabel, a.Order, a.Outcome,
 			a.ErrorClass, a.SkipReason, trunc(a.ProviderErrorCode, maxCodeLen), a.HTTPStatus, a.RetryAfterS, a.LatencyMs)
 	}
+	// Month-to-date spend for budgets, in the same batch (one implicit
+	// transaction) as the request row, so the hourly reconcile from
+	// request_metadata and this counter agree.
+	spend := q.Status == "success" && q.KeyID != "" && keystate.MicroUSD(q.CostUSD) > 0
+	if spend {
+		b.Queue(keystate.AddSpendSQL, q.KeyID, keystate.MonthStart(r.now()), keystate.MicroUSD(q.CostUSD))
+	}
 	br := r.db.SendBatch(ctx, b)
-	defer br.Close()
-	for i := 0; i < 1+len(q.Attempts); i++ {
+	n := b.Len()
+	for i := 0; i < n; i++ {
 		if _, err := br.Exec(); err != nil {
+			br.Close()
 			return err
 		}
+	}
+	if err := br.Close(); err != nil {
+		return err
+	}
+	if spend && r.onSpend != nil {
+		r.onSpend(q.KeyID)
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package keystate
 import (
 	"context"
 	"fmt"
+	"github.com/zer0-router/zer0/internal/testutil/testdb"
 	"os"
 	"sync"
 	"testing"
@@ -46,6 +47,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	if dsn == "" {
 		t.Skip("DATABASE_URL not set")
 	}
+	testdb.Migrate(t, dsn)
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {

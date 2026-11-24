@@ -2,10 +2,11 @@
 import { useMemo, useState } from 'react';
 import { useAuth, useLoader } from '@/lib/hooks';
 import {
-  addKey, deleteKey, errorMessage, getPriority, listKeys, listProviders, putPriority, testKey,
-  providerLabelFor, type ProviderKey,
+  addKey, deleteKey, errorMessage, getPriority, listKeys, listProviders, pollBalances, putPriority, resetKeyState, testKey,
+  providerLabelFor, updateKey, type KeyBalance, type ProviderKey,
 } from '@/lib/api';
 import KeyStateBadge from '@/components/KeyStateBadge';
+import SpendBar, { usd } from '@/components/SpendBar';
 import { btnDanger, btnGhost, btnPrimary, Card, EmptyState, ErrorBanner, fmtTime, inputCls, Loading, Notice, PageHeader } from '@/components/ui';
 
 const KEY_HINTS: Record<string, string> = {
@@ -26,6 +27,7 @@ export default function KeysPage() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [testing, setTesting] = useState<string | null>(null);
+  const [polling, setPolling] = useState(false);
 
   const providerLabel = useMemo(() => {
     const m: Record<string, string> = {};
@@ -108,6 +110,46 @@ export default function KeysPage() {
     }
   }
 
+  async function onReset(k: ProviderKey) {
+    if (!token) return;
+    setError('');
+    try {
+      await resetKeyState(token, k.id);
+      setNotice(`State of "${k.label}" reset: cooldowns and out-of-credits marks cleared.`);
+      await reloadAll();
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
+  async function onSaveBudget(k: ProviderKey, budget: number | null) {
+    if (!token) return false;
+    setError('');
+    try {
+      await updateKey(token, k.id, { monthly_budget_usd: budget });
+      setNotice(budget === null ? `Budget of "${k.label}" removed.` : `Budget of "${k.label}" set to ${usd(budget)} per month.`);
+      await reloadAll();
+      return true;
+    } catch (err) {
+      setError(errorMessage(err));
+      return false;
+    }
+  }
+
+  async function onPoll() {
+    if (!token) return;
+    setPolling(true); setError('');
+    try {
+      const r = await pollBalances(token);
+      setNotice(r.polled === 0 ? 'No keys with a balance API (only OpenRouter has one).' : `Polled ${r.polled} key balance${r.polled === 1 ? '' : 's'}.`);
+      await reloadAll();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setPolling(false);
+    }
+  }
+
   async function onRemove(k: ProviderKey) {
     if (!token) return;
     if (!window.confirm(`Remove key "${k.label}"? It will be disabled and no longer used for routing.`)) return;
@@ -122,10 +164,17 @@ export default function KeysPage() {
   }
 
   const loading = (keys.loading || prio.loading) && !keys.data;
+  const anyBalanceKey = (keys.data?.keys ?? []).some((k) => k.balance?.supported);
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Provider keys" subtitle="Bring your own keys. Within a provider, keys are tried top to bottom; use the arrows to change the order. Status refreshes every 10 s." />
+      <PageHeader
+        title="Provider keys"
+        subtitle="Bring your own keys. Within a provider, keys are tried top to bottom; use the arrows to change the order. Status refreshes every 10 s."
+        actions={canWrite && anyBalanceKey ? (
+          <button className={btnGhost} onClick={onPoll} disabled={polling}>{polling ? 'Polling…' : 'Poll balances'}</button>
+        ) : undefined}
+      />
       <ErrorBanner message={keys.error || prio.error || providers.error} onRetry={reloadAll} />
       <ErrorBanner message={error} />
       <Notice message={notice} />
@@ -183,9 +232,17 @@ export default function KeysPage() {
                       <button className={btnGhost} onClick={() => move(g.provider, i, -1)} disabled={i === 0} aria-label={`Move ${k.label} up`}>▲</button>
                       <button className={btnGhost} onClick={() => move(g.provider, i, 1)} disabled={i === g.keys.length - 1} aria-label={`Move ${k.label} down`}>▼</button>
                       <button className={btnGhost} onClick={() => onTest(k)} disabled={testing === k.id}>{testing === k.id ? 'Testing…' : 'Test'}</button>
+                      {k.state?.blocked && k.state.reason !== 'budget_exhausted' && (
+                        <button className={btnGhost} onClick={() => onReset(k)} title="Clear cooldowns and out-of-credits marks now">Reset state</button>
+                      )}
                       <button className={btnDanger} onClick={() => onRemove(k)}>Remove</button>
                     </div>
                   )}
+                  <div className="flex w-full flex-wrap items-center gap-x-6 gap-y-2 pl-8">
+                    <SpendBar spend={k.month_spend_usd ?? 0} budget={k.monthly_budget_usd} className="w-56" />
+                    <BalanceText balance={k.balance} />
+                    {canWrite && <BudgetEditor keyInfo={k} onSave={(b) => onSaveBudget(k, b)} />}
+                  </div>
                 </li>
               ))}
             </ul>
@@ -193,5 +250,80 @@ export default function KeysPage() {
         ))
       )}
     </div>
+  );
+}
+
+/** Last polled provider balance (OpenRouter), or a note that the provider has no balance API. */
+function BalanceText({ balance }: { balance?: KeyBalance | null }) {
+  if (!balance || !balance.supported) {
+    return <p className="text-xs text-neutral-600">Balance: not available for this provider</p>;
+  }
+  const when = balance.polled_at ? ` · polled ${fmtTime(balance.polled_at)}` : '';
+  switch (balance.status) {
+    case 'pending':
+      return <p className="text-xs text-neutral-500">Balance: not polled yet</p>;
+    case 'error':
+      return <p className="text-xs text-amber-400">Balance: last poll failed{when}</p>;
+    case 'exhausted':
+      return <p className="text-xs text-red-400">Balance: out of credits{when}</p>;
+  }
+  const rem = balance.remaining_usd;
+  return (
+    <p className="text-xs text-neutral-400">
+      Balance: <span className="font-mono text-neutral-200">{rem === null ? 'unlimited' : usd(rem)}</span>
+      {balance.limit_usd !== null && rem !== null ? <> of {usd(balance.limit_usd)}</> : null}
+      <span className="text-neutral-600">{when}</span>
+    </p>
+  );
+}
+
+/** Inline monthly-budget editor: shows the budget, edits it, or clears it. */
+function BudgetEditor({ keyInfo, onSave }: { keyInfo: ProviderKey; onSave: (budget: number | null) => Promise<boolean> }) {
+  const current = keyInfo.monthly_budget_usd ?? null;
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [invalid, setInvalid] = useState(false);
+
+  async function save(b: number | null) {
+    setSaving(true);
+    const ok = await onSave(b);
+    setSaving(false);
+    if (ok) setEditing(false);
+  }
+
+  if (!editing) {
+    return (
+      <button
+        className="text-xs text-neutral-400 underline decoration-neutral-700 underline-offset-2 hover:text-neutral-200"
+        onClick={() => { setValue(current === null ? '' : String(current)); setInvalid(false); setEditing(true); }}
+      >
+        {current === null ? 'Set monthly budget' : 'Edit budget'}
+      </button>
+    );
+  }
+
+  return (
+    <form
+      className="flex items-center gap-1.5"
+      onSubmit={(e) => {
+        e.preventDefault();
+        const n = Number(value);
+        if (value.trim() === '' || !Number.isFinite(n) || n < 0) { setInvalid(true); return; }
+        save(n);
+      }}
+    >
+      <label htmlFor={`budget-${keyInfo.id}`} className="text-xs text-neutral-400">Budget $</label>
+      <input
+        id={`budget-${keyInfo.id}`} type="number" min="0" step="0.0001" inputMode="decimal" autoFocus
+        className={`${inputCls} h-8 w-28 py-1 text-xs`} value={value}
+        aria-invalid={invalid} onChange={(e) => { setValue(e.target.value); setInvalid(false); }}
+      />
+      <span className="text-xs text-neutral-500">/ month</span>
+      <button type="submit" className={btnGhost} disabled={saving}>{saving ? 'Saving…' : 'Save'}</button>
+      {current !== null && <button type="button" className={btnGhost} disabled={saving} onClick={() => save(null)}>Remove</button>}
+      <button type="button" className={btnGhost} disabled={saving} onClick={() => setEditing(false)}>Cancel</button>
+      {invalid && <span className="text-xs text-red-400" role="alert">Enter an amount of 0 or more.</span>}
+    </form>
   );
 }

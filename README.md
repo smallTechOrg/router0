@@ -104,6 +104,16 @@ print(c.chat.completions.create(model="claude-sonnet-5-5", messages=msgs, tools=
 
 **Mock keys** (Phase 2 mocks): Anthropic `mock-ok-anth`, `mock-credits-*` (400 "credit balance is too low" -> router0 402), `mock-529-*` (overloaded -> failover); Mesh keys may carry the prefix, e.g. `rsk_mock-429-15-a`. Select a scripted tool conversation by adding `[scenario:single]`, `[scenario:parallel]` or `[scenario:chain]` to the user message together with a `tools` list. `curl -X POST localhost:9902/_models -d '["acme/new-model-x"]'` changes a mock's model list (on-demand discovery demo).
 
+## Budgets, balances and key state
+
+**Monthly budgets.** `PATCH /api/keys/{id} {"monthly_budget_usd": 50}` (owner/admin; `null` removes it, `0` pauses the key; the smallest non-zero budget is `0.0001`). Each successful request adds its estimated cost to the key's spend for the current UTC month. Costs come from the provider's reported cost, router0's price table, or the catalog's per-model prices. Once spend reaches the budget, the key is skipped (`skip_reason: budget_exhausted`). If no other key can serve the request, the client gets `402 insufficient_credits`. Budgets reset at 00:00 UTC on the 1st. The counter is rebuilt from the request log on startup and every hour. The keys page shows spend against budget (estimated) and has a budget editor. The Costs page shows a bar per key.
+
+**Balances (OpenRouter).** router0 reads each active OpenRouter key's remaining balance (`GET /key`, plus `/credits` for keys without their own limit) on startup and every `ROUTER0_BALANCE_POLL_SECONDS` (600). The keys page "Poll balances" button, or `POST /api/keys/poll-balances`, does it on demand. A key at $0 is marked out of credits and skipped before it fails. The mark lasts one poll interval plus a minute, and a later poll with a positive balance clears it. A 402 from a live request is never cleared by a poll. Other providers have no per-key balance API and show "not available". On Cloud Run with request-based CPU (`--min-instances 0`), the periodic loop only runs while the service is handling traffic. The startup poll and the button still work.
+
+**Reset state.** `POST /api/keys/{id}/reset-state` (the keys page "Reset state" button) deletes a key's cooldown and out-of-credits rows, so the next request tries it again. It does not lift a budget; raise or remove the budget instead.
+
+With the mocks: set a key's budget to `0.0001` and send requests until it shows "budget reached". To run the balance poll against the mock, run `curl -X POST localhost:9902/_balance -d 0`, then click "Poll balances": `or-main` shows "out of credits" and is skipped. Then run `-d 5` and poll again to clear it.
+
 ## How the gateway behaves
 
 - **Model resolution:** the requested name is canonicalised (`llama-3.3-70b-versatile`, `meta-llama/llama-3.3-70b-instruct` and `Llama-3.3-70B` are the same model) and matched against the org's catalog, which is discovered from each provider's model list.

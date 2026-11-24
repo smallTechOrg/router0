@@ -12,7 +12,9 @@
 // mock-credits-*, mock-529-*; Mesh keys may be prefixed, e.g. rsk_mock-ok-a).
 // See internal/testutil/mockprovider for the full list, including the scripted
 // tool-calling scenarios. POST a JSON array of ids to /_models on any port to
-// change its model list at runtime.
+// change its model list at runtime. The OpenRouter mock also serves the
+// balance API (GET /v1/key, /v1/credits); POST a JSON number to /_balance on
+// :9902 to set the remaining USD (e.g. `curl -X POST localhost:9902/_balance -d 0`).
 package main
 
 import (

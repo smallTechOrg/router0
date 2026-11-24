@@ -100,6 +100,9 @@ type Mock struct {
 	models []string
 	calls  []Call
 	alias  map[string]string // key -> key whose behaviour it takes
+	// balance is the OpenRouter limit_remaining reported by GET /key (USD);
+	// set with SetBalance or POST /_balance. Default 100.
+	balance float64
 }
 
 // NewMock builds a mock without a listener.
@@ -116,7 +119,7 @@ func NewMock(o Options) *Mock {
 			o.PageSize = 2
 		}
 	}
-	return &Mock{flavour: o.Flavour, pageSize: o.PageSize, models: append([]string(nil), o.Models...)}
+	return &Mock{flavour: o.Flavour, pageSize: o.PageSize, models: append([]string(nil), o.Models...), balance: mockBalanceLimit}
 }
 
 // Server is a Mock bound to an httptest server.
@@ -233,6 +236,18 @@ func (m *Mock) Handler() http.Handler {
 			m.anthropicListModels(w, r)
 		case strings.HasSuffix(p, "/models") && r.Method == http.MethodGet && m.flavour != Gemini:
 			m.listModels(w, r)
+		case strings.HasSuffix(p, "/key") && r.Method == http.MethodGet && m.flavour == OpenRouter:
+			m.openRouterKey(w, r)
+		case strings.HasSuffix(p, "/credits") && r.Method == http.MethodGet && m.flavour == OpenRouter:
+			m.openRouterCredits(w, r)
+		case p == "/_balance" && r.Method == http.MethodPost:
+			var v float64
+			if err := json.NewDecoder(r.Body).Decode(&v); err != nil {
+				http.Error(w, "body must be a JSON number (remaining USD)", http.StatusBadRequest)
+				return
+			}
+			m.SetBalance(v)
+			w.WriteHeader(http.StatusNoContent)
 		case p == "/_models" && r.Method == http.MethodPost:
 			var ids []string
 			if err := json.NewDecoder(r.Body).Decode(&ids); err != nil {

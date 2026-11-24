@@ -201,6 +201,8 @@ Optional smoke (real keys, not part of the gate): the Phase 1 smoke command with
 
 ## Phase 3: Balance polling, monthly budgets, priority UI polish, legacy cleanup
 
+**Status: implemented 2026-11-24.** Additions beyond the slices below: `POST /api/keys/poll-balances` (the "Poll balances" button), catalog-price fallback for cost estimates (so budgets apply to models outside the static price table), a 422 for positive budgets below $0.0001 (the column keeps 4 decimals), and `internal/testutil/testdb` so DB-backed unit tests apply migrations themselves.
+
 **Goal:** OpenRouter keys with zero balance are skipped before they fail. Per-key monthly USD budgets stop a key at its limit (402 when nothing else can serve). The priority and key UI gets drag-and-drop, budgets, balances, and "reset state". The legacy pool tables are dropped (their code was already deleted in Phase 1).
 
 Capabilities: credit-tracking, provider-key-management (P3 parts), dashboard (P3 parts).
