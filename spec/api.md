@@ -192,6 +192,10 @@ Body `{"label":"…","monthly_budget_usd":50}` (`null` clears budget).
 
 Deletes the key's `provider_key_state` rows (cooldown/credits/budget) and evicts the key-state cache. 204.
 
+### `PATCH /api/tokens/{id}` (owner/admin) — Phase 4
+
+Body `{"monthly_budget_usd": 25}` (`null` clears it; 0 pauses the token; otherwise at least 0.0001). Live tokens of the caller's org only (404 otherwise). 200 with the token as listed by `GET /api/tokens` (never the secret). `GET /api/tokens` entries gain `monthly_budget_usd` and `month_spend_usd` (estimated, current UTC month). Over budget, `/v1/chat/completions` answers `402` with `error.type = "insufficient_credits"`, `error.code = "token_budget_exceeded"` and no attempts, before any provider is called.
+
 ### `POST /api/keys/poll-balances` (owner/admin) — Phase 3
 
 Polls the balances of the org's active OpenRouter keys now (same code as the background poll). 200 `{"polled": n}`.

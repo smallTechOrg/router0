@@ -48,8 +48,32 @@ ON CONFLICT (provider_key_id, month) DO UPDATE
   SET spend_micro_usd = EXCLUDED.spend_micro_usd, updated_at = NOW()
   WHERE provider_key_spend.spend_micro_usd <> EXCLUDED.spend_micro_usd`
 
-// Reconcile rebuilds the spend counters of the UTC month containing now from
-// request_metadata and returns how many key rows it inserted or corrected
+// reconcileTokensSQL is reconcileSQL for service_token_spend (keyed by
+// request_metadata.service_token_id).
+const reconcileTokensSQL = `
+WITH actual AS (
+  SELECT rm.service_token_id AS id, round(SUM(rm.estimated_cost_usd) * 1000000)::bigint AS micro
+    FROM request_metadata rm
+    JOIN service_tokens t ON t.id = rm.service_token_id
+   WHERE rm.status = 'success' AND rm.service_token_id IS NOT NULL
+     AND rm.created_at >= $1 AND rm.created_at < $2
+     AND ($4 = '' OR t.org_id::text = $4)
+   GROUP BY rm.service_token_id
+), zeroed AS (
+  UPDATE service_token_spend sp SET spend_micro_usd = 0, updated_at = NOW()
+   WHERE sp.month = $3::date AND sp.spend_micro_usd <> 0
+     AND NOT EXISTS (SELECT 1 FROM actual a WHERE a.id = sp.service_token_id)
+     AND ($4 = '' OR sp.service_token_id IN (SELECT id FROM service_tokens WHERE org_id::text = $4))
+)
+INSERT INTO service_token_spend (service_token_id, month, spend_micro_usd)
+SELECT id, $3::date, micro FROM actual
+ON CONFLICT (service_token_id, month) DO UPDATE
+  SET spend_micro_usd = EXCLUDED.spend_micro_usd, updated_at = NOW()
+  WHERE service_token_spend.spend_micro_usd <> EXCLUDED.spend_micro_usd`
+
+// Reconcile rebuilds the provider-key and service-token spend counters of the
+// UTC month containing now from request_metadata and returns how many rows it
+// inserted or corrected
 // (zeroed rows are not counted). orgID limits it to one org ("" = all orgs;
 // tests use the filter so parallel packages do not reset each other's keys).
 func Reconcile(ctx context.Context, db Beginner, now time.Time, orgID string) (int64, error) {
@@ -66,12 +90,17 @@ func reconcileTx(ctx context.Context, db Beginner, start time.Time, orgID string
 	if _, err := tx.Exec(ctx, spendLockSQL); err != nil {
 		return 0, err
 	}
-	tag, err := tx.Exec(ctx, reconcileSQL, start, start.AddDate(0, 1, 0), start.Format("2006-01-02"), orgID)
-	if err != nil {
-		return 0, err
+	args := []any{start, start.AddDate(0, 1, 0), start.Format("2006-01-02"), orgID}
+	var n int64
+	for _, q := range []string{reconcileSQL, reconcileTokensSQL} {
+		tag, err := tx.Exec(ctx, q, args...)
+		if err != nil {
+			return 0, err
+		}
+		n += tag.RowsAffected()
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	return n, nil
 }

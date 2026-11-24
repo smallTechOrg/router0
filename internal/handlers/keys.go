@@ -444,8 +444,28 @@ func (h *KeysHandler) addUsage(kj *keyJSON, k *keys.ProviderKey, u *keys.Usage) 
 	kj.Balance = bj
 }
 
-// maxBudgetUSD is the largest value provider_keys.monthly_budget_usd (NUMERIC(12,4)) holds.
+// maxBudgetUSD is the largest value a NUMERIC(12,4) budget column holds.
 const maxBudgetUSD = 99999999.9999
+
+// parseBudget validates a monthly_budget_usd JSON value: null (nil budget), 0,
+// or 0.0001..99999999.9999, rounded to the column's 4 decimals. A non-empty
+// msg is the 422 message.
+func parseBudget(v json.RawMessage) (budget *float64, msg string) {
+	if string(v) == "null" {
+		return nil, ""
+	}
+	var b float64
+	if err := json.Unmarshal(v, &b); err != nil || b < 0 || b > maxBudgetUSD {
+		return nil, "monthly_budget_usd must be a number from 0 to 99999999.9999, or null"
+	}
+	// Store what the column keeps, and refuse a positive amount that would
+	// silently round to a $0 budget.
+	rounded := math.Round(b*1e4) / 1e4
+	if b > 0 && rounded == 0 {
+		return nil, "monthly_budget_usd must be 0 or at least 0.0001"
+	}
+	return &rounded, ""
+}
 
 // UpdateKey serves PATCH /api/keys/{id}: {"label": "...", "monthly_budget_usd": 50 | null}.
 func (h *KeysHandler) UpdateKey(w http.ResponseWriter, r *http.Request) {
@@ -473,24 +493,12 @@ func (h *KeysHandler) UpdateKey(w http.ResponseWriter, r *http.Request) {
 			u.Label = &label
 		case "monthly_budget_usd":
 			u.SetBudget = true
-			if string(v) == "null" {
-				continue
-			}
-			var b float64
-			if err := json.Unmarshal(v, &b); err != nil || b < 0 || b > maxBudgetUSD {
-				writeError(w, http.StatusUnprocessableEntity, "validation_error", "invalid_budget",
-					"monthly_budget_usd must be a number from 0 to 99999999.9999, or null")
+			b, msg := parseBudget(v)
+			if msg != "" {
+				writeError(w, http.StatusUnprocessableEntity, "validation_error", "invalid_budget", msg)
 				return
 			}
-			// The column is NUMERIC(12,4): store what will be kept, and refuse a
-			// positive amount that would silently round to a $0 budget.
-			rounded := math.Round(b*1e4) / 1e4
-			if b > 0 && rounded == 0 {
-				writeError(w, http.StatusUnprocessableEntity, "validation_error", "invalid_budget",
-					"monthly_budget_usd must be 0 or at least 0.0001")
-				return
-			}
-			u.Budget = &rounded
+			u.Budget = b
 		default:
 			writeError(w, http.StatusUnprocessableEntity, "validation_error", "unknown_field", "Unknown field: "+field)
 			return

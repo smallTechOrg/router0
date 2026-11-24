@@ -85,7 +85,8 @@ func Build(d Deps) *App {
 	legacyDiscovery := models.NewDiscoveryJob(pool)
 
 	authHandler := handlers.NewAuthHandler(pool, d.JWTSecret)
-	tokensHandler := handlers.NewTokensHandler(tokenRepo)
+	tokenBudgets := tokens.NewBudgetGuard(pool, 0)
+	tokensHandler := handlers.NewTokensHandler(tokenRepo).WithBudgetGuard(tokenBudgets)
 	adminHandler := handlers.NewAdminHandler(pool, modelRegistry, legacyDiscovery)
 	keysHandler := handlers.NewKeysHandler(pool, handlers.KeysDeps{
 		ValidProviders:   providers.ValidProviders,
@@ -111,7 +112,7 @@ func Build(d Deps) *App {
 
 	// Each spend write evicts the key's cached state so a reached budget blocks
 	// the very next request.
-	recorder := metadata.NewRecorder(pool, metadata.Options{OnSpend: keyStates.SpendChanged})
+	recorder := metadata.NewRecorder(pool, metadata.Options{OnSpend: keyStates.SpendChanged, OnTokenSpend: tokenBudgets.Evict})
 	execCfg := d.ExecutorConfig
 	execCfg.States = keyStates
 	execCfg.Auth = keyRepo
@@ -123,6 +124,7 @@ func Build(d Deps) *App {
 	inf.Executor = routing.NewExecutor(execCfg)
 	inf.Recorder = recorder
 	inf.Pricing = catalogRepo
+	inf.TokenBudgets = tokenBudgets
 	inferenceHandler := handlers.NewInferenceHandler(inf)
 
 	jwt := auth.JWTMiddleware(d.JWTSecret, orgRepo)
@@ -161,6 +163,7 @@ func Build(d Deps) *App {
 		r.Get("/api/tokens", tokensHandler.List)
 		r.With(orgWrite).Post("/api/tokens", tokensHandler.Create)
 		r.With(orgWrite).Delete("/api/tokens/{id}", tokensHandler.Revoke)
+		r.With(orgWrite).Patch("/api/tokens/{id}", tokensHandler.Update)
 
 		r.Get("/api/providers", priorityHandler.ListProviders)
 		r.Get("/api/keys", keysHandler.ListKeys)
