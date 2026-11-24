@@ -76,6 +76,7 @@ type PGStore struct {
 	cache *cache.TTL[string, keyEntry]
 	gen   atomic.Uint64 // bumped by every write; fetches that raced a write are not cached
 	log   *slog.Logger
+	spend spendCache
 }
 
 var _ Store = (*PGStore)(nil)
@@ -175,10 +176,7 @@ func (s *PGStore) CheckMany(ctx context.Context, pairs []KeyModel) (map[KeyModel
 // unless a write happened meanwhile.
 func (s *PGStore) fetch(ctx context.Context, keyIDs []string) (map[string]keyEntry, error) {
 	g := s.gen.Load()
-	rows, err := s.db.Query(ctx,
-		`SELECT provider_key_id::text, kind, scope_model, until_at
-		   FROM provider_key_state
-		  WHERE provider_key_id = ANY($1::uuid[]) AND until_at > NOW()`, keyIDs)
+	rows, err := s.db.Query(ctx, fetchSQL, keyIDs)
 	if err != nil {
 		return nil, err
 	}

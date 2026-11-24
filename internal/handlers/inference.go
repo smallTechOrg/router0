@@ -51,6 +51,14 @@ type InferenceConfig struct {
 	FirstByteTimeout time.Duration
 	// Decrypt turns a stored key into plaintext; nil uses keys.Decrypt.
 	Decrypt func(*keys.ProviderKey) (string, error)
+	// Pricing is the catalog price fallback for cost estimates (catalog.Repository);
+	// optional. Used when the provider reports no cost and the static table has none.
+	Pricing Pricer
+}
+
+// Pricer returns USD-per-million-token prices for an org's provider model.
+type Pricer interface {
+	Pricing(ctx context.Context, orgID, provider, providerModelID string) (in, out float64, ok bool)
 }
 
 // InferenceHandler serves POST /v1/chat/completions.
@@ -63,6 +71,7 @@ type InferenceHandler struct {
 	recorder *metadata.Recorder
 	firstB   time.Duration
 	decrypt  func(*keys.ProviderKey) (string, error)
+	pricing  Pricer
 }
 
 // NewInferenceHandler wires the handler. The executor's per-attempt timeout
@@ -83,7 +92,7 @@ func NewInferenceHandler(cfg InferenceConfig) *InferenceHandler {
 	return &InferenceHandler{
 		resolver: cfg.Resolver, priority: cfg.Priority, keys: cfg.Keys,
 		exec: cfg.Executor, streamEx: cfg.Executor.WithAttemptTimeout(0),
-		recorder: cfg.Recorder, firstB: fb, decrypt: dec,
+		recorder: cfg.Recorder, firstB: fb, decrypt: dec, pricing: cfg.Pricing,
 	}
 }
 
@@ -477,7 +486,7 @@ func (h *InferenceHandler) serveBlocking(w http.ResponseWriter, r *http.Request,
 	})
 	cost := resp.Cost
 	if cost <= 0 {
-		cost = metadata.EstimateCost(res.Winner.Provider, res.Winner.ProviderModelID, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+		cost = h.estimateCost(rs.orgID, res.Winner.Provider, res.Winner.ProviderModelID, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 	}
 	h.finish(rs, outcome{
 		provider: res.Winner.Provider, providerModel: res.Winner.ProviderModelID, keyID: res.Winner.KeyID, keyLabel: res.Winner.KeyLabel,
@@ -637,7 +646,7 @@ loop:
 	}
 	if usage != nil {
 		o.in, o.out = usage.PromptTokens, usage.CompletionTokens
-		o.cost = metadata.EstimateCost(win.Provider, win.ProviderModelID, o.in, o.out)
+		o.cost = h.estimateCost(rs.orgID, win.Provider, win.ProviderModelID, o.in, o.out)
 	}
 	h.finish(rs, o)
 }
@@ -652,4 +661,20 @@ func mustJSON(v any) []byte {
 		return []byte(`{}`)
 	}
 	return b
+}
+
+// estimateCost prices a request from router0's static table, falling back to
+// the org catalog's per-model prices (e.g. from the provider's model listing).
+// Budgets are built on these estimates.
+func (h *InferenceHandler) estimateCost(orgID, provider, model string, in, out int) float64 {
+	if c := metadata.EstimateCost(provider, model, in, out); c > 0 || h.pricing == nil {
+		return c
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	pin, pout, ok := h.pricing.Pricing(ctx, orgID, provider, model)
+	if !ok {
+		return 0
+	}
+	return (float64(in)*pin + float64(out)*pout) / 1e6
 }

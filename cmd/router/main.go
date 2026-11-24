@@ -17,6 +17,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/zer0-router/zer0/internal/db"
+	"github.com/zer0-router/zer0/internal/metadata"
 	"github.com/zer0-router/zer0/internal/orgs"
 	"github.com/zer0-router/zer0/internal/providers"
 	"github.com/zer0-router/zer0/internal/server"
@@ -74,7 +75,10 @@ func main() {
 	// Background jobs: catalog refresh (startup pass for never-refreshed pairs,
 	// then periodic) and hourly sweep of expired key-state rows.
 	app.Scheduler.Start(ctx)
+	// OpenRouter balance polling: once now, then every ROUTER0_BALANCE_POLL_SECONDS (600).
+	app.Balance.Start(ctx)
 	go func() {
+		reconcileSpend(ctx, pool) // on startup, then hourly
 		t := time.NewTicker(time.Hour)
 		defer t.Stop()
 		for {
@@ -87,6 +91,7 @@ func main() {
 				} else if n > 0 {
 					slog.Info("keystate: swept expired rows", "count", n)
 				}
+				reconcileSpend(ctx, pool)
 			}
 		}
 	}()
@@ -207,5 +212,14 @@ func ensureAdminOrgs(ctx context.Context, pool *pgxpool.Pool) {
 			continue
 		}
 		slog.Info("admin bootstrap: org created", "email", a.email)
+	}
+}
+
+// reconcileSpend rebuilds this month's per-key spend counters from the request log.
+func reconcileSpend(ctx context.Context, pool *pgxpool.Pool) {
+	if n, err := metadata.Reconcile(ctx, pool, time.Now(), ""); err != nil {
+		slog.Warn("spend: reconcile failed", "error", err)
+	} else if n > 0 {
+		slog.Info("spend: reconciled key counters", "count", n)
 	}
 }

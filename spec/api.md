@@ -192,6 +192,12 @@ Body `{"label":"…","monthly_budget_usd":50}` (`null` clears budget).
 
 Deletes the key's `provider_key_state` rows (cooldown/credits/budget) and evicts the key-state cache. 204.
 
+### `POST /api/keys/poll-balances` (owner/admin) — Phase 3
+
+Polls the balances of the org's active OpenRouter keys now (same code as the background poll). 200 `{"polled": n}`.
+
+`GET /api/keys` entries gain (Phase 3) `monthly_budget_usd` (number|null), `month_spend_usd` (estimated, current UTC month) and `balance` `{supported, status: ok|exhausted|error|unsupported|pending, remaining_usd, limit_usd, usage_usd, polled_at}`. A key over its budget reports `state.reason = "budget_exhausted"`. `PATCH` validation: `monthly_budget_usd` is 0, at least 0.0001, or null (422 `invalid_budget`); unknown fields are 422 `unknown_field`.
+
 ---
 
 ## Routing Priority — Phase 1

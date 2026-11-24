@@ -260,3 +260,16 @@ func (r *Repository) HasOtherKind(ctx context.Context, orgID, canonical, kind st
 		orgID, canonical, kind).Scan(&ok)
 	return ok, err
 }
+
+// Pricing returns the catalog USD-per-million-token prices of an org's provider
+// model. ok is false when the model has no stored price (both prices 0/NULL).
+func (r *Repository) Pricing(ctx context.Context, orgID, provider, providerModelID string) (in, out float64, ok bool) {
+	err := r.pool.QueryRow(ctx,
+		`SELECT COALESCE(MAX(input_cost_per_mtok), 0)::float8, COALESCE(MAX(output_cost_per_mtok), 0)::float8
+		   FROM org_model_catalog WHERE org_id = $1 AND provider = $2 AND provider_model_id = $3`,
+		orgID, provider, providerModelID).Scan(&in, &out)
+	if err != nil || (in <= 0 && out <= 0) {
+		return 0, 0, false
+	}
+	return in, out, true
+}

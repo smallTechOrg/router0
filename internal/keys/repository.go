@@ -26,8 +26,10 @@ type ProviderKey struct {
 	Position       int    // 0 = first within (org, provider)
 	LastTestedAt   *time.Time
 	LastTestResult string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// MonthlyBudgetUSD is the optional per-key month budget (nil = no budget).
+	MonthlyBudgetUSD *float64
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 var (
@@ -40,12 +42,13 @@ var (
 )
 
 const keyCols = `id, org_id, user_id, provider, label, key_hint, ciphertext, nonce,
-	COALESCE(model_id,''), status, position, last_tested_at, COALESCE(last_test_result,''), created_at, updated_at`
+	COALESCE(model_id,''), status, position, last_tested_at, COALESCE(last_test_result,''),
+	monthly_budget_usd::float8, created_at, updated_at`
 
 func scanKey(row pgx.Row) (*ProviderKey, error) {
 	k := &ProviderKey{}
 	err := row.Scan(&k.ID, &k.OrgID, &k.UserID, &k.Provider, &k.Label, &k.KeyHint, &k.Ciphertext, &k.Nonce,
-		&k.ModelID, &k.Status, &k.Position, &k.LastTestedAt, &k.LastTestResult, &k.CreatedAt, &k.UpdatedAt)
+		&k.ModelID, &k.Status, &k.Position, &k.LastTestedAt, &k.LastTestResult, &k.MonthlyBudgetUSD, &k.CreatedAt, &k.UpdatedAt)
 	return k, err
 }
 
@@ -194,6 +197,32 @@ func (r *Repository) Disable(ctx context.Context, id, orgID string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// KeyUpdate is a partial update of a key (PATCH /api/keys/{id}). Nil fields
+// are left unchanged; SetBudget with a nil Budget clears the budget.
+type KeyUpdate struct {
+	Label     *string
+	SetBudget bool
+	Budget    *float64
+}
+
+// Update applies a partial update and returns the updated key.
+func (r *Repository) Update(ctx context.Context, id, orgID string, u KeyUpdate) (*ProviderKey, error) {
+	k, err := scanKey(r.pool.QueryRow(ctx,
+		`UPDATE provider_keys SET
+		   label = COALESCE($3, label),
+		   monthly_budget_usd = CASE WHEN $4 THEN $5::numeric ELSE monthly_budget_usd END,
+		   updated_at = NOW()
+		 WHERE id=$1 AND org_id=$2 AND status<>'disabled'
+		 RETURNING `+keyCols, id, orgID, u.Label, u.SetBudget, u.Budget))
+	switch {
+	case errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err):
+		return nil, ErrNotFound
+	case isUnique(err):
+		return nil, ErrDuplicateLabel
+	}
+	return k, err
 }
 
 // MarkAuthError takes a key out of plans after an auth failure (status='error').

@@ -3,6 +3,7 @@ package keystate
 import (
 	"context"
 	"fmt"
+	"github.com/zer0-router/zer0/internal/testutil/testdb"
 	"os"
 	"sync"
 	"testing"
@@ -55,6 +56,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	if err := pool.Ping(ctx); err != nil {
 		t.Skipf("cannot ping: %v", err)
 	}
+	testdb.Migrate(t, dsn)
 	var reg *string
 	if err := pool.QueryRow(ctx, `SELECT to_regclass('provider_key_state')::text`).Scan(&reg); err != nil || reg == nil {
 		t.Skip("table provider_key_state missing (migration 000019 not applied)")

@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/zer0-router/zer0/internal/auth"
+	"github.com/zer0-router/zer0/internal/balance"
 	"github.com/zer0-router/zer0/internal/catalog"
 	"github.com/zer0-router/zer0/internal/handlers"
 	"github.com/zer0-router/zer0/internal/keys"
@@ -42,6 +43,8 @@ type Deps struct {
 	ExecutorConfig routing.Config
 	// Inference tunes the inference handler (FirstByteTimeout, Decrypt). Wiring fields are set by Build.
 	Inference handlers.InferenceConfig
+	// Balance tunes the balance poller (interval, fetcher). Its loop is started by main, not Build.
+	Balance balance.Options
 }
 
 // App is a built gateway: the HTTP handler plus the components main needs for
@@ -53,6 +56,7 @@ type App struct {
 	Catalog   *catalog.Repository
 	Discovery *catalog.Discovery
 	Scheduler *catalog.Scheduler
+	Balance   *balance.Poller
 }
 
 // Close flushes the request-log recorder.
@@ -75,6 +79,7 @@ func Build(d Deps) *App {
 	discovery := catalog.NewDiscovery(catalogRepo, catalog.NewKeySource(keyRepo))
 	resolver := catalog.NewResolver(catalogRepo, discovery)
 	keyStates := keystate.New(pool, d.KeyStateOptions)
+	poller := balance.New(pool, keyStates, d.Balance)
 
 	modelRegistry := models.NewRegistry(pool)
 	legacyDiscovery := models.NewDiscoveryJob(pool)
@@ -83,8 +88,11 @@ func Build(d Deps) *App {
 	tokensHandler := handlers.NewTokensHandler(tokenRepo)
 	adminHandler := handlers.NewAdminHandler(pool, modelRegistry, legacyDiscovery)
 	keysHandler := handlers.NewKeysHandler(pool, handlers.KeysDeps{
-		ValidProviders: providers.ValidProviders,
-		Discoverer:     discovery,
+		ValidProviders:   providers.ValidProviders,
+		Discoverer:       discovery,
+		KeyState:         keyStates,
+		Balances:         poller,
+		BalanceSupported: balance.Supported,
 	})
 	priorityHandler := handlers.NewPriorityHandler(keysHandler.Priority(), providers.ValidProviders)
 	v1Catalog := handlers.NewCatalogHandler(catalogRepo, discovery, func(r *http.Request) string {
@@ -101,7 +109,9 @@ func Build(d Deps) *App {
 	})
 	requestLog := handlers.NewRequestLogHandler(pool)
 
-	recorder := metadata.NewRecorder(pool)
+	// Each spend write evicts the key's cached state so a reached budget blocks
+	// the very next request.
+	recorder := metadata.NewRecorder(pool, metadata.Options{OnSpend: keyStates.SpendChanged})
 	execCfg := d.ExecutorConfig
 	execCfg.States = keyStates
 	execCfg.Auth = keyRepo
@@ -112,6 +122,7 @@ func Build(d Deps) *App {
 	inf.Keys = keyRepo
 	inf.Executor = routing.NewExecutor(execCfg)
 	inf.Recorder = recorder
+	inf.Pricing = catalogRepo
 	inferenceHandler := handlers.NewInferenceHandler(inf)
 
 	jwt := auth.JWTMiddleware(d.JWTSecret, orgRepo)
@@ -156,6 +167,9 @@ func Build(d Deps) *App {
 		r.With(orgWrite).Post("/api/keys", keysHandler.AddKey)
 		r.With(orgWrite).Delete("/api/keys/{id}", keysHandler.DeleteKey)
 		r.With(orgWrite).Post("/api/keys/{id}/test", keysHandler.TestKey)
+		r.With(orgWrite).Patch("/api/keys/{id}", keysHandler.UpdateKey)
+		r.With(orgWrite).Post("/api/keys/{id}/reset-state", keysHandler.ResetKeyState)
+		r.With(orgWrite).Post("/api/keys/poll-balances", keysHandler.PollBalances)
 
 		r.Get("/api/routing/priority", priorityHandler.GetPriority)
 		r.With(orgWrite).Put("/api/routing/priority", priorityHandler.PutPriority)
@@ -193,6 +207,7 @@ func Build(d Deps) *App {
 		Catalog:   catalogRepo,
 		Discovery: discovery,
 		Scheduler: catalog.NewScheduler(catalogRepo, discovery, catalog.IntervalFromEnv()),
+		Balance:   poller,
 	}
 }
 

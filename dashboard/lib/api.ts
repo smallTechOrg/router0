@@ -123,6 +123,21 @@ export interface ProviderKey {
   last_test_result: string | null;
   state?: KeyState | null;
   created_at: string;
+  /** Monthly USD budget; null = no budget. */
+  monthly_budget_usd?: number | null;
+  /** Estimated spend this UTC month (USD); null if unavailable. */
+  month_spend_usd?: number | null;
+  balance?: KeyBalance | null;
+}
+
+export interface KeyBalance {
+  /** Whether router0 can poll this provider's balance (OpenRouter only). */
+  supported: boolean;
+  status: 'ok' | 'exhausted' | 'error' | 'unsupported' | 'pending' | string;
+  remaining_usd: number | null;
+  limit_usd: number | null;
+  usage_usd: number | null;
+  polled_at: string | null;
 }
 
 export interface TestKeyResult {
@@ -267,6 +282,12 @@ export const deleteKey = (token: string, id: string) =>
   request<void>(`/api/keys/${encodeURIComponent(id)}`, { method: 'DELETE', token });
 export const testKey = (token: string, id: string) =>
   request<TestKeyResult>(`/api/keys/${encodeURIComponent(id)}/test`, { method: 'POST', token });
+export const updateKey = (token: string, id: string, body: { label?: string; monthly_budget_usd?: number | null }) =>
+  request<ProviderKey>(`/api/keys/${encodeURIComponent(id)}`, { method: 'PATCH', token, body });
+export const resetKeyState = (token: string, id: string) =>
+  request<void>(`/api/keys/${encodeURIComponent(id)}/reset-state`, { method: 'POST', token });
+export const pollBalances = (token: string) =>
+  request<{ polled: number }>('/api/keys/poll-balances', { method: 'POST', token });
 
 // ---------- Routing priority ----------
 

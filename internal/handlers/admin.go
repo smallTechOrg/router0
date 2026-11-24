@@ -259,7 +259,7 @@ func (h *AdminHandler) ListModels(w http.ResponseWriter, r *http.Request) {
 		AvgLatencyMs      *int     `json:"avg_latency_ms"`
 		ErrorRate         *float64 `json:"error_rate"`
 		ProbeStatus       string   `json:"probe_status"`
-		// Historical stats from model_perf_stats
+		// Historical stats (always null since model_perf_stats was dropped in 000022)
 		TotalRequests  *int64          `json:"total_requests"`
 		TotalErrors    *int64          `json:"total_errors"`
 		P50LatencyMs   *int            `json:"p50_latency_ms"`
@@ -317,9 +317,11 @@ func (h *AdminHandler) ListModels(w http.ResponseWriter, r *http.Request) {
 			pm.input_cost_per_mtok, pm.output_cost_per_mtok,
 			pm.parameter_count_b, pm.architecture,
 			pm.score, pm.avg_latency_ms, pm.error_rate, pm.probe_status,
-			mps.total_requests, mps.total_errors,
-			mps.p50_latency_ms, mps.p95_latency_ms, mps.p99_latency_ms,
-			mps.min_latency_ms, mps.max_latency_ms,
+			-- Historical per-model stats came from model_perf_stats, dropped in
+			-- migration 000022; the fields are kept in the response as null.
+			NULL::bigint, NULL::bigint,
+			NULL::int, NULL::int, NULL::int,
+			NULL::int, NULL::int,
 			COALESCE(
 				json_agg(json_build_object(
 					'plan', el.plan,
@@ -334,14 +336,10 @@ func (h *AdminHandler) ListModels(w http.ResponseWriter, r *http.Request) {
 		FROM provider_models pm
 		LEFT JOIN effective_limits el
 			ON el.provider = pm.provider AND (el.model_id = pm.model_id OR el.model_id = '')
-		LEFT JOIN model_perf_stats mps
-			ON mps.provider = pm.provider AND mps.model_id = pm.model_id
 		`+whereClause+`
 		GROUP BY pm.provider, pm.model_id, pm.display_name, pm.context_window, pm.max_output_tokens,
 			pm.input_cost_per_mtok, pm.output_cost_per_mtok, pm.parameter_count_b, pm.architecture,
-			pm.score, pm.avg_latency_ms, pm.error_rate, pm.probe_status,
-			mps.total_requests, mps.total_errors, mps.p50_latency_ms, mps.p95_latency_ms, mps.p99_latency_ms,
-			mps.min_latency_ms, mps.max_latency_ms
+			pm.score, pm.avg_latency_ms, pm.error_rate, pm.probe_status
 		ORDER BY pm.provider, pm.model_id`, args...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "db_error", "Failed to list models")
