@@ -143,6 +143,10 @@ func Build(d Deps) *App {
 	// Cloud Run's front end reserves /healthz on *.run.app and answers it with its own
 	// 404 page, so the same handler is also served at /health for platform smoke tests.
 	r.Get("/health", healthz(pool))
+	// The API root answers like /health too: uptime pingers (the staging cron
+	// pinger) hit https://api.router0.smalltech.in/ and should get a real
+	// health check rather than a 404.
+	r.Get("/", healthz(pool))
 	r.Get("/metrics", promhttp.Handler().ServeHTTP)
 
 	// Auth (humans)
