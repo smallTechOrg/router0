@@ -1,12 +1,15 @@
 import clsx from 'clsx';
 
+/** Share of a monthly budget at which a key is flagged "near budget". */
+export const BUDGET_WARN_RATIO = 0.8;
+
 export const usd = (v: number) => (v >= 1 ? `$${v.toFixed(2)}` : v >= 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(6)}`);
 
 /** Month-to-date estimated spend, with a bar against the budget when one is set. */
 export default function SpendBar({ spend, budget, className }: { spend: number; budget?: number | null; className?: string }) {
   const hasBudget = typeof budget === 'number';
   const pct = typeof budget === 'number' ? (budget > 0 ? Math.min(100, (spend / budget) * 100) : 100) : 0;
-  const color = pct >= 100 ? 'bg-red-500' : pct >= 80 ? 'bg-amber-500' : 'bg-emerald-500';
+  const color = pct >= 100 ? 'bg-red-500' : pct >= BUDGET_WARN_RATIO * 100 ? 'bg-amber-500' : 'bg-emerald-500';
   return (
     <div className={clsx('min-w-[10rem]', className)}>
       <p className="text-xs text-neutral-400">

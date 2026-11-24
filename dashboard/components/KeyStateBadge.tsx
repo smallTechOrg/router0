@@ -1,11 +1,16 @@
 import clsx from 'clsx';
 import type { ProviderKey } from '@/lib/api';
+import { BUDGET_WARN_RATIO } from '@/components/SpendBar';
 
 const base = 'inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset';
 
 /** Badge for a provider key: ok / rate-limited until / out of credits / budget reached / auth error. */
-export default function KeyStateBadge({ keyInfo }: { keyInfo: Pick<ProviderKey, 'status' | 'state'> }) {
+export default function KeyStateBadge({ keyInfo }: {
+  keyInfo: Pick<ProviderKey, 'status' | 'state'> & Partial<Pick<ProviderKey, 'monthly_budget_usd' | 'month_spend_usd'>>;
+}) {
   const { status, state } = keyInfo;
+  const budget = keyInfo.monthly_budget_usd;
+  const nearBudget = typeof budget === 'number' && budget > 0 && (keyInfo.month_spend_usd ?? 0) >= budget * BUDGET_WARN_RATIO;
   if (status === 'disabled') {
     return <span className={clsx(base, 'bg-neutral-700/30 text-neutral-400 ring-neutral-600/30')}>disabled</span>;
   }
@@ -32,6 +37,9 @@ export default function KeyStateBadge({ keyInfo }: { keyInfo: Pick<ProviderKey, 
       return <span className={clsx(base, 'bg-red-500/15 text-red-400 ring-red-500/20')}>out of credits</span>;
     }
     return <span className={clsx(base, 'bg-neutral-500/15 text-neutral-300 ring-neutral-500/20')}>cooling down</span>;
+  }
+  if (nearBudget) {
+    return <span className={clsx(base, 'bg-amber-500/15 text-amber-400 ring-amber-500/20')}>near budget</span>;
   }
   return <span className={clsx(base, 'bg-emerald-500/15 text-emerald-400 ring-emerald-500/20')}>ok</span>;
 }

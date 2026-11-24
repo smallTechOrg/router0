@@ -3,6 +3,7 @@ import Link from 'next/link';
 import { useAuth, useLoader } from '@/lib/hooks';
 import { listKeys, listRequests, listTokens } from '@/lib/api';
 import { useApiBase } from '@/lib/useApiBase';
+import KeyAlerts from '@/components/KeyAlerts';
 import { Card, CopyButton, ErrorBanner, Loading, PageHeader } from '@/components/ui';
 
 const snippetFor = (base: string) => `curl ${base}/chat/completions \\
@@ -45,6 +46,8 @@ export default function OverviewPage() {
           </Link>
         </div>
       )}
+
+      {keys.data && <KeyAlerts keys={keys.data.keys} />}
 
       {loading ? (
         <Loading />
