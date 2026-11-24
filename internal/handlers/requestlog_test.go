@@ -171,7 +171,28 @@ func TestRequestLog_IsolationFiltersCursorTrail(t *testing.T) {
 	if err != nil || len(rows) != 2 || total < 2.99 || total > 3.01 {
 		t.Fatalf("costs: %v rows=%+v total=%v", err, rows, total)
 	}
+	orgRows := rows
 	if rows, _, _ = costs(ctx, db, uuid.NewString()); len(rows) != 0 {
 		t.Fatal("unknown org has costs")
+	}
+	byToken, err := costsByToken(ctx, db, a.id)
+	if err != nil || len(byToken) == 0 {
+		t.Fatalf("costsByToken: %v %+v", err, byToken)
+	}
+	var tokTotal float64
+	var reqs int64
+	for _, c := range byToken {
+		tokTotal += c.EstimatedCostUSD
+		reqs += c.RequestCount
+	}
+	var rowReqs int64
+	for _, c := range orgRows {
+		rowReqs += c.RequestCount
+	}
+	if tokTotal < total-0.001 || tokTotal > total+0.001 || reqs != rowReqs {
+		t.Fatalf("by_token does not add up: cost %v vs %v, requests %d vs %d", tokTotal, total, reqs, rowReqs)
+	}
+	if other, _ := costsByToken(ctx, db, uuid.NewString()); len(other) != 0 {
+		t.Fatal("unknown org has token costs")
 	}
 }
