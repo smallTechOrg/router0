@@ -273,7 +273,7 @@ Query: `limit` (default 50, max 200), `before` (RFC3339 cursor on `created_at`),
 
 ### `GET /api/requests/{request_id}` — same object for one request; 404 for another org's request.
 
-### `GET /api/costs` — existing endpoint, now grouped by org (provider, canonical model, key label) over the last 30 days.
+### `GET /api/costs` — existing endpoint, now grouped by org (provider, canonical model, key label) over the last 30 days. It also returns `by_token`: one row per service token (`token_id`, `token_name`, `revoked`, `request_count`, `error_count`, `estimated_cost_usd`), most expensive first.
 
 `GET /api/pool` and `GET /api/attempts` are removed in Phase 1 (the trail is embedded in `/api/requests`).
 

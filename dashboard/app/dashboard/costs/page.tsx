@@ -28,10 +28,11 @@ export default function CostsPage() {
   const rows = extractRows(data);
   const total = rows.reduce((s, r) => s + num(r.estimated_cost_usd), 0);
   const requests = rows.reduce((s, r) => s + num(r.request_count ?? r.requests), 0);
+  const byToken: Row[] = Array.isArray(data?.by_token) ? (data!.by_token as Row[]) : [];
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Costs" subtitle="Estimated spend over the last 30 days, grouped by provider, model and key." />
+      <PageHeader title="Costs" subtitle="Estimated spend: this month per key, and the last 30 days by service token and by provider, model and key." />
       <ErrorBanner message={error} onRetry={() => reload()} />
       {loading && !data ? <Card><Loading /></Card> : (
         <>
@@ -56,6 +57,50 @@ export default function CostsPage() {
                   </li>
                 ))}
               </ul>
+            )}
+          </Card>
+          <Card title="By service token (last 30 days)">
+            {byToken.length === 0 ? (
+              <EmptyState title="No requests in the last 30 days" />
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <caption className="sr-only">Costs by service token</caption>
+                  <thead>
+                    <tr className="border-b border-neutral-800">
+                      {['Token', 'Requests', 'Errors', 'Est. cost', 'Share'].map((h) => <th key={h} scope="col" className={thCls}>{h}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {byToken.map((r, i) => {
+                      const cost = num(r.estimated_cost_usd);
+                      const share = total > 0 ? (cost / total) * 100 : 0;
+                      return (
+                        <tr key={r.token_id ?? `none-${i}`} className="border-b border-neutral-800/50">
+                          <td className={tdCls}>
+                            <span className="font-medium text-neutral-100">{r.token_name ?? 'deleted token'}</span>
+                            {r.revoked && <span className="ml-2 text-xs text-neutral-500">(revoked)</span>}
+                          </td>
+                          <td className={tdCls}>{num(r.request_count).toLocaleString()}</td>
+                          <td className={tdCls}>
+                            {num(r.error_count).toLocaleString()}
+                            {num(r.request_count) > 0 && <span className="ml-1 text-xs text-neutral-500">({((num(r.error_count) / num(r.request_count)) * 100).toFixed(1)}%)</span>}
+                          </td>
+                          <td className={`${tdCls} font-mono`}>${cost.toFixed(6)}</td>
+                          <td className={tdCls}>
+                            <div className="flex items-center gap-2">
+                              <div className="h-1.5 w-24 overflow-hidden rounded-full bg-neutral-800" aria-hidden="true">
+                                <div className="h-full rounded-full bg-indigo-500" style={{ width: `${share}%` }} />
+                              </div>
+                              <span className="text-xs text-neutral-400">{share.toFixed(0)}%</span>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             )}
           </Card>
           <Card title="Last 30 days">

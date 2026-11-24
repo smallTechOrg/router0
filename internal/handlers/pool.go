@@ -351,6 +351,44 @@ func costs(ctx context.Context, db pgQuerier, orgID string) ([]costRow, float64,
 	return out, total, rows.Err()
 }
 
+// tokenCostRow is one service token's last-30-days usage (GET /api/costs by_token).
+// Requests without a token (none in practice) and revoked tokens are included.
+type tokenCostRow struct {
+	TokenID          *string `json:"token_id"`
+	TokenName        *string `json:"token_name"`
+	Revoked          bool    `json:"revoked"`
+	RequestCount     int64   `json:"request_count"`
+	ErrorCount       int64   `json:"error_count"`
+	EstimatedCostUSD float64 `json:"estimated_cost_usd"`
+}
+
+func costsByToken(ctx context.Context, db pgQuerier, orgID string) ([]tokenCostRow, error) {
+	rows, err := db.Query(ctx, `
+		SELECT rm.service_token_id::text, t.name, t.revoked_at IS NOT NULL,
+		       COUNT(*), COUNT(*) FILTER (WHERE rm.status = 'error'),
+		       COALESCE(SUM(rm.estimated_cost_usd),0)::float8
+		FROM request_metadata rm
+		LEFT JOIN service_tokens t ON t.id = rm.service_token_id
+		WHERE rm.org_id = $1 AND rm.created_at >= NOW() - INTERVAL '30 days'
+		GROUP BY rm.service_token_id, t.name, t.revoked_at
+		ORDER BY 6 DESC, 4 DESC, 2`, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []tokenCostRow{}
+	for rows.Next() {
+		var c tokenCostRow
+		var revoked *bool
+		if err := rows.Scan(&c.TokenID, &c.TokenName, &revoked, &c.RequestCount, &c.ErrorCount, &c.EstimatedCostUSD); err != nil {
+			return nil, err
+		}
+		c.Revoked = revoked != nil && *revoked && c.TokenID != nil
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func (h *RequestLogHandler) GetCosts(w http.ResponseWriter, r *http.Request) {
 	orgID := auth.OrgIDFromCtx(r.Context())
 	if orgID == "" {
@@ -362,9 +400,15 @@ func (h *RequestLogHandler) GetCosts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "server_error", "db_error", "Failed to fetch costs")
 		return
 	}
+	byToken, err := costsByToken(r.Context(), h.db, orgID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "db_error", "Failed to fetch costs")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"window_days":              30,
 		"costs":                    rows,
+		"by_token":                 byToken,
 		"total_estimated_cost_usd": total,
 	})
 }
