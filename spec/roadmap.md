@@ -270,6 +270,17 @@ Optional smoke: `TestSmokeOpenRouterBalance` (needs `TEST_OPENROUTER_KEY`): the 
 - **Dashboard:** Tokens page "This month" column (spend bar, budget editor) and a "budget reached" status.
 - **Tests:** `internal/integration/phase4_test.go` (`TestPhase4_TokenBudget`, `TestPhase4_TokenBudgetZeroAndRevoked`, `TestPhase4_TokenSpendReconcile`); CI runs every `TestPhase*` suite.
 
+## Phase 5: Service-token model allowlists
+
+**Goal:** restrict what a service token may call (for example, only cheap models for a batch job), independently of the org's catalog.
+
+- **Data:** migration `000024_token_model_allowlist` adds `service_tokens.allowed_models TEXT[]` (NULL = every model).
+- **Semantics:** entries are canonicalised and de-duplicated when saved (`llama-3.3-70b-versatile` is stored as `llama-3.3-70b`, which allows that model on every provider). A request is allowed when its resolved canonical model or the name it was sent as (an alias) is on the list. An allowlisted alias works without allowing the model's own name; an allowlisted model works under every alias that resolves to it.
+- **Enforcement:** after model resolution, a disallowed model is refused with `403 invalid_request_error` / `model_not_allowed` (`param: "model"`), before any provider call. An unknown model is still `404 model_not_found`. `GET /v1/models` lists only what the token may call. The policy is cached with the token budget (`tokens.BudgetGuard`, 2 s, evicted on change).
+- **API:** `PATCH /api/tokens/{id} {"allowed_models": ["llama-3.3-70b", "fast"] | null}` (an empty list is 422: use `null` for every model, or revoke the token); `GET /api/tokens` adds `allowed_models`.
+- **Dashboard:** Tokens page "Models" column with an inline editor.
+- **Tests:** `internal/integration/phase5_test.go`.
+
 ---
 
 ## Self-Review

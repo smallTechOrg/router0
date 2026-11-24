@@ -194,6 +194,8 @@ Deletes the key's `provider_key_state` rows (cooldown/credits/budget) and evicts
 
 ### `PATCH /api/tokens/{id}` (owner/admin) — Phase 4
 
+Phase 5 adds `allowed_models`: an array of up to 200 model or alias names (canonicalised and de-duplicated; empty is 422 `invalid_allowed_models`), or `null` for every model. Either field may be sent alone. A request for a model the token may not use is `403` `invalid_request_error` / `model_not_allowed` with `param: "model"`; `/v1/models` lists only allowed models.
+
 Body `{"monthly_budget_usd": 25}` (`null` clears it; 0 pauses the token; otherwise at least 0.0001). Live tokens of the caller's org only (404 otherwise). 200 with the token as listed by `GET /api/tokens` (never the secret). `GET /api/tokens` entries gain `monthly_budget_usd` and `month_spend_usd` (estimated, current UTC month). Over budget, `/v1/chat/completions` answers `402` with `error.type = "insufficient_credits"`, `error.code = "token_budget_exceeded"` and no attempts, before any provider is called.
 
 ### `POST /api/keys/poll-balances` (owner/admin) — Phase 3

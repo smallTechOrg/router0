@@ -48,6 +48,8 @@ type Token struct {
 	MonthlyBudgetUSD *float64 `json:"monthly_budget_usd"`
 	// MonthSpendUSD is the token's estimated spend this UTC month.
 	MonthSpendUSD float64 `json:"month_spend_usd"`
+	// AllowedModels restricts the models the token may call (nil = all).
+	AllowedModels []string `json:"allowed_models"`
 }
 
 // Record is what the verifier needs from storage.
@@ -115,7 +117,7 @@ func (r *Repository) Create(ctx context.Context, orgID, createdBy, name string) 
 func (r *Repository) List(ctx context.Context, orgID string) ([]Token, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT t.id::text, t.name, t.token_prefix, t.hash_alg, t.created_at, u.email, t.last_used_at, t.revoked_at,
-		        t.monthly_budget_usd::float8, COALESCE(sp.spend_micro_usd, 0)
+		        t.monthly_budget_usd::float8, COALESCE(sp.spend_micro_usd, 0), t.allowed_models
 		   FROM service_tokens t LEFT JOIN users u ON u.id = t.created_by
 		   LEFT JOIN service_token_spend sp
 		     ON sp.service_token_id = t.id AND sp.month = (date_trunc('month', NOW() AT TIME ZONE 'UTC'))::date
@@ -131,7 +133,7 @@ func (r *Repository) List(ctx context.Context, orgID string) ([]Token, error) {
 		var prefix, alg string
 		var spendMicro int64
 		if err := rows.Scan(&t.ID, &t.Name, &prefix, &alg, &t.CreatedAt, &t.CreatedBy, &t.LastUsedAt, &t.RevokedAt,
-			&t.MonthlyBudgetUSD, &spendMicro); err != nil {
+			&t.MonthlyBudgetUSD, &spendMicro, &t.AllowedModels); err != nil {
 			return nil, err
 		}
 		t.MonthSpendUSD = float64(spendMicro) / 1e6

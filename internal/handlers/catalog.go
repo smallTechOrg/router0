@@ -16,6 +16,15 @@ type CatalogHandler struct {
 	repo  *catalog.Repository
 	disc  catalog.Discoverer
 	orgID func(*http.Request) string
+	// allows, when set, limits ListModels to the caller's allowed models
+	// (service-token allowlists on /v1/models).
+	allows func(*http.Request) func(canonical, requested string) bool
+}
+
+// WithModelFilter limits ListModels to the models fn's predicate allows.
+func (h *CatalogHandler) WithModelFilter(fn func(*http.Request) func(canonical, requested string) bool) *CatalogHandler {
+	h.allows = fn
+	return h
 }
 
 // NewCatalogHandler builds the handler. orgID extracts the caller's org id from
@@ -82,6 +91,21 @@ func (h *CatalogHandler) ListModels(w http.ResponseWriter, r *http.Request) {
 		}
 		data = append(data, item{ID: a.Alias, Object: "model", Created: a.CreatedAt.Unix(), OwnedBy: "router0",
 			Router0: map[string]any{"kind": catalog.KindChat, "alias_of": data[ti].ID}})
+	}
+	if h.allows != nil {
+		allow := h.allows(r)
+		kept := data[:0]
+		for _, it := range data {
+			target, _ := it.Router0["alias_of"].(string)
+			if target == "" {
+				target = it.ID
+			}
+			// A model is listed when a request for this id would be allowed.
+			if allow(target, it.ID) {
+				kept = append(kept, it)
+			}
+		}
+		data = kept
 	}
 	sort.SliceStable(data, func(i, j int) bool { return data[i].ID < data[j].ID })
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})

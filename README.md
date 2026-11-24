@@ -112,6 +112,8 @@ print(c.chat.completions.create(model="claude-sonnet-5-5", messages=msgs, tools=
 
 **Service-token budgets.** `PATCH /api/tokens/{id} {"monthly_budget_usd": 25}` (Tokens page "Set monthly budget") caps what one calling app can spend per UTC month, whatever keys serve it. Over the cap, its requests get `402 token_budget_exceeded` before any provider is called; other tokens are unaffected. The counter is reconciled from the request log like key spend.
 
+**Model allowlists per token.** `PATCH /api/tokens/{id} {"allowed_models": ["llama-3.3-70b", "fast"]}` (Tokens page, "Models" column) limits a token to those models or aliases; anything else gets `403 model_not_allowed`, and `/v1/models` shows only the allowed ones. `null` allows every model again.
+
 **Reset state.** `POST /api/keys/{id}/reset-state` (the keys page "Reset state" button) deletes a key's cooldown and out-of-credits rows, so the next request tries it again. It does not lift a budget; raise or remove the budget instead.
 
 With the mocks: set a key's budget to `0.0001` and send requests until it shows "budget reached". To run the balance poll against the mock, run `curl -X POST localhost:9902/_balance -d 0`, then click "Poll balances": `or-main` shows "out of credits" and is skipped. Then run `-d 5` and poll again to clear it.
