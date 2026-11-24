@@ -869,6 +869,13 @@ func TestPhase1_MetricsRenamed(t *testing.T) {
 	e, tn, tok := fixture(t, []string{"mock-429-30-a", "mock-ok-b"}, nil)
 	assertStatus(t, tn.chat(tok, chatOpts{}), 200)
 
+	for _, path := range []string{"/health", "/"} {
+		h := e.do("GET", path, "", nil, nil)
+		assertStatus(t, h, 200)
+		if str(h.json()["status"]) != "ok" {
+			t.Fatalf("GET %s: %s", path, h)
+		}
+	}
 	h := e.do("GET", "/healthz", "", nil, nil)
 	assertStatus(t, h, 200)
 	if str(h.json()["status"]) != "ok" || str(h.json()["db"]) != "ok" || h.json()["redis"] != nil {
